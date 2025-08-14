@@ -1,0 +1,5 @@
+numpy>=1.26
+opencv-python>=4.8
+PyQt5>=5.15.9
+pyserial>=3.5
+psychopy>=2023.2.3; python_version < "3.11"
