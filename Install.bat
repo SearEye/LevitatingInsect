@@ -1,74 +1,99 @@
 @echo off
 setlocal ENABLEDELAYEDEXPANSION
 
-echo.
-echo ===========================================
-echo  FlyPy - Install Dependencies
-echo ===========================================
-echo.
+REM ============================================
+REM Install.bat — Bootstrap + Install requirements
+REM - If requirements.txt exists: install from it
+REM - Else: write a default requirements.txt, then install
+REM - Writes requirements.lock.txt (pip freeze)
+REM - Uses local .venv
+REM ============================================
 
-REM -- Move to repo root (where this script lives)
-cd /d "%~dp0"
+set "SCRIPT_DIR=%~dp0"
+pushd "%SCRIPT_DIR%"
 
-REM -- Create venv if missing (prefer py launcher)
-if not exist ".venv" (
-    echo [INFO] Creating virtual environment (.venv) ...
-    where py >NUL 2>&1
-    if %ERRORLEVEL%==0 (
-        py -3 -m venv .venv
-    ) else (
-        python -m venv .venv
-    )
+REM Choose Python launcher
+where py >nul 2>&1
+if %ERRORLEVEL%==0 ( set "PYTHON=py" ) else ( set "PYTHON=python" )
+
+REM Create venv if missing
+if not exist .venv (
+  echo [INFO] Creating virtual environment in .venv ...
+  %PYTHON% -m venv .venv
+  if ERRORLEVEL 1 (
+    echo [ERROR] Failed to create virtual environment.
+    popd & endlocal & exit /b 1
+  )
 )
 
-REM -- Activate venv
-if exist ".venv\Scripts\activate.bat" (
-    call ".venv\Scripts\activate.bat"
-) else (
-    echo [ERROR] Could not activate .venv\Scripts\activate.bat
-    echo        Make sure Python 3 is installed and accessible.
-    pause
-    exit /b 1
+call .venv\Scripts\activate
+if ERRORLEVEL 1 (
+  echo [ERROR] Failed to activate virtual environment.
+  popd & endlocal & exit /b 1
 )
 
-REM -- Auto-create a minimal requirements.txt if missing
-if not exist "requirements.txt" (
-    echo [WARN] requirements.txt not found. Creating a minimal one ...
-    > "requirements.txt" (
-        echo # ============================================
-        echo # FlyPy Requirements (core runtime)
-        echo # ============================================
-        echo.
-        echo numpy^>=1.26
-        echo opencv-python^>=4.8
-        echo PyQt5^>=5.15.9
-        echo pyserial^>=3.5
-        echo.
-        echo # PsychoPy for the looming stimulus (install only on Python ^< 3.11)
-        echo psychopy^>=2023.2.3^; python_version ^< "3.11"
-    )
-)
-
-echo [INFO] Upgrading pip, setuptools, and wheel ...
+echo [INFO] Upgrading pip, setuptools, wheel ...
 python -m pip install --upgrade pip setuptools wheel
-if errorlevel 1 goto :pip_fail
+
+REM If requirements.txt missing, write a sensible default (core + optional commented)
+if not exist requirements.txt (
+  echo [INFO] Writing default requirements.txt ...
+  > requirements.txt (
+    echo numpy^>=1.26
+    echo opencv-python^>=4.8
+    echo PyQt5^>=5.15.9
+    echo pyserial^>=3.5
+    REM PsychoPy only for Python ^< 3.11 (CMD needs ^< escape)
+    echo psychopy^>=2023.2.3; python_version ^< "3.11"
+
+    REM ----- Optional tools (commented; uncomment if needed) -----
+    echo # pillow^>=10.0
+    echo # imageio^>=2.34
+    echo # imageio-ffmpeg^>=0.4
+    echo # av^>=10.0
+    echo # opencv-contrib-python^>=4.8
+    echo # pandas^>=2.2
+    echo # pyarrow^>=16.0
+    echo # pydantic^>=2.5
+    echo # pyyaml^>=6.0.1
+    echo # rich^>=13.7
+    echo # typer^>=0.12
+    echo # numba^>=0.59
+    echo # tqdm^>=4.66
+    echo # pywin32^>=306; sys_platform == "win32"
+    echo # screeninfo^>=0.8
+    echo # ruff^>=0.5
+    echo # black^>=24.4
+    echo # isort^>=5.13
+    echo # mypy^>=1.10
+    echo # types-PyYAML^>=6.0.12.20240808
+    echo # pytest^>=8.2
+    echo # pytest-qt^>=4.4
+    echo # pytest-cov^>=5.0
+    echo # pre-commit^>=3.7
+    echo # sphinx^>=7.3
+    echo # furo^>=2024.8.6
+    echo # sphinx-autodoc-typehints^>=2.1
+    echo # myst-parser^>=3.0
+    echo # NOTE: FLIR/Spinnaker SDK (PySpin) is vendor-installed, not pip.
+  )
+) else (
+  echo [INFO] Found existing requirements.txt — using it.
+)
 
 echo [INFO] Installing from requirements.txt ...
 pip install -r requirements.txt
-if errorlevel 1 goto :pip_fail
+if ERRORLEVEL 1 (
+  echo [ERROR] pip install failed. See output above.
+  popd & endlocal & exit /b 1
+)
 
 echo [INFO] Writing exact versions to requirements.lock.txt ...
-pip freeze --exclude-editable > requirements.lock.txt
+pip freeze > requirements.lock.txt
 
-echo.
-echo [SUCCESS] Environment is ready.
-echo          Activate later with:  call .venv\Scripts\activate.bat
-echo.
-goto :eof
+echo [INFO] Quick import check (numpy, cv2, PyQt5, serial) ...
+python -c "import importlib; [importlib.import_module(m) for m in ('numpy','cv2','PyQt5','serial')]; print('Core imports OK.')"
 
-:pip_fail
-echo.
-echo [FAIL] Package installation failed. See messages above.
-echo        You may need to run this as Administrator or fix network/proxy settings.
-pause
-exit /b 1
+echo [SUCCESS] Requirements installed.
+popd
+endlocal & exit /b 0
