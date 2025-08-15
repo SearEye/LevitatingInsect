@@ -357,7 +357,7 @@ class CameraRecorder:
         """Update the target FPS for recording and hint capture FPS to the driver.
 
         Args:
-            fps: Target frames per second.
+            fps: Target frames per second. (GUI allows 1..10000, default 60)
 
         GUI impact:
             Called when user changes “Target recording frame rate (fps)” and presses “Apply Settings”.
@@ -793,19 +793,28 @@ class SettingsGUI(QtWidgets.QWidget):
             fl.addWidget(preview, 0, 0, 5, 1)
 
             # Right: settings & info (wrapped labels)
-            spin_index = QtWidgets.QSpinBox(); spin_index.setRange(0, 15)
+
+            # Camera index selection
+            spin_index = QtWidgets.QSpinBox()
+            spin_index.setRange(0, 15)
             spin_index.setValue(cam.index)
             spin_index.setToolTip("Which camera to use (OpenCV device index). Change if the preview shows the wrong device; click Apply to rebind.")
             _lbl_idx = QtWidgets.QLabel("Which camera to use (OpenCV device index):"); _lbl_idx.setWordWrap(True)
             fl.addWidget(_lbl_idx, 0, 1)
             fl.addWidget(spin_index, 0, 2)
 
-            spin_fps = QtWidgets.QSpinBox(); spin_fps.setRange(1, 240); spin_fps.setValue(int(target_default))
-            spin_fps.setToolTip("Target recording frame rate (FPS). Actual FPS may be limited by the camera/driver.")
+            # >>> FPS selection — updated per request <<<
+            spin_fps = QtWidgets.QSpinBox()
+            spin_fps.setRange(1, 10000)                 # allow up to 10,000 FPS
+            spin_fps.setValue(60)                       # start at 60
+            spin_fps.setAccelerated(True)               # faster arrow stepping
+            spin_fps.setKeyboardTracking(True)          # allow typing; updates on the fly
+            spin_fps.setToolTip("Target recording frame rate (FPS). Type directly or use arrows. Range: 1–10,000. Actual FPS may be limited by camera/driver.")
             _lbl_tf = QtWidgets.QLabel("Target recording frame rate (fps):"); _lbl_tf.setWordWrap(True)
             fl.addWidget(_lbl_tf, 1, 1)
             fl.addWidget(spin_fps, 1, 2)
 
+            # Informational labels
             lbl_rep = QtWidgets.QLabel("Driver-reported frame rate (may be 0 on some webcams): —")
             lbl_rep.setWordWrap(True)
             lbl_rep.setToolTip("Driver-reported FPS (CAP_PROP_FPS). Some webcams return 0 or an inaccurate value here.")
