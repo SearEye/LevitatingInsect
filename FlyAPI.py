@@ -1,5 +1,5 @@
 """
-FlyPy — Trigger→Outputs build with All-in-One Settings GUI, camera previews, rich tooltips,
+FlyPy — Trigger->Outputs build with All-in-One Settings GUI, camera previews, rich tooltips,
 and comprehensive docstrings (natural-English labels).
 
 On each trigger:
@@ -26,6 +26,26 @@ from collections import deque
 import numpy as np
 import cv2
 from PyQt5 import QtWidgets, QtCore, QtGui
+
+# ---------- HiDPI scaling (set BEFORE QApplication is constructed) ----------
+try:
+    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
+    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
+except Exception:
+    pass
+
+# Reduce noisy OpenCV backend chatter when available
+try:
+    cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+except Exception:
+    pass
+
+# Make stdout/stderr UTF-8 if possible (extra safety on some consoles)
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 # Optional PsychoPy for high-precision stimulus (falls back to OpenCV)
 try:
@@ -178,10 +198,10 @@ class HardwareBridge:
                     self.ser = serial.Serial(port, baud, timeout=0.01)
                     wait_s(2)  # allow MCU reset
                 except Exception as e:
-                    print(f"[HardwareBridge] Serial open failed: {e} → simulation.")
+                    print(f"[HardwareBridge] Serial open failed: {e} -> simulation.")
                     self.simulated = True
             except ImportError:
-                print("[HardwareBridge] pyserial missing → simulation.")
+                print("[HardwareBridge] pyserial missing -> simulation.")
                 self.simulated = True
 
     def check_trigger(self) -> bool:
@@ -275,11 +295,25 @@ class CameraRecorder:
 
     def _open(self, index: int):
         """(Private) Try to open a VideoCapture at `index`; return (cap, synthetic_flag)."""
-        cap = cv2.VideoCapture(index)
-        if cap and cap.isOpened():
-            # try hinting FPS (many drivers ignore)
-            cap.set(cv2.CAP_PROP_FPS, float(self.target_fps))
-            return cap, False
+        backends = [cv2.CAP_ANY]
+        if os.name == "nt":
+            backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+
+        for be in backends:
+            try:
+                cap = cv2.VideoCapture(index, be)
+            except TypeError:
+                cap = cv2.VideoCapture(index)  # OpenCV < 4.5 fallback
+            if cap and cap.isOpened():
+                try:
+                    cap.set(cv2.CAP_PROP_FPS, float(self.target_fps))
+                except Exception:
+                    pass
+                return cap, False
+            try:
+                cap.release()
+            except Exception:
+                pass
         return None, True  # synthetic
 
     def release(self):
@@ -315,7 +349,7 @@ class CameraRecorder:
             self.cap, self.synthetic = self._open(index)
             self.index = index
             if self.synthetic:
-                print(f"[Camera {self.name}] index {index} not available → synthetic preview/recording.")
+                print(f"[Camera {self.name}] index {index} not available -> synthetic preview/recording.")
             else:
                 print(f"[Camera {self.name}] bound to index {index}.")
 
@@ -397,9 +431,9 @@ class CameraRecorder:
             self._preview_times.append(time.time())
             return frame
 
-    def _writer(self, path: str, size):
+    def _writer(self, path: str, size, fourcc_str: str = "mp4v"):
         """(Private) Build a cv2.VideoWriter for (path, size) using current target FPS."""
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
         return cv2.VideoWriter(path, fourcc, float(self.target_fps), size)
 
     def _frame_size(self):
@@ -430,7 +464,7 @@ class CameraRecorder:
             return
 
         t_end = time.time() + duration_s
-        print(f"[Camera {self.name}] Recording → {path} @ ~{self.target_fps:.1f} fps")
+        print(f"[Camera {self.name}] Recording -> {path} @ ~{self.target_fps:.1f} fps")
         frame_index = 0
         while time.time() < t_end:
             with self.lock:
@@ -464,7 +498,7 @@ class LoomingStim:
       • Stimulus display duration (seconds), Starting/Final radius (pixels), Background shade (0–1)
     """
     def run(self, duration_s: float, r0: int, r1: int, bg_grey: float):
-        """Present the looming stimulus for `duration_s` with radius ranging r0→r1.
+        """Present the looming stimulus for `duration_s` with radius ranging r0->r1.
 
         Args:
             duration_s: Duration of the looming stimulus.
@@ -493,7 +527,7 @@ class LoomingStim:
                 print("[Stim] Looming done (PsychoPy).")
                 return
             except Exception as e:
-                print(f"[Stim] PsychoPy error: {e} → OpenCV fallback.")
+                print(f"[Stim] PsychoPy error: {e} -> OpenCV fallback.")
 
         # OpenCV fallback
         try:
@@ -571,7 +605,7 @@ class TrialRunner:
             pass
 
     def run_trial(self):
-        """Execute one complete trial: lights → cameras (parallel) → looming → log.
+        """Execute one complete trial: lights -> cameras (parallel) -> looming -> log.
 
         Reads from GUI/Config:
             • cfg.output_root, cfg.fourcc, cfg.record_duration_s
@@ -646,7 +680,8 @@ class SettingsGUI(QtWidgets.QWidget):
         self.cam1 = cam1
 
         self.setWindowTitle("FlyPy — Trigger→Outputs (All-in-One GUI)")
-        self.setMinimumWidth(980)
+        # Fixed-size 1920x1080 canvas as requested
+        self.setFixedSize(1920, 1080)
 
         root = QtWidgets.QVBoxLayout(self)
 
@@ -666,14 +701,18 @@ class SettingsGUI(QtWidgets.QWidget):
 
         # --- Panels container ---
         panels = QtWidgets.QGridLayout()
+        panels.setColumnStretch(0, 1)
+        panels.setColumnStretch(1, 1)
         root.addLayout(panels)
 
         # General panel
         gen = QtWidgets.QGroupBox("General settings")
         gen.setToolTip("Top-level behavior and where files are saved.")
         gl = QtWidgets.QFormLayout(gen)
+        gl.setRowWrapPolicy(QtWidgets.QFormLayout.WrapAllRows)
 
         self.lbl_sim = QtWidgets.QLabel("Simulation mode: OFF (hardware triggers active)")
+        self.lbl_sim.setWordWrap(True)
         self.lbl_sim.setToolTip("If ON, triggers are generated on a timer instead of coming from hardware.")
         gl.addRow(self.lbl_sim)
 
@@ -681,7 +720,8 @@ class SettingsGUI(QtWidgets.QWidget):
         self.sb_sim_interval.setRange(0.5, 3600.0); self.sb_sim_interval.setDecimals(2)
         self.sb_sim_interval.setValue(self.cfg.sim_trigger_interval)
         self.sb_sim_interval.setToolTip("Time between simulated triggers (in seconds). Use ≥2 s on laptops to keep CPU low.")
-        gl.addRow("Interval between simulated triggers (seconds):", self.sb_sim_interval)
+        _lbl_simint = QtWidgets.QLabel("Interval between simulated triggers (seconds):"); _lbl_simint.setWordWrap(True)
+        gl.addRow(_lbl_simint, self.sb_sim_interval)
 
         self.le_root = QtWidgets.QLineEdit(self.cfg.output_root)
         self.le_root.setToolTip("Folder where all date-stamped trial folders and videos will be saved.")
@@ -689,18 +729,21 @@ class SettingsGUI(QtWidgets.QWidget):
         self.btn_browse.setToolTip("Choose a different output folder.")
         rhl = QtWidgets.QHBoxLayout()
         rhl.addWidget(self.le_root); rhl.addWidget(self.btn_browse)
-        gl.addRow("Output folder for all trials:", rhl)
+        _lbl_root = QtWidgets.QLabel("Output folder for all trials:"); _lbl_root.setWordWrap(True)
+        gl.addRow(_lbl_root, rhl)
 
         self.cb_fourcc = QtWidgets.QComboBox()
         self.cb_fourcc.addItems(["mp4v", "avc1", "XVID"])
         self.cb_fourcc.setCurrentText(self.cfg.fourcc)
         self.cb_fourcc.setToolTip("Video codec (FOURCC code). 'mp4v' is broadly compatible; 'avc1' compresses better if available.")
-        gl.addRow("Video codec (FOURCC code):", self.cb_fourcc)
+        _lbl_fourcc = QtWidgets.QLabel("Video codec (FOURCC code):"); _lbl_fourcc.setWordWrap(True)
+        gl.addRow(_lbl_fourcc, self.cb_fourcc)
 
         self.sb_rec_dur = QtWidgets.QDoubleSpinBox()
         self.sb_rec_dur.setRange(0.2, 600.0); self.sb_rec_dur.setDecimals(2); self.sb_rec_dur.setValue(self.cfg.record_duration_s)
         self.sb_rec_dur.setToolTip("How long to record for each trigger (seconds). Longer clips = larger files.")
-        gl.addRow("Recording duration per trigger (seconds):", self.sb_rec_dur)
+        _lbl_recdur = QtWidgets.QLabel("Recording duration per trigger (seconds):"); _lbl_recdur.setWordWrap(True)
+        gl.addRow(_lbl_recdur, self.sb_rec_dur)
 
         panels.addWidget(gen, 0, 0)
 
@@ -708,19 +751,29 @@ class SettingsGUI(QtWidgets.QWidget):
         stim = QtWidgets.QGroupBox("Looming stimulus (growing dot)")
         stim.setToolTip("Duration and size change of the looming dot shown after each trigger.")
         sl = QtWidgets.QFormLayout(stim)
+        sl.setRowWrapPolicy(QtWidgets.QFormLayout.WrapAllRows)
+
         self.sb_stim_dur = QtWidgets.QDoubleSpinBox()
         self.sb_stim_dur.setRange(0.1, 30.0); self.sb_stim_dur.setDecimals(2); self.sb_stim_dur.setValue(self.cfg.stim_duration_s)
         self.sb_stim_dur.setToolTip("How long the looming dot is shown (seconds). Cameras still record for the full duration above.")
-        sl.addRow("Stimulus display duration (seconds):", self.sb_stim_dur)
+        _lbl_sd = QtWidgets.QLabel("Stimulus display duration (seconds):"); _lbl_sd.setWordWrap(True)
+        sl.addRow(_lbl_sd, self.sb_stim_dur)
+
         self.sb_r0 = QtWidgets.QSpinBox(); self.sb_r0.setRange(1, 2000); self.sb_r0.setValue(self.cfg.stim_r0_px)
         self.sb_r0.setToolTip("Starting dot radius in pixels. Smaller values (8–20 px) start more subtly.")
-        sl.addRow("Starting dot radius (pixels):", self.sb_r0)
+        _lbl_r0 = QtWidgets.QLabel("Starting dot radius (pixels):"); _lbl_r0.setWordWrap(True)
+        sl.addRow(_lbl_r0, self.sb_r0)
+
         self.sb_r1 = QtWidgets.QSpinBox(); self.sb_r1.setRange(1, 4000); self.sb_r1.setValue(self.cfg.stim_r1_px)
         self.sb_r1.setToolTip("Final dot radius in pixels at the end of the stimulus.")
-        sl.addRow("Final dot radius (pixels):", self.sb_r1)
+        _lbl_r1 = QtWidgets.QLabel("Final dot radius (pixels):"); _lbl_r1.setWordWrap(True)
+        sl.addRow(_lbl_r1, self.sb_r1)
+
         self.sb_bg = QtWidgets.QDoubleSpinBox(); self.sb_bg.setRange(0.0, 1.0); self.sb_bg.setSingleStep(0.05); self.sb_bg.setValue(self.cfg.stim_bg_grey)
         self.sb_bg.setToolTip("Background shade for PsychoPy display (0 = black, 1 = white). Ignored by OpenCV fallback.")
-        sl.addRow("Stimulus background shade (0=black, 1=white):", self.sb_bg)
+        _lbl_bg = QtWidgets.QLabel("Stimulus background shade (0=black, 1=white):"); _lbl_bg.setWordWrap(True)
+        sl.addRow(_lbl_bg, self.sb_bg)
+
         panels.addWidget(stim, 0, 1)
 
         # Camera panels
@@ -731,37 +784,47 @@ class SettingsGUI(QtWidgets.QWidget):
             gb.setToolTip("Live preview shows which camera you're using. Frame-rate panel shows driver-reported, preview-measured, and target recording FPS.")
             fl = QtWidgets.QGridLayout(gb)
 
-            # Left: preview
+            # Left: preview (larger for 1920x1080 canvas)
             preview = QtWidgets.QLabel()
-            preview.setFixedSize(360, 270)
+            preview.setFixedSize(640, 480)
             preview.setFrameShape(QtWidgets.QFrame.Box)
             preview.setAlignment(QtCore.Qt.AlignCenter)
             preview.setToolTip("Live preview (pauses while recording). The overlay at the bottom shows the OpenCV device index in use.")
             fl.addWidget(preview, 0, 0, 5, 1)
 
-            # Right: settings & info
+            # Right: settings & info (wrapped labels)
             spin_index = QtWidgets.QSpinBox(); spin_index.setRange(0, 15)
             spin_index.setValue(cam.index)
             spin_index.setToolTip("Which camera to use (OpenCV device index). Change if the preview shows the wrong device; click Apply to rebind.")
-            fl.addWidget(QtWidgets.QLabel("Which camera to use (OpenCV device index):"), 0, 1)
+            _lbl_idx = QtWidgets.QLabel("Which camera to use (OpenCV device index):"); _lbl_idx.setWordWrap(True)
+            fl.addWidget(_lbl_idx, 0, 1)
             fl.addWidget(spin_index, 0, 2)
 
             spin_fps = QtWidgets.QSpinBox(); spin_fps.setRange(1, 240); spin_fps.setValue(int(target_default))
             spin_fps.setToolTip("Target recording frame rate (FPS). Actual FPS may be limited by the camera/driver.")
-            fl.addWidget(QtWidgets.QLabel("Target recording frame rate (fps):"), 1, 1)
+            _lbl_tf = QtWidgets.QLabel("Target recording frame rate (fps):"); _lbl_tf.setWordWrap(True)
+            fl.addWidget(_lbl_tf, 1, 1)
             fl.addWidget(spin_fps, 1, 2)
 
             lbl_rep = QtWidgets.QLabel("Driver-reported frame rate (may be 0 on some webcams): —")
+            lbl_rep.setWordWrap(True)
             lbl_rep.setToolTip("Driver-reported FPS (CAP_PROP_FPS). Some webcams return 0 or an inaccurate value here.")
             fl.addWidget(lbl_rep, 2, 1, 1, 2)
 
             lbl_mea = QtWidgets.QLabel("Measured preview frame rate (GUI): —")
+            lbl_mea.setWordWrap(True)
             lbl_mea.setToolTip("Measured frame rate of the GUI preview (not the recorded file).")
             fl.addWidget(lbl_mea, 3, 1, 1, 2)
 
             lbl_tar = QtWidgets.QLabel(f"Recording target frame rate (intended): {int(target_default)}")
+            lbl_tar.setWordWrap(True)
             lbl_tar.setToolTip("Intended recording FPS used by the video writer.")
             fl.addWidget(lbl_tar, 4, 1, 1, 2)
+
+            # Stretch so preview gets more space
+            fl.setColumnStretch(0, 3)  # preview
+            fl.setColumnStretch(1, 1)  # labels
+            fl.setColumnStretch(2, 1)  # editors
 
             self.cam_groups.append({
                 "group": gb,
@@ -778,6 +841,7 @@ class SettingsGUI(QtWidgets.QWidget):
 
         # Status
         self.lbl_status = QtWidgets.QLabel("Status: Idle")
+        self.lbl_status.setWordWrap(True)
         self.lbl_status.setToolTip("Overall state: Idle / Watching for triggers / Trial running / Errors.")
         root.addWidget(self.lbl_status)
 
@@ -823,7 +887,11 @@ class SettingsGUI(QtWidgets.QWidget):
             cam: CameraRecorder = g["cam"]
             rep = cam.reported_fps()
             mea = cam.measured_preview_fps()
-            g["lbl_rep"].setText(f"Driver-reported frame rate (may be 0 on some webcams): {rep:.1f}" if rep > 0 else "Driver-reported frame rate (may be 0 on some webcams): (unknown)")
+            g["lbl_rep"].setText(
+                f"Driver-reported frame rate (may be 0 on some webcams): {rep:.1f}"
+                if rep > 0 else
+                "Driver-reported frame rate (may be 0 on some webcams): (unknown)"
+            )
             g["lbl_mea"].setText(f"Measured preview frame rate (GUI): {mea:.1f}")
             g["lbl_tar"].setText(f"Recording target frame rate (intended): {int(cam.target_fps)}")
 
@@ -840,7 +908,12 @@ class SettingsGUI(QtWidgets.QWidget):
         g = self.cam_groups[cam_idx]
         h, w, _ = img_rgb.shape
         qimg = QtGui.QImage(img_rgb.data, w, h, w*3, QtGui.QImage.Format_RGB888)
-        g["preview"].setPixmap(QtGui.QPixmap.fromImage(qimg))
+        pix = QtGui.QPixmap.fromImage(qimg).scaled(
+            g["preview"].size(),
+            QtCore.Qt.KeepAspectRatio,
+            QtCore.Qt.SmoothTransformation
+        )
+        g["preview"].setPixmap(pix)
 
 
 # =========================
@@ -966,10 +1039,15 @@ class MainApp(QtWidgets.QApplication):
             self.gui.lbl_status.setText("Status: Trial running (preview paused).")
             self.gui.update_cam_fps_labels()
             return
-        img0 = self.cam0.grab_preview()
-        img1 = self.cam1.grab_preview()
+
+        # Render frames at the preview labels' actual sizes
+        p0 = self.gui.cam_groups[0]["preview"]
+        p1 = self.gui.cam_groups[1]["preview"]
+        img0 = self.cam0.grab_preview(w=p0.width(), h=p0.height())
+        img1 = self.cam1.grab_preview(w=p1.width(), h=p1.height())
         self.gui.set_preview_image(0, img0)
         self.gui.set_preview_image(1, img1)
+
         self.gui.update_cam_fps_labels()
         self.gui.lbl_status.setText("Status: Waiting / Idle.")
 
