@@ -1,5 +1,73 @@
+# ============================================
+# FlyPy Requirements (core runtime)
+# ============================================
+
 numpy>=1.26
 opencv-python>=4.8
 PyQt5>=5.15.9
 pyserial>=3.5
+
+# PsychoPy for the looming stimulus (install only on Python < 3.11)
 psychopy>=2023.2.3; python_version < "3.11"
+
+# ============================================
+# Recommended optional runtime (uncomment as needed)
+# ============================================
+
+# --- Video/Imaging extras ---
+# pillow>=10.0               # Extra image formats & simple image ops
+# imageio>=2.34              # Easy image/video read/write (alt to OpenCV writes)
+# imageio-ffmpeg>=0.4        # Bundled ffmpeg for imageio (does not replace system ffmpeg)
+# av>=10.0                   # PyAV: advanced ffmpeg-based video I/O (power users)
+# opencv-contrib-python>=4.8 # If you need contrib features (SIFT/SURF, etc.). Replace opencv-python above.
+
+# --- Data & logging ---
+# pandas>=2.2                # Structured logs, CSV/Parquet handling
+# pyarrow>=16.0              # Parquet/Feather support for pandas
+
+# --- Config & CLI UX ---
+# pydantic>=2.5              # Typed config models / validation
+# pyyaml>=6.0.1              # YAML config files
+# rich>=13.7                 # Pretty console logs and progress
+# typer>=0.12                # Simple CLI for batch/utility scripts
+
+# --- Performance / progress ---
+# numba>=0.59                # JIT speedups for NumPy-heavy processing
+# tqdm>=4.66                 # Progress bars for long tasks
+
+# --- Platform-specific helpers ---
+# pywin32>=306; sys_platform == "win32"   # Windows serial/USB helpers (optional)
+# screeninfo>=0.8                        # Detect monitors; useful with PsychoPy
+
+# ============================================
+# Developer tools (CI, linting, typing) — optional
+# ============================================
+
+# ruff>=0.5                  # Fast linter/formatter (flake8+isort compatible)
+# black>=24.4                # Code formatter
+# isort>=5.13                # Import sorter (if you don’t rely solely on ruff)
+# mypy>=1.10                 # Static typing
+# types-PyYAML>=6.0.12.20240808  # Type stubs for PyYAML
+
+# pytest stack
+# pytest>=8.2
+# pytest-qt>=4.4             # Qt signal/GUI testing
+# pytest-cov>=5.0            # Coverage reports
+
+# pre-commit hooks
+# pre-commit>=3.7
+
+# ============================================
+# Documentation (optional)
+# ============================================
+
+# sphinx>=7.3
+# furo>=2024.8.6             # Clean Sphinx theme
+# sphinx-autodoc-typehints>=2.1
+# myst-parser>=3.0           # Markdown in Sphinx
+
+# ============================================
+# Not installable via pip (reference only)
+# ============================================
+# - FLIR/Teledyne Spinnaker (PySpin) for Blackfly cameras → install from vendor SDK.
+# - System ffmpeg for advanced H.264/H.265 pipelines (imageio-ffmpeg bundles a lightweight build for imageio).
