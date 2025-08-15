@@ -1,0 +1,25 @@
+# Normalize line endings but force Windows-friendly CRLF for batch scripts.
+* text=auto
+
+# Windows launchers need CRLF or they'll misbehave on some shells
+*.bat text eol=crlf
+
+# Unix-y scripts should stay LF
+*.sh  text eol=lf
+*.ps1 text eol=crlf
+
+# Source files (keep LF so diffs/linters behave)
+*.py  text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md  text eol=lf
+*.txt text eol=lf
+*.gitignore text eol=lf
+
+# Treat common binary assets as binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.mp4 binary
+*.avi binary
