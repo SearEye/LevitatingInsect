@@ -1,111 +1,96 @@
 @echo off
-setlocal ENABLEDELAYEDEXPANSION
+setlocal
 
 REM ======================================================
-REM LaunchFlyPy.bat — Sync + Activate venv + Install + Run
-REM - Fast-forward git pull on current branch (if git exists)
-REM - Update submodules (if any)
-REM - Ensure .venv, activate, upgrade pip
-REM - If requirements.txt missing: auto-call Install.bat
-REM - Install from requirements.txt and write requirements.lock.txt
-REM - Run entrypoint (defaults to FlyAPI.py; override via FLYPY_ENTRY or first arg)
+REM LaunchFlyPy.bat — Safe launcher (no for/quoted subshells)
+REM Usage:
+REM   LaunchFlyPy.bat           -> normal run (defaults to FlyAPI.py)
+REM   LaunchFlyPy.bat /debug    -> verbose + pause on errors
+REM   LaunchFlyPy.bat Main.py   -> run a different entrypoint
+REM   set FLYPY_ENTRY=Main.py & LaunchFlyPy.bat
 REM ======================================================
 
 set "SCRIPT_DIR=%~dp0"
 pushd "%SCRIPT_DIR%"
 
-REM Choose Python launcher
-where py >nul 2>&1
-if %ERRORLEVEL%==0 ( set "PYTHON=py" ) else ( set "PYTHON=python" )
+REM --- Parse /debug flag (first arg) ---
+set "DEBUG=0"
+if /I "%~1"=="/debug" set "DEBUG=1" & shift
+if /I "%~1"=="--debug" set "DEBUG=1" & shift
 
-REM Resolve entrypoint (default to FlyAPI.py in this repo)
+REM --- Pick Python launcher ---
+where py >nul 2>&1 && (set "PY=py") || (set "PY=python")
+
+REM --- Resolve entrypoint (default to FlyAPI.py) ---
 set "ENTRYPOINT=FlyAPI.py"
 if not "%FLYPY_ENTRY%"=="" set "ENTRYPOINT=%FLYPY_ENTRY%"
 if not "%~1"=="" set "ENTRYPOINT=%~1"
 
-REM ----- Git sync (optional) -----
-where git >nul 2>&1
-if %ERRORLEVEL%==0 (
-  git rev-parse --is-inside-work-tree >nul 2>&1
-  if %ERRORLEVEL%==0 (
-    echo [INFO] Fetching latest changes...
+REM --- Optional Git sync (no branch parsing to avoid CMD quirks) ---
+where git >nul 2>&1 && (
+  git rev-parse --is-inside-work-tree >nul 2>&1 && (
+    echo [INFO] Syncing repository...
     git fetch --all --prune
-    for /f "delims=" %%i in ('git rev-parse --abbrev-ref HEAD') do set "CURBRANCH=%%i"
-    if "%CURBRANCH%"=="" set "CURBRANCH=main"
-    echo [INFO] Pulling fast-forward on "%CURBRANCH%" ...
-    git pull --ff-only origin "%CURBRANCH%"
-    if %ERRORLEVEL% NEQ 0 (
-      echo [WARN] Fast-forward pull failed (local changes?). Continuing without sync...
-    )
-    if exist ".gitmodules" (
-      echo [INFO] Updating submodules...
-      git submodule update --init --recursive
-    )
-  ) else (
-    echo [WARN] Not a Git repository. Skipping sync.
+    git pull --ff-only
+    if exist ".gitmodules" git submodule update --init --recursive
   )
-) else (
-  echo [WARN] Git not found on PATH. Skipping sync.
 )
 
-REM ----- Virtual environment -----
-if not exist .venv (
+REM --- Ensure virtual environment ---
+if not exist ".venv\Scripts\activate" (
   echo [INFO] Creating virtual environment in .venv ...
-  %PYTHON% -m venv .venv
-  if ERRORLEVEL 1 (
-    echo [ERROR] Failed to create virtual environment.
-    popd & endlocal & exit /b 1
-  )
+  %PY% -m venv .venv || (echo [ERROR] venv creation failed.& goto :fail)
 )
 
-call .venv\Scripts\activate
-if ERRORLEVEL 1 (
-  echo [ERROR] Failed to activate virtual environment.
-  popd & endlocal & exit /b 1
-)
+call ".venv\Scripts\activate" || (echo [ERROR] venv activation failed.& goto :fail)
 
 echo [INFO] Upgrading pip, setuptools, wheel ...
 python -m pip install --upgrade pip setuptools wheel
 
-REM ----- Auto-install if requirements.txt missing -----
+REM --- Ensure requirements installed (auto-call Install.bat if missing) ---
 if not exist requirements.txt (
-  echo [INFO] requirements.txt not found — invoking Install.bat to generate/install...
-  if exist "%SCRIPT_DIR%Install.bat" (
-    call "%SCRIPT_DIR%Install.bat"
-    if ERRORLEVEL 1 (
-      echo [ERROR] Install.bat failed; cannot continue.
-      popd & endlocal & exit /b 1
-    )
+  echo [INFO] requirements.txt not found — calling Install.bat ...
+  if exist "Install.bat" (
+    call "Install.bat" || goto :fail
   ) else (
-    echo [ERROR] Install.bat not found at: "%SCRIPT_DIR%"
-    popd & endlocal & exit /b 1
+    echo [ERROR] Install.bat is missing and no requirements.txt available.
+    goto :fail
   )
 )
 
-REM ----- Install from requirements.txt -----
 echo [INFO] Installing from requirements.txt ...
-pip install -r requirements.txt
-if ERRORLEVEL 1 (
-  echo [ERROR] pip install failed. See output above.
-  popd & endlocal & exit /b 1
-)
+pip install -r requirements.txt || goto :fail
 
 echo [INFO] Writing exact versions to requirements.lock.txt ...
 pip freeze > requirements.lock.txt
 
-REM Verify entrypoint exists
+REM --- Verify entrypoint ---
 if not exist "%ENTRYPOINT%" (
   echo [ERROR] Entrypoint not found: "%ENTRYPOINT%"
-  echo         Override with:  set FLYPY_ENTRY=FlyAPI.py ^& LaunchFlyPy.bat
-  echo         Or:              LaunchFlyPy.bat FlyAPI.py
-  popd & endlocal & exit /b 1
+  echo         Override with:  set FLYPY_ENTRY=MyMain.py ^& LaunchFlyPy.bat
+  echo         Or:              LaunchFlyPy.bat MyMain.py
+  goto :fail
 )
 
-REM Run the app; pass through remaining args (shift if first arg was entrypoint)
-if not "%~1"=="" shift
-echo [INFO] Running: python "%ENTRYPOINT%" %*
-python "%ENTRYPOINT%" %*
-set APP_RC=%ERRORLEVEL%
+REM --- Debug verbosity (optional) ---
+if "%DEBUG%"=="1" (
+  set QT_DEBUG_PLUGINS=1
+  set PYTHONFAULTHANDLER=1
+  echo [INFO] Debug mode ON (Qt plugin logs + faulthandler).
+)
 
-popd
-endlocal & exit /b %APP_RC%
+echo [INFO] Running: python "%ENTRYPOINT%"
+python "%ENTRYPOINT%"
+set "RC=%ERRORLEVEL%"
+
+if not "%RC%"=="0" goto :fail
+echo [OK] Application exited normally.
+if "%DEBUG%"=="1" pause
+popd & endlocal & exit /b 0
+
+:fail
+echo.
+echo [FAIL] Exit code: %ERRORLEVEL%
+echo If the window closed instantly, run again as:  LaunchFlyPy.bat /debug
+if "%DEBUG%"=="1" pause
+popd & endlocal & exit /b 1
