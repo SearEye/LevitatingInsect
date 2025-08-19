@@ -13,6 +13,13 @@ GUI:
   • Tooltips on every control
   • Per-camera visual index (live preview with overlayed index) and FPS
   • Video Format/Codec dropdown with captions (max res/FPS, size hint)
+  • Stimulus delay after recording start
+  • Select which screen shows the Stimulus and which screen hosts the GUI
+  • Stimulus fullscreen/windowed mode
+  • Manual "Trigger Once" button
+
+This file is heavily annotated. Every class and function includes a docstring written in natural English,
+and most non-obvious lines include inline comments to make the control/data flow easy to follow.
 """
 
 import sys
@@ -33,6 +40,7 @@ try:
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
 except Exception:
+    # If Qt can't set these attributes (rare), we just proceed without HiDPI scaling.
     pass
 
 # Reduce noisy OpenCV backend chatter when available
@@ -41,7 +49,7 @@ try:
 except Exception:
     pass
 
-# Make stdout/stderr UTF-8 if possible (extra safety on some consoles)
+# Make stdout/stderr UTF-8 if possible (helps on some Windows consoles)
 try:
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
@@ -112,93 +120,95 @@ VIDEO_PRESETS = [
 PRESETS_BY_ID = {p["id"]: p for p in VIDEO_PRESETS}
 
 def default_preset_id() -> str:
-    """Choose a sensible default preset."""
-    # mp4_mp4v tends to be broadly compatible across platforms
+    """Return the default video preset ID.
+
+    We choose 'mp4_mp4v' because it is broadly compatible across platforms
+    without requiring extra codecs.
+    """
     return "mp4_mp4v"
 
 def ensure_dir(path: str):
-    """Create directory `path` if it doesn't exist.
+    """Create a directory if it does not exist already.
 
-    Usage:
-        ensure_dir("FlyPy_Output/20250813")
-
-    GUI impact:
-        None directly. Called when applying settings (to ensure the Output Root exists)
-        and when writing trial files inside date-stamped subfolders.
+    This is used for the general Output Root and the date-stamped trial folders.
+    It's safe to call repeatedly due to `exist_ok=True`.
     """
     os.makedirs(path, exist_ok=True)
 
-
-def now_stamp():
+def now_stamp() -> str:
     """Return a filesystem-safe timestamp string (YYYY-MM-DD_HH-MM-SS).
 
-    Usage:
-        ts = now_stamp()
-
-    GUI impact:
-        None. Used for file naming shown in logs and indirectly visible via output folder.
+    This timestamp is used in video filenames and CSV logs to keep trials organized.
     """
     return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
+def day_folder(root: str) -> str:
+    """Return a path to today's date-stamped folder under `root`, creating it if needed.
 
-def day_folder(root: str):
-    """Return/create today's date-stamped subfolder within `root`.
-
-    Args:
-        root: Output Root path (typically from GUI "Output folder for all trials")
-
-    Returns:
-        Absolute/relative path to `<root>/<YYYYMMDD>`.
-
-    GUI impact:
-        Reads the "Output folder for all trials" setting (via cfg) to organize trial videos.
+    We store all outputs per-day to keep the output directory clean and to simplify bookkeeping.
+    Example: <root>/20250819/
     """
     d = datetime.now().strftime("%Y%m%d")
     p = os.path.join(root, d)
     ensure_dir(p)
     return p
 
-
 def wait_s(sec: float):
-    """Wait for `sec` seconds using PsychoPy's clock if available, else time.sleep.
+    """Sleep for `sec` seconds, using PsychoPy's timing if available.
 
-    Args:
-        sec: Seconds to wait.
-
-    GUI impact:
-        None. Timing helper used for serial reset and headless stimulus fallback duration.
+    This ensures stimulus timing behaves the same regardless of whether PsychoPy is installed.
     """
     if PSYCHOPY:
         core.wait(sec)
     else:
         time.sleep(sec)
 
+def get_screen_geometries():
+    """Return a list of tuples describing each screen: (x, y, width, height).
+
+    We use this to position the OpenCV stimulus window onto a specific monitor.
+    """
+    screens = QtGui.QGuiApplication.screens()
+    geoms = []
+    for s in screens:
+        g = s.geometry()
+        geoms.append((g.x(), g.y(), g.width(), g.height()))
+    return geoms
+
 
 class Config:
-    """Holds all runtime settings; the GUI reads/writes these.
+    """Mutable configuration object shared across the app (GUI <-> runtime).
 
-    Visible GUI names → Config fields:
-
-      General settings
-        • “Interval between simulated triggers (seconds)” → sim_trigger_interval
-        • “Output folder for all trials”                  → output_root
-        • “Video format / codec (container + FOURCC)”     → video_preset_id (+ fourcc shadow)
-        • “Recording duration per trigger (seconds)”      → record_duration_s
-        • Simulation mode (Yes/No dialog at startup)      → simulation_mode
-
-      Looming stimulus (growing dot)
-        • “Stimulus display duration (seconds)”           → stim_duration_s
-        • “Starting dot radius (pixels)”                  → stim_r0_px
-        • “Final dot radius (pixels)”                     → stim_r1_px
-        • “Stimulus background shade (0=black, 1=white)”  → stim_bg_grey
-
-      Camera N — preview & frame rate
-        • “Which camera to use (OpenCV device index)”     → camN_index
-        • “Target recording frame rate (fps)”             → camN_target_fps
-        • FPS labels are informational; they don't change settings.
+    Each field maps directly to a GUI control. This makes it simple to apply
+    and persist user choices during an experiment run.
     """
     def __init__(self):
-        """Initialize default configuration values used by GUI and core logic."""
+        """Initialize default configuration values used by GUI and core logic.
+
+        General:
+          - simulation_mode: If True, synthesize triggers on a timer.
+          - sim_trigger_interval: Seconds between simulated triggers.
+
+        Recording & Output:
+          - output_root: Top-level folder where trial folders are created.
+          - video_preset_id/fourcc: What format/codec to use when writing videos.
+          - record_duration_s: How long each camera records per trigger.
+
+        Stimulus:
+          - stim_duration_s: How long the looming dot runs.
+          - stim_r0_px / stim_r1_px: Start/end radius of the dot (in pixels).
+          - stim_bg_grey: Background shade (0=black, 1=white).
+          - stim_delay_s: Delay between recording start and stimulus onset.
+          - stim_screen_index: Which monitor to show the stimulus on.
+          - stim_fullscreen: Whether the stimulus should cover the whole screen.
+
+        GUI:
+          - gui_screen_index: Which monitor the GUI window should appear on.
+
+        Cameras:
+          - camN_index: OpenCV device indices for each camera.
+          - camN_target_fps: Intended frames-per-second for recording.
+        """
         # General
         self.simulation_mode = False
         self.sim_trigger_interval = 5.0
@@ -206,7 +216,6 @@ class Config:
         # Recording / output
         self.output_root = "FlyPy_Output"
         self.video_preset_id = default_preset_id()
-        # Keep a shadow 'fourcc' for convenience with existing code paths
         self.fourcc = PRESETS_BY_ID[self.video_preset_id]["fourcc"]
         self.record_duration_s = 3.0
 
@@ -215,6 +224,12 @@ class Config:
         self.stim_r0_px = 8
         self.stim_r1_px = 400
         self.stim_bg_grey = 1.0  # white background
+        self.stim_delay_s = 0.0  # delay between recording start and stimulus
+        self.stim_screen_index = 0  # which monitor for the stimulus
+        self.stim_fullscreen = False  # stimulus fullscreen/windowed
+
+        # GUI placement
+        self.gui_screen_index = 0  # which monitor shows the GUI
 
         # Cameras
         self.cam0_index = 0
@@ -227,13 +242,23 @@ class Config:
 # Hardware Bridge (Elegoo UNO R3 via CH340)
 # =========================
 class HardwareBridge:
-    """USB-serial bridge for Elegoo UNO R3 (CH340) with simulation fallback.
+    """Small adapter around a USB serial device that provides trigger input and marker output.
 
-    • Simulation ON  -> interval-based triggers.
-    • Simulation OFF -> auto-detect CH340 COM port (or use provided 'port') at 115200.
-    • Reads 'T' lines as triggers. Accepts lines we send (START/STIM/END/PULSE n, LIGHT ON/OFF).
+    When simulation is ON, we simply synthesize triggers every `sim_trigger_interval` seconds.
+    When simulation is OFF, we try to auto-detect an Elegoo/UNO on a CH340 serial port and
+    listen for lines containing 'T', which signals a trigger.
+
+    We also provide small helper methods to send text commands to the microcontroller
+    to mark START/STIM/END boundaries or control lights.
     """
     def __init__(self, cfg: Config, port: str = None, baud: int = 115200):
+        """Create a hardware bridge.
+
+        Args:
+            cfg: Global configuration (we read simulation flag and interval).
+            port: Optional explicit serial port (e.g., 'COM3' or '/dev/ttyUSB0').
+            baud: Baud rate for the serial connection (defaults to 115200).
+        """
         self.cfg = cfg
         self.simulated = cfg.simulation_mode
         self._last_sim = time.time()
@@ -241,6 +266,7 @@ class HardwareBridge:
         self.port = port
         self.baud = baud
 
+        # Try to open a real serial port if we are not simulating
         if not self.simulated:
             try:
                 import serial, serial.tools.list_ports
@@ -249,7 +275,7 @@ class HardwareBridge:
                 if self.port:
                     try:
                         self.ser = serial.Serial(self.port, self.baud, timeout=0.01)
-                        wait_s(1.5)  # allow reset
+                        wait_s(1.5)  # allow the microcontroller to reset after opening serial
                         print(f"[HardwareBridge] Opened {self.port} @ {self.baud} baud")
                     except Exception as e:
                         print(f"[HardwareBridge] Serial open failed on {self.port}: {e} -> simulation.")
@@ -262,14 +288,15 @@ class HardwareBridge:
                 self.simulated = True
 
     def _autodetect_port(self) -> str:
-        """Return the first likely Elegoo CH340 COM port or None."""
+        """Try to find a likely Elegoo/UNO CH340 port; return a device path or None."""
         import serial.tools.list_ports
+        # First pass: look for specific USB VID/PID known for CH340
         for p in serial.tools.list_ports.comports():
             vid = f"{p.vid:04X}" if p.vid is not None else None
             pid = f"{p.pid:04X}" if p.pid is not None else None
-            if vid == "1A86" and pid == "7523":  # CH340/CH34x (Elegoo UNO R3)
+            if vid == "1A86" and pid == "7523":  # CH340/CH34x
                 return p.device
-        # Fallback: any port mentioning CH340 or UNO/Elegoo in description
+        # Second pass: fuzzy match by human-readable description
         for p in serial.tools.list_ports.comports():
             desc = (p.description or "").lower()
             if "ch340" in desc or "uno" in desc or "elegoo" in desc:
@@ -277,7 +304,14 @@ class HardwareBridge:
         return None
 
     def check_trigger(self) -> bool:
-        """Return True when a trigger is detected (simulated or via USB line 'T')."""
+        """Return True exactly when a trigger occurs.
+
+        Simulation mode:
+          - Return True when the simulated interval elapses.
+
+        Hardware mode:
+          - Non-blocking read from serial; if a full line equals 'T', return True.
+        """
         if self.simulated:
             now = time.time()
             if now - self._last_sim >= self.cfg.sim_trigger_interval:
@@ -296,7 +330,10 @@ class HardwareBridge:
 
     # -------- Outgoing commands (markers & lights) --------
     def _send_line(self, text: str):
-        """Send a single line to the board (newline-terminated); log in simulation."""
+        """Send one line of text to the device, or log it if simulating.
+
+        This method centralizes error handling so that our marker/light helpers are tiny.
+        """
         if self.simulated or not self.ser:
             print(f"[HardwareBridge] (Sim) SEND: {text}")
             return
@@ -305,18 +342,37 @@ class HardwareBridge:
         except Exception as e:
             print(f"[HardwareBridge] Write error: {e}")
 
-    def mark_start(self): self._send_line("START")
-    def mark_stim(self):  self._send_line("STIM")
-    def mark_end(self):   self._send_line("END")
-    def pulse_ms(self, ms: int = 20): self._send_line(f"PULSE {int(ms)}")
-    def light_on(self):   self._send_line("LIGHT ON")
-    def light_off(self):  self._send_line("LIGHT OFF")
+    def mark_start(self):
+        """Tell the device we are starting a trial (useful for syncing and lights)."""
+        self._send_line("START")
 
-    # Backward-compat with existing code
-    def activate_lights(self): self.light_on()
+    def mark_stim(self):
+        """Tell the device the stimulus just started (timestamp alignment marker)."""
+        self._send_line("STIM")
+
+    def mark_end(self):
+        """Tell the device the trial finished (end marker)."""
+        self._send_line("END")
+
+    def pulse_ms(self, ms: int = 20):
+        """Ask the device to produce a TTL pulse for `ms` milliseconds."""
+        self._send_line(f"PULSE {int(ms)}")
+
+    def light_on(self):
+        """Turn on lights via the device (or log in simulation)."""
+        self._send_line("LIGHT ON")
+
+    def light_off(self):
+        """Turn off lights via the device (or log in simulation)."""
+        self._send_line("LIGHT OFF")
+
+    # Backward-compat with legacy naming
+    def activate_lights(self):
+        """Legacy alias for `light_on()` to avoid breaking old call sites."""
+        self.light_on()
 
     def close(self):
-        """Close serial port if open."""
+        """Close the serial port if it was opened."""
         if not self.simulated and self.ser:
             try:
                 if getattr(self.ser, "is_open", True):
@@ -330,40 +386,41 @@ class HardwareBridge:
 # Camera Recorder w/ Preview
 # =========================
 class CameraRecorder:
-    """OpenCV VideoCapture wrapper with live preview, FPS info, and recording.
+    """Thin wrapper around OpenCV VideoCapture that adds:
 
-    GUI settings used/written:
-      • “Which camera to use (OpenCV device index)” (SpinBox) → set_index()
-      • “Target recording frame rate (fps)” (SpinBox)         → set_target_fps()
-      • Preview panel fetches frames via grab_preview()
-      • Labels show reported_fps(), measured_preview_fps(), target_fps
+    - Live preview frames for the GUI
+    - Easy switching of device index
+    - A simple file writer with target FPS
+    - Basic FPS diagnostics (driver-reported + preview-measured)
     """
     def __init__(self, index: int, name: str, target_fps: int = 60):
-        """Bind a camera by index and set a target recording FPS.
+        """Bind to a camera index and set an intended recording FPS.
 
         Args:
-            index: OpenCV camera index.
-            name: Friendly name ("cam0"/"cam1") for logging/overlays.
-            target_fps: Intended FPS for recording.
-
-        GUI impact:
-            Initial values populate the Camera panel. Rebinding/retargeting occurs via Apply.
+            index: OpenCV device index (0, 1, ...).
+            name: Friendly label for logs (e.g., "cam0").
+            target_fps: Intended FPS for recordings (actual FPS may vary by hardware).
         """
         self.name = name
         self.target_fps = float(target_fps)
-        self._preview_times = deque(maxlen=30)
+        self._preview_times = deque(maxlen=30)  # rolling timestamps for preview FPS
         self._last_preview_frame = None
-        self.lock = threading.Lock()
+        self.lock = threading.Lock()            # guards self.cap during capture/record
         self.cap = None
-        self.synthetic = False
+        self.synthetic = False                  # if True, we render synthetic frames
         self.set_index(index)
 
     def _open(self, index: int):
-        """(Private) Try to open a VideoCapture at `index`; return (cap, synthetic_flag)."""
+        """Try to open the physical device at `index` using a few backends.
+
+        Returns:
+            (cap, False) if a real device opened successfully
+            (None, True) if we will use a synthetic camera
+        """
         backends = [cv2.CAP_ANY]
         if os.name == "nt":
+            # On Windows, DirectShow and Media Foundation are both worth trying explicitly.
             backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
-
         for be in backends:
             try:
                 cap = cv2.VideoCapture(index, be)
@@ -382,11 +439,7 @@ class CameraRecorder:
         return None, True  # synthetic
 
     def release(self):
-        """Release the underlying VideoCapture (if any).
-
-        GUI impact:
-            None. Called during cleanup and when rebinding to a new camera index.
-        """
+        """Release the camera device if it is currently open."""
         with self.lock:
             if self.cap:
                 try:
@@ -396,15 +449,7 @@ class CameraRecorder:
             self.cap = None
 
     def set_index(self, index: int):
-        """Bind to a new OpenCV camera `index`. Falls back to synthetic if unavailable.
-
-        Args:
-            index: Desired OpenCV index.
-
-        GUI impact:
-            Called when user changes “Which camera to use (OpenCV device index)” and presses “Apply Settings”.
-            Affects the live preview and subsequent recordings for this camera.
-        """
+        """Switch to a new OpenCV device index, falling back to a synthetic camera if needed."""
         with self.lock:
             if self.cap:
                 try:
@@ -419,15 +464,7 @@ class CameraRecorder:
                 print(f"[Camera {self.name}] bound to index {index}.")
 
     def set_target_fps(self, fps: float):
-        """Update the target FPS for recording and hint capture FPS to the driver.
-
-        Args:
-            fps: Target frames per second. (GUI allows 1..10000, default 60)
-
-        GUI impact:
-            Called when user changes “Target recording frame rate (fps)” and presses “Apply Settings”.
-            Updates the “Recording target frame rate (intended)” label and video writer behavior.
-        """
+        """Set the intended recording FPS and hint that value to the capture driver."""
         self.target_fps = float(fps)
         with self.lock:
             if self.cap:
@@ -437,11 +474,7 @@ class CameraRecorder:
                     pass
 
     def reported_fps(self) -> float:
-        """Return driver-reported FPS (CAP_PROP_FPS), may be 0 or inaccurate.
-
-        GUI impact:
-            Populates the “Driver-reported frame rate (may be 0 on some webcams)” label in the Camera panel.
-        """
+        """Return the driver-reported FPS from CAP_PROP_FPS (may be 0 or unreliable)."""
         with self.lock:
             if self.cap:
                 v = float(self.cap.get(cv2.CAP_PROP_FPS) or 0.0)
@@ -449,11 +482,7 @@ class CameraRecorder:
         return 0.0
 
     def measured_preview_fps(self) -> float:
-        """Compute measured preview FPS from recent preview timestamps.
-
-        GUI impact:
-            Populates the “Measured preview frame rate (GUI)” label in the Camera panel.
-        """
+        """Compute GUI preview FPS from recent frame timestamps."""
         if len(self._preview_times) < 2:
             return 0.0
         dt = self._preview_times[-1] - self._preview_times[0]
@@ -462,22 +491,19 @@ class CameraRecorder:
         return (len(self._preview_times) - 1) / dt
 
     def grab_preview(self, w=320, h=240, overlay_index=True):
-        """Return an RGB preview frame for GUI display (HxWx3 uint8).
+        """Return an RGB frame sized for the GUI preview area.
 
-        Args:
-            w, h: Desired preview size (GUI preview label dimensions).
-            overlay_index: If True, overlays “Index N” text on the frame.
-
-        GUI impact:
-            Called on a timer to update each camera's preview pane and FPS labels.
+        This method never blocks for long: if the camera read fails,
+        we return a simple "drop" frame so the GUI remains responsive.
         """
         with self.lock:
             if self.synthetic:
+                # Simple animation to prove the UI is refreshing
                 frame = np.full((h, w, 3), 255, dtype=np.uint8)
                 cv2.putText(frame, f"{self.name} (synthetic)", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
                 cx, cy = (int(time.time()*60) % w, h//2)
-                cv2.circle(frame, (cx, cy), 15, (0, 0, 0), 2)  # black dot
+                cv2.circle(frame, (cx, cy), 15, (0, 0, 0), 2)
             else:
                 ok, bgr = self.cap.read()
                 if not ok or bgr is None:
@@ -497,12 +523,12 @@ class CameraRecorder:
             return frame
 
     def _writer(self, path: str, size, fourcc_str: str = "mp4v"):
-        """(Private) Build a cv2.VideoWriter for (path, size) using current target FPS."""
+        """Create and return a cv2.VideoWriter using the given FOURCC and current target FPS."""
         fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
         return cv2.VideoWriter(path, fourcc, float(self.target_fps), size)
 
     def _frame_size(self):
-        """Return current capture size (width, height); defaults to 640x480 when unknown."""
+        """Return the current capture frame size (w, h), falling back to 640x480."""
         with self.lock:
             if self.cap:
                 w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
@@ -511,22 +537,15 @@ class CameraRecorder:
         return (640, 480)
 
     def record_clip(self, path: str, duration_s: float, fourcc_str: str = "mp4v"):
-        """Record a video clip to `path` for `duration_s` seconds at `target_fps`.
+        """Record a video to `path` for `duration_s` seconds at `target_fps`.
 
-        Args:
-            path: Output file path (container/extension should match FOURCC).
-            duration_s: Duration to record.
-            fourcc_str: FOURCC string selected in GUI (e.g., "mp4v", "avc1", "XVID", "VP90").
+        We attempt to open the writer using the selected FOURCC. If that fails,
+        we fall back to 'mp4v' so a recording is still produced.
 
         Returns:
-            The actual file path written (may differ if we fallback), or None on failure.
-
-        GUI impact:
-            Uses Camera panel's Target FPS and General settings; files appear under Output folder/date.
+            The path actually written (may be changed to .mp4 if we fell back), or None on failure.
         """
         size = self._frame_size()
-
-        # Attempt preferred writer
         out = self._writer(path, size, fourcc_str)
         if not out or not out.isOpened():
             print(f"[Camera {self.name}] VideoWriter failed for {path} with FOURCC={fourcc_str}. Trying fallback mp4v...")
@@ -550,6 +569,7 @@ class CameraRecorder:
         while time.time() < t_end:
             with self.lock:
                 if self.synthetic:
+                    # Render a simple white frame with a moving dot and timestamp
                     frame = np.full((size[1], size[0], 3), 255, dtype=np.uint8)
                     cv2.putText(frame, f"{self.name} {now_stamp()}", (20, 40),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
@@ -559,6 +579,7 @@ class CameraRecorder:
                 else:
                     ok, frame = self.cap.read()
                     if not ok or frame is None:
+                        # If a frame drops, write a placeholder so the writer stays open
                         frame = np.full((size[1], size[0], 3), 255, dtype=np.uint8)
                         cv2.putText(frame, f"{self.name} [drop] {now_stamp()}", (20, 40),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
@@ -566,6 +587,7 @@ class CameraRecorder:
                         ok_any = True
             out.write(frame)
             frame_index += 1
+            # Throttle loop to target FPS in a cross-platform friendly way
             time.sleep(max(0.0, 1.0 / float(self.target_fps)))
         out.release()
         if not ok_any and not self.synthetic:
@@ -575,138 +597,222 @@ class CameraRecorder:
 
 
 # =========================
-# Looming Stimulus (white background, black dot)
+# Looming Stimulus (white background, black dot) — persistent window
 # =========================
 class LoomingStim:
-    """Renders a growing-dot ("looming") stimulus via PsychoPy or OpenCV fallback.
+    """Display a growing black dot on a white (or chosen grey) background.
 
-    GUI settings used:
-      • Stimulus display duration (seconds), Starting/Final radius (pixels), Background shade (0–1)
+    Implementation details:
+    - If PsychoPy is available, we use it for accurate timing and full-screen support.
+    - If PsychoPy isn't available, we create a persistent OpenCV named window
+      and paint frames manually. The window stays open across trials so you
+      can drag it to another monitor one time and keep it there.
     """
-    def run(self, duration_s: float, r0: int, r1: int, bg_grey: float):
-        """Present the looming stimulus for `duration_s` with radius ranging r0->r1.
+    def __init__(self, cfg: Config):
+        """Create a stimulus manager bound to the shared configuration."""
+        self.cfg = cfg
+        # PsychoPy window cache (so we don't re-create it every trial)
+        self._pp_win = None
+        self._pp_cfg = None  # (screen_idx, fullscr)
+        # OpenCV window cache
+        self._cv_window_name = "Looming Stimulus"
+        self._cv_open = False
+        self._cv_size = (800, 600)  # default size for windowed mode
+
+    # ---------- internal helpers ----------
+    def _ensure_psychopy_window(self, screen_idx: int, fullscr: bool, bg_grey: float):
+        """Create or update the PsychoPy window so it matches screen/fullscreen settings."""
+        need_new = False
+        if self._pp_win is None:
+            need_new = True
+        elif self._pp_cfg != (screen_idx, fullscr):
+            # Screen index or full-screen state changed → rebuild window
+            try:
+                self._pp_win.close()
+            except Exception:
+                pass
+            self._pp_win = None
+            need_new = True
+
+        if need_new:
+            try:
+                if fullscr:
+                    self._pp_win = visual.Window(color=[bg_grey]*3, units='pix', fullscr=True, screen=screen_idx)
+                else:
+                    # Windowed & resizable → easy to drag anywhere
+                    self._pp_win = visual.Window(size=self._cv_size, color=[bg_grey]*3,
+                                                 units='pix', fullscr=False, screen=screen_idx, allowGUI=True)
+                self._pp_cfg = (screen_idx, fullscr)
+            except Exception as e:
+                print(f"[Stim] PsychoPy window create error: {e}")
+                self._pp_win = None
+
+        # Keep background color up-to-date (if the user changed it)
+        if self._pp_win is not None:
+            try:
+                self._pp_win.color = [bg_grey]*3
+            except Exception:
+                pass
+
+    def _ensure_opencv_window(self, screen_idx: int, bg_grey: float):
+        """Create the OpenCV window if needed and move it to the chosen monitor."""
+        try:
+            if not self._cv_open:
+                cv2.namedWindow(self._cv_window_name, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(self._cv_window_name, self._cv_size[0], self._cv_size[1])
+                self._cv_open = True
+            # Position the window near the top-left of the selected screen
+            geoms = get_screen_geometries()
+            if 0 <= screen_idx < len(geoms):
+                x, y, w, h = geoms[screen_idx]
+                cv2.moveWindow(self._cv_window_name, x + 50, y + 50)
+        except Exception as e:
+            print(f"[Stim] OpenCV window create/move error: {e}")
+            self._cv_open = False
+
+    # ---------- public API ----------
+    def run(self, duration_s: float, r0: int, r1: int, bg_grey: float,
+            screen_idx: int, fullscreen: bool):
+        """Show the looming stimulus for `duration_s` seconds.
 
         Args:
-            duration_s: Duration of the looming stimulus.
+            duration_s: Length of the stimulus in seconds.
             r0: Starting radius in pixels.
             r1: Ending radius in pixels.
-            bg_grey: Psychopy background grey level [0–1] (1=white). Ignored by OpenCV fallback which uses white.
-
-        GUI impact:
-            Reads current Stimulus panel values at trial time.
+            bg_grey: Background shade (0=black, 1=white).
+            screen_idx: Which monitor to present on.
+            fullscreen: If True, cover the entire selected screen; otherwise open a window.
         """
         print("[Stim] Looming start.")
+
         if PSYCHOPY:
             try:
-                win = visual.Window(size=(800, 600), color=[bg_grey]*3, units='pix', fullscr=False)
-                dot = visual.Circle(win, radius=r0, fillColor='black', lineColor='black')
-                t0 = time.time()
-                while True:
-                    t = time.time() - t0
-                    if t >= duration_s:
-                        break
-                    r = r0 + (r1 - r0) * (t / duration_s)
-                    dot.radius = r
-                    dot.draw()
-                    win.flip()
-                win.close()
-                print("[Stim] Looming done (PsychoPy).")
-                return
+                # Use a persistent, correctly-configured PsychoPy window
+                self._ensure_psychopy_window(screen_idx, fullscreen, bg_grey)
+                if self._pp_win is not None:
+                    dot = visual.Circle(self._pp_win, radius=r0, fillColor='black', lineColor='black')
+                    t0 = time.time()
+                    while True:
+                        t = time.time() - t0
+                        if t >= duration_s:
+                            break
+                        # Linearly scale radius over time (r0 -> r1)
+                        r = r0 + (r1 - r0) * (t / duration_s)
+                        dot.radius = r
+                        dot.draw()
+                        self._pp_win.flip()
+                    print("[Stim] Looming done (PsychoPy).")
+                    return
             except Exception as e:
                 print(f"[Stim] PsychoPy error: {e} -> OpenCV fallback.")
 
-        # OpenCV fallback: white background, black dot
+        # OpenCV fallback: persistent namedWindow positioned to selected screen
         try:
-            size = (800, 600)
-            cv2.namedWindow("Looming Stimulus", cv2.WINDOW_NORMAL)
-            cv2.resizeWindow("Looming Stimulus", size[0], size[1])
+            self._ensure_opencv_window(screen_idx, bg_grey)
+            size = self._cv_size
+            bg = int(np.clip(bg_grey * 255, 0, 255))
             t0 = time.time()
             while True:
                 t = time.time() - t0
                 if t >= duration_s:
                     break
                 r = int(r0 + (r1 - r0) * (t / duration_s))
-                frame = np.full((size[1], size[0], 3), 255, dtype=np.uint8)
+                frame = np.full((size[1], size[0], 3), bg, dtype=np.uint8)
                 cv2.circle(frame, (size[0]//2, size[1]//2), r, (0, 0, 0), -1)
-                cv2.imshow("Looming Stimulus", frame)
+                cv2.imshow(self._cv_window_name, frame)
+                # ESC allows an early exit without crashing the window
                 if cv2.waitKey(1) & 0xFF == 27:
                     break
-            cv2.destroyWindow("Looming Stimulus")
+            # We intentionally do NOT destroy the window, so it persists between trials.
             print("[Stim] Looming done (OpenCV).")
         except Exception as e:
             print(f"[Stim] OpenCV display unavailable ({e}). Logging-only fallback.")
             wait_s(duration_s)
             print("[Stim] Looming done (no display).")
 
+    def close(self):
+        """Tear down the persistent windows (PsychoPy and OpenCV) when quitting."""
+        # PsychoPy window cleanup
+        try:
+            if self._pp_win is not None:
+                self._pp_win.close()
+        except Exception:
+            pass
+        self._pp_win = None
+        self._pp_cfg = None
+
+        # OpenCV window cleanup
+        if self._cv_open:
+            try:
+                cv2.destroyWindow(self._cv_window_name)
+            except Exception:
+                pass
+        self._cv_open = False
+
 
 # =========================
 # Trial Orchestrator
 # =========================
 class TrialRunner:
-    """Coordinates lights, cameras, stimulus, and logging for each trigger event.
+    """Glue object that coordinates cameras, lights, stimulus, and logging for each trigger.
 
-    GUI settings used:
-      • Output folder for all trials, Video format/codec, Recording duration per trigger (seconds)
-      • Stimulus panel fields
-      • Camera target FPS (written to CSV)
+    Usage:
+      - `run_trial()` is called when a trigger occurs.
+      - It records both cameras in parallel, waits the configured delay,
+        runs the stimulus, and writes a row to the CSV log.
     """
     def __init__(self, cfg: Config, hardware: HardwareBridge, cam0: CameraRecorder, cam1: CameraRecorder, logger_path: str):
-        """Initialize the trial runner and open/create the CSV logger.
-
-        Args:
-            cfg: Shared Config (output, durations, stimulus params).
-            hardware: HardwareBridge for lights and trigger source.
-            cam0, cam1: CameraRecorder instances to record per trial.
-            logger_path: Path to CSV log file under Output folder.
-
-        GUI impact:
-            Writes to CSV files inside Output folder (visible to user). No direct widget updates.
-        """
+        """Create a TrialRunner and open (or create) the CSV log file."""
         self.cfg = cfg
         self.hardware = hardware
         self.cam0 = cam0
         self.cam1 = cam1
-        self.stim = LoomingStim()
+        self.stim = LoomingStim(cfg)
         self.trial_idx = 0
-        # CSV logger
+
+        # CSV logger set-up (append mode; create header if file is new)
         new_file = not os.path.exists(logger_path)
         ensure_dir(os.path.dirname(logger_path))
         self.log_file = open(logger_path, "a", newline="", encoding="utf-8")
         self.log_writer = csv.writer(self.log_file)
         if new_file:
             self.log_writer.writerow([
-                "trial", "timestamp", "cam0_path", "cam1_path",
-                "record_duration_s", "stim_duration_s", "cam0_target_fps", "cam1_target_fps",
+                "trial", "timestamp",
+                "cam0_path", "cam1_path",
+                "record_duration_s", "stim_duration_s", "stim_delay_s",
+                "stim_screen_index", "stim_fullscreen",
+                "cam0_target_fps", "cam1_target_fps",
                 "video_preset_id", "fourcc"
             ])
 
     def close(self):
-        """Close the CSV logger file handle.
-
-        GUI impact:
-            None (file is flushed/closed on exit).
-        """
+        """Close the CSV log and stimulus windows at application shutdown."""
         try:
             self.log_file.close()
         except Exception:
             pass
+        try:
+            self.stim.close()
+        except Exception:
+            pass
 
     def _preset(self):
-        """Return the active video preset dict."""
+        """Return the active video preset dict (container/FOURCC/labels)."""
         return PRESETS_BY_ID.get(self.cfg.video_preset_id, PRESETS_BY_ID[default_preset_id()])
 
     def run_trial(self):
-        """Execute one complete trial: lights -> cameras (parallel) -> looming -> log.
+        """Perform one full trial from start to end.
 
-        Reads from GUI/Config:
-            • cfg.output_root, cfg.video_preset_id (container & fourcc), cfg.record_duration_s
-            • cfg.stim_* fields
-            • cam0.target_fps, cam1.target_fps (written to CSV)
+        Steps:
+          1) Increment trial index and compute output paths.
+          2) Turn on lights and send START marker.
+          3) Launch camera recordings in two parallel threads.
+          4) Wait the configured delay (`stim_delay_s`), then send STIM marker.
+          5) Run the looming stimulus on the selected monitor.
+          6) Join camera threads, send END marker, and turn lights off.
+          7) Write a CSV row including file paths and key settings.
 
-        Side-effects:
-            • Writes two video files into Output folder/date
-            • Appends a row to the CSV log
-            • Console status prints
+        All significant moments also print to the console for quick diagnostics.
         """
         self.trial_idx += 1
         ts = now_stamp()
@@ -716,6 +822,7 @@ class TrialRunner:
         ext = preset["ext"]
         fourcc = preset["fourcc"]
 
+        # Requested output paths. Note: writer may fall back to .mp4 if FOURCC is unsupported.
         cam0_path_req = os.path.join(out_dir, f"{ts}_trial{self.trial_idx:04d}_cam0{ext}")
         cam1_path_req = os.path.join(out_dir, f"{ts}_trial{self.trial_idx:04d}_cam1{ext}")
 
@@ -723,7 +830,7 @@ class TrialRunner:
         self.hardware.activate_lights()
         self.hardware.mark_start()
 
-        # Record both cameras in parallel, capturing the actual written paths
+        # Record both cameras in parallel, capturing the actual written paths from each
         results = {"cam0": None, "cam1": None}
         def rec0():
             results["cam0"] = self.cam0.record_clip(cam0_path_req, self.cfg.record_duration_s, fourcc)
@@ -734,20 +841,37 @@ class TrialRunner:
         t1 = threading.Thread(target=rec1, daemon=True)
         t0.start(); t1.start()
 
-        # Run looming while cameras record
-        self.hardware.mark_stim()
-        self.stim.run(self.cfg.stim_duration_s, self.cfg.stim_r0_px, self.cfg.stim_r1_px, self.cfg.stim_bg_grey)
+        # Configurable delay between recording start and stimulus onset
+        delay = max(0.0, float(self.cfg.stim_delay_s))
+        if delay > 0:
+            print(f"[Trial {self.trial_idx}] Waiting {delay:.3f}s before stimulus...")
+            wait_s(delay)
 
+        # Mark stimulus onset right before we actually draw the first frame
+        self.hardware.mark_stim()
+
+        # Show looming stimulus while cameras are still recording
+        self.stim.run(self.cfg.stim_duration_s,
+                      self.cfg.stim_r0_px, self.cfg.stim_r1_px,
+                      self.cfg.stim_bg_grey,
+                      screen_idx=self.cfg.stim_screen_index,
+                      fullscreen=self.cfg.stim_fullscreen)
+
+        # Close out the trial: wait for cameras, mark end, turn lights off
         t0.join(); t1.join()
         self.hardware.mark_end()
         self.hardware.light_off()
 
+        # Final written paths (may differ from requested if we fell back)
         cam0_path_actual = results["cam0"] or cam0_path_req
         cam1_path_actual = results["cam1"] or cam1_path_req
 
+        # Append a log row with key parameters for reproducibility
         self.log_writer.writerow([
-            self.trial_idx, ts, cam0_path_actual, cam1_path_actual,
-            self.cfg.record_duration_s, self.cfg.stim_duration_s,
+            self.trial_idx, ts,
+            cam0_path_actual, cam1_path_actual,
+            self.cfg.record_duration_s, self.cfg.stim_duration_s, self.cfg.stim_delay_s,
+            self.cfg.stim_screen_index, int(self.cfg.stim_fullscreen),
             self.cam0.target_fps, self.cam1.target_fps,
             self.cfg.video_preset_id, fourcc
         ])
@@ -759,28 +883,24 @@ class TrialRunner:
 # All-in-One GUI
 # =========================
 class SettingsGUI(QtWidgets.QWidget):
-    """Single-window GUI exposing all settings, camera previews, and loop controls.
+    """Single-window GUI exposing all settings, camera previews, windows/screens and loop controls.
 
     Signals:
-      • start_experiment() — user clicked "Start"
-      • stop_experiment()  — user clicked "Stop"
-      • apply_settings()   — user clicked "Apply Settings"
-
-    Panels/controls map to Config and CameraRecorder instances passed by MainApp.
+      - start_experiment(): user clicked "Start"
+      - stop_experiment():  user clicked "Stop"
+      - apply_settings():   user clicked "Apply Settings"
+      - manual_trigger():   user clicked "Trigger Once (Manual)"
     """
     start_experiment = QtCore.pyqtSignal()
     stop_experiment  = QtCore.pyqtSignal()
     apply_settings   = QtCore.pyqtSignal()
+    manual_trigger   = QtCore.pyqtSignal()
 
     def __init__(self, cfg: Config, cam0: CameraRecorder, cam1: CameraRecorder):
-        """Build all GUI widgets and bind local references.
+        """Build the entire GUI and connect signal handlers.
 
-        Args:
-            cfg: Shared Config (read to initialize widgets).
-            cam0, cam1: CameraRecorder objects for previews and live info.
-
-        GUI impact:
-            Initializes all displayed settings to match current Config/camera state.
+        The layout is designed for a 1920×1080 screen. The top area contains global and
+        stimulus settings; the bottom half contains two camera panels with live previews.
         """
         super().__init__()
         self.cfg  = cfg
@@ -793,16 +913,19 @@ class SettingsGUI(QtWidgets.QWidget):
 
         root = QtWidgets.QVBoxLayout(self)
 
-        # --- Controls row: Start / Stop ---
+        # --- Controls row: Start / Stop / Trigger Once / Apply ---
         controls = QtWidgets.QHBoxLayout()
-        self.bt_start = QtWidgets.QPushButton("Start")
-        self.bt_stop  = QtWidgets.QPushButton("Stop")
-        self.bt_apply = QtWidgets.QPushButton("Apply Settings")
+        self.bt_start   = QtWidgets.QPushButton("Start")
+        self.bt_stop    = QtWidgets.QPushButton("Stop")
+        self.bt_trigger = QtWidgets.QPushButton("Trigger Once (Manual)")  # Manual single trial for quick testing
+        self.bt_apply   = QtWidgets.QPushButton("Apply Settings")
         self.bt_start.setToolTip("Begin watching for triggers. On each trigger: lights on, record both cameras, show looming stimulus, log trial.")
         self.bt_stop.setToolTip("Stop watching for triggers. Safe to close the app after this.")
+        self.bt_trigger.setToolTip("Run a single trial immediately (for testing without hardware trigger).")
         self.bt_apply.setToolTip("Apply changes from the panels below without restarting the app.")
         controls.addWidget(self.bt_start)
         controls.addWidget(self.bt_stop)
+        controls.addWidget(self.bt_trigger)
         controls.addStretch(1)
         controls.addWidget(self.bt_apply)
         root.addLayout(controls)
@@ -840,14 +963,13 @@ class SettingsGUI(QtWidgets.QWidget):
         _lbl_root = QtWidgets.QLabel("Output folder for all trials:"); _lbl_root.setWordWrap(True)
         gl.addRow(_lbl_root, rhl)
 
-        # New: Video format/codec dropdown with captions
+        # Video format/codec dropdown with captions
         self.cb_format = QtWidgets.QComboBox()
         self.cb_format.setToolTip("Select the container and codec for saved videos. Captions show typical max resolution/FPS and approximate file size.")
         self._preset_id_by_index = {}
         current_index = 0
         for i, p in enumerate(VIDEO_PRESETS):
             self.cb_format.addItem(p["label"])
-            # store id as userData
             self.cb_format.setItemData(i, p["id"])
             self._preset_id_by_index[i] = p["id"]
             if p["id"] == self.cfg.video_preset_id:
@@ -887,11 +1009,52 @@ class SettingsGUI(QtWidgets.QWidget):
         sl.addRow(_lbl_r1, self.sb_r1)
 
         self.sb_bg = QtWidgets.QDoubleSpinBox(); self.sb_bg.setRange(0.0, 1.0); self.sb_bg.setSingleStep(0.05); self.sb_bg.setValue(self.cfg.stim_bg_grey)
-        self.sb_bg.setToolTip("Background shade for PsychoPy display (0 = black, 1 = white). OpenCV fallback uses white regardless.")
+        self.sb_bg.setToolTip("Background shade for PsychoPy display (0 = black, 1 = white). OpenCV fallback uses this shade as well.")
         _lbl_bg = QtWidgets.QLabel("Stimulus background shade (0=black, 1=white):"); _lbl_bg.setWordWrap(True)
         sl.addRow(_lbl_bg, self.sb_bg)
 
+        # Stimulus delay
+        self.sb_stim_delay = QtWidgets.QDoubleSpinBox()
+        self.sb_stim_delay.setRange(0.0, 10.0); self.sb_stim_delay.setDecimals(3)
+        self.sb_stim_delay.setValue(self.cfg.stim_delay_s)
+        self.sb_stim_delay.setToolTip("Delay (seconds) after recording starts before the stimulus begins.")
+        _lbl_delay = QtWidgets.QLabel("Delay before stimulus after recording start (seconds):"); _lbl_delay.setWordWrap(True)
+        sl.addRow(_lbl_delay, self.sb_stim_delay)
+
         panels.addWidget(stim, 0, 1)
+
+        # Display / Screens panel
+        disp = QtWidgets.QGroupBox("Display & Windows")
+        disp.setToolTip("Choose which monitor shows the Stimulus window and the GUI. Stimulus can be fullscreen or windowed.")
+        dl = QtWidgets.QFormLayout(disp)
+        dl.setRowWrapPolicy(QtWidgets.QFormLayout.WrapAllRows)
+
+        # Build screen choices
+        screens = QtGui.QGuiApplication.screens()
+        def screen_label(i, s):
+            g = s.geometry()
+            return f"Screen {i} — {g.width()}×{g.height()} @ ({g.x()},{g.y()})"
+
+        self.cb_stim_screen = QtWidgets.QComboBox()
+        self.cb_gui_screen = QtWidgets.QComboBox()
+        for i, s in enumerate(screens):
+            lbl = screen_label(i, s)
+            self.cb_stim_screen.addItem(lbl)
+            self.cb_gui_screen.addItem(lbl)
+        self.cb_stim_screen.setCurrentIndex(self.cfg.stim_screen_index if self.cfg.stim_screen_index < len(screens) else 0)
+        self.cb_gui_screen.setCurrentIndex(self.cfg.gui_screen_index if self.cfg.gui_screen_index < len(screens) else 0)
+        self.cb_stim_screen.setToolTip("Which monitor should the looming stimulus appear on.")
+        self.cb_gui_screen.setToolTip("Which monitor should host this GUI window.")
+
+        self.cb_stim_fullscr = QtWidgets.QCheckBox("Stimulus fullscreen on selected screen")
+        self.cb_stim_fullscr.setChecked(bool(self.cfg.stim_fullscreen))
+        self.cb_stim_fullscr.setToolTip("If checked, the stimulus uses fullscreen on the chosen monitor; otherwise it opens a resizable window you can drag anywhere.")
+
+        dl.addRow(QtWidgets.QLabel("Stimulus display screen:"), self.cb_stim_screen)
+        dl.addRow(QtWidgets.QLabel("GUI display screen:"), self.cb_gui_screen)
+        dl.addRow(self.cb_stim_fullscr)
+
+        panels.addWidget(disp, 1, 0, 1, 2)
 
         # Camera panels
         self.cam_groups = []
@@ -914,7 +1077,7 @@ class SettingsGUI(QtWidgets.QWidget):
             # Camera index selection
             spin_index = QtWidgets.QSpinBox()
             spin_index.setRange(0, 15)
-            spin_index.setValue(cam.index)
+            spin_index.setValue(getattr(cam, "index", 0))
             spin_index.setToolTip("Which camera to use (OpenCV device index). Change if the preview shows the wrong device; click Apply to rebind.")
             _lbl_idx = QtWidgets.QLabel("Which camera to use (OpenCV device index):"); _lbl_idx.setWordWrap(True)
             fl.addWidget(_lbl_idx, 0, 1)
@@ -923,7 +1086,7 @@ class SettingsGUI(QtWidgets.QWidget):
             # FPS selection — typable up to 10,000
             spin_fps = QtWidgets.QSpinBox()
             spin_fps.setRange(1, 10000)
-            spin_fps.setValue(60)
+            spin_fps.setValue(int(target_default))
             spin_fps.setAccelerated(True)
             spin_fps.setKeyboardTracking(True)
             spin_fps.setToolTip("Target recording frame rate (FPS). Type directly or use arrows. Range: 1–10,000. Actual FPS may be limited by camera/driver.")
@@ -962,7 +1125,7 @@ class SettingsGUI(QtWidgets.QWidget):
                 "cam": cam
             })
 
-            panels.addWidget(gb, 1, idx)
+            panels.addWidget(gb, 2, idx)
 
         # Status
         self.lbl_status = QtWidgets.QLabel("Status: Idle")
@@ -973,6 +1136,7 @@ class SettingsGUI(QtWidgets.QWidget):
         # Signals
         self.bt_start.clicked.connect(self.start_experiment.emit)
         self.bt_stop.clicked.connect(self.stop_experiment.emit)
+        self.bt_trigger.clicked.connect(self.manual_trigger.emit)
         self.bt_apply.clicked.connect(self.apply_settings.emit)
         self.btn_browse.clicked.connect(self._pick_folder)
 
@@ -983,31 +1147,19 @@ class SettingsGUI(QtWidgets.QWidget):
         self.preview_paused = False
 
     def _pick_folder(self):
-        """Open a directory picker and write the selected path to Output Root line edit.
-
-        GUI impact:
-            Updates the “Output folder for all trials” field; changes take effect after “Apply Settings”.
-        """
+        """Open a directory picker and store the user's selection in the Output Root field."""
         path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Output Root", self.le_root.text() or ".")
         if path:
             self.le_root.setText(path)
 
     def _refresh_general_labels(self):
-        """Refresh labels derived from config (e.g., Simulation mode text).
-
-        GUI impact:
-            Updates “Simulation mode: ON/OFF …” label based on cfg.simulation_mode.
-        """
+        """Reflect the current simulation mode in the big label at the top of General settings."""
         self.lbl_sim.setText(
             f"Simulation mode: {'ON (timer-based triggers)' if self.cfg.simulation_mode else 'OFF (hardware triggers active)'}"
         )
 
     def update_cam_fps_labels(self):
-        """Update Driver-reported/Preview/Target FPS labels for both cameras.
-
-        GUI impact:
-            Writes to per-camera labels in the Camera panels.
-        """
+        """Update the three FPS labels (driver-reported, GUI-measured, target) for each camera."""
         for g in self.cam_groups:
             cam: CameraRecorder = g["cam"]
             rep = cam.reported_fps()
@@ -1021,15 +1173,7 @@ class SettingsGUI(QtWidgets.QWidget):
             g["lbl_tar"].setText(f"Recording target frame rate (intended): {int(cam.target_fps)}")
 
     def set_preview_image(self, cam_idx: int, img_rgb: np.ndarray):
-        """Render a numpy RGB image into the preview QLabel for camera `cam_idx`.
-
-        Args:
-            cam_idx: 0 or 1 (Camera panels' index).
-            img_rgb: HxWx3 uint8 RGB image produced by CameraRecorder.grab_preview().
-
-        GUI impact:
-            Visually updates the “preview & frame rate” box for the selected camera.
-        """
+        """Render a numpy RGB image into the preview QLabel for camera `cam_idx`."""
         g = self.cam_groups[cam_idx]
         h, w, _ = img_rgb.shape
         qimg = QtGui.QImage(img_rgb.data, w, h, w*3, QtGui.QImage.Format_RGB888)
@@ -1045,21 +1189,12 @@ class SettingsGUI(QtWidgets.QWidget):
 # Main Application
 # =========================
 class MainApp(QtWidgets.QApplication):
-    """Qt Application wiring together Config, Hardware, Cameras, GUI, and the trigger loop.
+    """Top-level Qt application that wires together Config, Hardware, Cameras, GUI, and the trigger loop.
 
-    GUI settings used/written:
-      • Reads all panels via apply_from_gui()
-      • Updates Status label and camera preview/fps labels periodically
+    The MainApp owns the long-lived objects and controls the background loop that watches for triggers.
     """
     def __init__(self, argv):
-        """Construct all subsystems, prompt for Simulation Mode, and show the GUI.
-
-        Args:
-            argv: sys.argv from Python entry point.
-
-        GUI impact:
-            Shows Yes/No dialog to set cfg.simulation_mode, initializes panels, starts preview timer.
-        """
+        """Construct subsystems, prompt for Simulation Mode, and display the GUI."""
         super().__init__(argv)
         # Config + Simulation prompt
         self.cfg = Config()
@@ -1085,7 +1220,11 @@ class MainApp(QtWidgets.QApplication):
         self.gui.start_experiment.connect(self.start_loop)
         self.gui.stop_experiment.connect(self.stop_loop)
         self.gui.apply_settings.connect(self.apply_from_gui)
+        self.gui.manual_trigger.connect(self.trigger_once)
         self.gui.show()
+
+        # Place GUI on selected screen initially (centered on that monitor)
+        self.position_gui(self.cfg.gui_screen_index)
 
         # Preview timer (updates when idle)
         self.preview_timer = QtCore.QTimer(self)
@@ -1093,30 +1232,35 @@ class MainApp(QtWidgets.QApplication):
         self.preview_timer.timeout.connect(self.update_previews)
         self.preview_timer.start()
 
-        # Status
-        self.running = False
-        self.in_trial = False
-        self.thread = None
+        # State flags
+        self.running = False   # whether the trigger-watching loop is running
+        self.in_trial = False  # whether a trial is currently executing
+        self.thread = None     # background loop thread
 
-        # Cleanup hooks
+        # Cleanup hooks to ensure cameras, serial, and files close properly
         self.aboutToQuit.connect(self.cleanup)
         atexit.register(self.cleanup)
 
         # Initialize labels after sim prompt
         self.gui._refresh_general_labels()
 
+    def position_gui(self, screen_idx: int):
+        """Move and center the GUI window on the chosen screen."""
+        screens = QtGui.QGuiApplication.screens()
+        if not screens:
+            return
+        if screen_idx < 0 or screen_idx >= len(screens):
+            screen_idx = 0
+        g = screens[screen_idx].availableGeometry()
+        w = self.gui.frameGeometry()
+        w.moveCenter(g.center())
+        self.gui.move(w.topLeft())
+
     def apply_from_gui(self):
         """Read current widget values and write them into Config/Cameras.
 
-        Reads/writes:
-            • General settings → cfg.sim_trigger_interval, cfg.output_root, cfg.video_preset_id, cfg.record_duration_s
-            • Looming stimulus → cfg.stim_* fields
-            • Camera panels → cam.set_index(), cam.set_target_fps()
-            • Updates cfg.cam* fields from CameraRecorder state
-            • Ensures Output folder exists
-
-        GUI impact:
-            Sets Status to “Settings applied.” and prints console confirmation.
+        This is the single place where UI → runtime updates are applied.
+        It keeps the rest of the code clean and predictable.
         """
         # General
         self.cfg.sim_trigger_interval = float(self.gui.sb_sim_interval.value())
@@ -1137,22 +1281,30 @@ class MainApp(QtWidgets.QApplication):
         self.cfg.stim_r0_px = int(self.gui.sb_r0.value())
         self.cfg.stim_r1_px = int(self.gui.sb_r1.value())
         self.cfg.stim_bg_grey = float(self.gui.sb_bg.value())
+        self.cfg.stim_delay_s = float(self.gui.sb_stim_delay.value())
+        self.cfg.stim_screen_index = int(self.gui.cb_stim_screen.currentIndex())
+        self.cfg.stim_fullscreen = bool(self.gui.cb_stim_fullscr.isChecked())
 
-        # Cameras
+        # GUI screen placement
+        self.cfg.gui_screen_index = int(self.gui.cb_gui_screen.currentIndex())
+        self.position_gui(self.cfg.gui_screen_index)
+
+        # Cameras (rebind as needed and update target FPS)
         cam0_new_idx = int(self.gui.cam_groups[0]["spin_index"].value())
         cam0_new_tfps = int(self.gui.cam_groups[0]["spin_fps"].value())
-        if cam0_new_idx != self.cam0.index:
+        if cam0_new_idx != getattr(self.cam0, "index", -1):
             self.cam0.set_index(cam0_new_idx)
         self.cam0.set_target_fps(cam0_new_tfps)
 
         cam1_new_idx = int(self.gui.cam_groups[1]["spin_index"].value())
         cam1_new_tfps = int(self.gui.cam_groups[1]["spin_fps"].value())
-        if cam1_new_idx != self.cam1.index:
+        if cam1_new_idx != getattr(self.cam1, "index", -1):
             self.cam1.set_index(cam1_new_idx)
         self.cam1.set_target_fps(cam1_new_tfps)
 
-        self.cfg.cam0_index = self.cam0.index
-        self.cfg.cam1_index = self.cam1.index
+        # Mirror back into cfg for logging completeness
+        self.cfg.cam0_index = getattr(self.cam0, "index", 0)
+        self.cfg.cam1_index = getattr(self.cam1, "index", 1)
         self.cfg.cam0_target_fps = int(self.cam0.target_fps)
         self.cfg.cam1_target_fps = int(self.cam1.target_fps)
 
@@ -1161,19 +1313,14 @@ class MainApp(QtWidgets.QApplication):
         print("[MainApp] Settings applied.")
 
     def update_previews(self):
-        """Refresh camera previews and FPS labels when not recording a trial.
-
-        GUI impact:
-            • Updates preview panes for both cameras
-            • Updates Driver-reported/Preview/Target FPS labels
-            • Writes the Status label (“Waiting / Idle” or “Trial running” when paused)
-        """
+        """Refresh the camera previews and FPS labels when not in a trial."""
         if self.in_trial:
+            # While recording, we pause preview updates to avoid starving the writers.
             self.gui.lbl_status.setText("Status: Trial running (preview paused).")
             self.gui.update_cam_fps_labels()
             return
 
-        # Render frames at the preview labels' actual sizes
+        # Render frames at the preview labels' actual sizes for best quality/perf
         p0 = self.gui.cam_groups[0]["preview"]
         p1 = self.gui.cam_groups[1]["preview"]
         img0 = self.cam0.grab_preview(w=p0.width(), h=p0.height())
@@ -1185,15 +1332,10 @@ class MainApp(QtWidgets.QApplication):
         self.gui.lbl_status.setText("Status: Waiting / Idle.")
 
     def loop(self):
-        """Background trigger loop. On trigger, runs a trial end-to-end.
+        """Background thread that watches for triggers and runs trials.
 
-        Reads:
-            • hardware.check_trigger() (Simulation interval or real serial)
-        Calls:
-            • trial_runner.run_trial() which uses cfg and camera settings
-
-        GUI impact:
-            Writes status messages to Status label and prints to console.
+        The loop is simple by design: poll for triggers, run a trial when one occurs,
+        and update the GUI status messages so the user knows what's happening.
         """
         self.gui.lbl_status.setText("Status: Watching for triggers...")
         print("[MainApp] Trigger loop started.")
@@ -1205,31 +1347,37 @@ class MainApp(QtWidgets.QApplication):
                     self.trial_runner.run_trial()
                     self.in_trial = False
                     self.gui.lbl_status.setText("Status: Trial finished.")
-                time.sleep(0.002)
+                time.sleep(0.002)  # tiny sleep keeps CPU usage sane
             except Exception as e:
                 print(f"[MainApp] Loop error: {e}")
                 self.gui.lbl_status.setText(f"Status: Error - {e}")
                 time.sleep(0.05)
         print("[MainApp] Trigger loop stopped.")
 
-    def start_loop(self):
-        """Start the trigger loop thread (idempotent).
+    def trigger_once(self):
+        """Run a single trial immediately (manual button). Does not affect the background loop."""
+        if self.in_trial:
+            return  # ignore if already mid-trial
+        def _run():
+            try:
+                self.in_trial = True
+                self.gui.lbl_status.setText("Status: Trial running (manual trigger)...")
+                self.trial_runner.run_trial()
+                self.gui.lbl_status.setText("Status: Trial finished (manual).")
+            finally:
+                self.in_trial = False
+        threading.Thread(target=_run, daemon=True).start()
 
-        GUI impact:
-            Applies current settings before starting; Status reflects “Watching for triggers...”.
-        """
+    def start_loop(self):
+        """Start the background trigger-watching loop (idempotent)."""
         if not self.running:
-            self.apply_from_gui()  # ensure latest settings at start
+            self.apply_from_gui()  # ensure we use the latest settings
             self.running = True
             self.thread = threading.Thread(target=self.loop, daemon=True)
             self.thread.start()
 
     def stop_loop(self):
-        """Stop the trigger loop thread and update Status.
-
-        GUI impact:
-            Sets Status to “Stopped.” after the worker thread has been joined.
-        """
+        """Stop the background loop and update the status label."""
         self.running = False
         if self.thread:
             try:
@@ -1240,11 +1388,7 @@ class MainApp(QtWidgets.QApplication):
         self.gui.lbl_status.setText("Status: Stopped.")
 
     def cleanup(self):
-        """Gracefully shut down background thread, log file, hardware, and cameras.
-
-        GUI impact:
-            None directly; prints “Cleanup complete.” and ensures resources are released.
-        """
+        """Gracefully shut down threads, close files/serial/cameras, and print a final message."""
         self.running = False
         if self.thread:
             try:
@@ -1269,5 +1413,6 @@ class MainApp(QtWidgets.QApplication):
 
 
 if __name__ == "__main__":
+    # Create and run the Qt app. This call blocks until the window is closed.
     app = MainApp(sys.argv)
     sys.exit(app.exec_())
