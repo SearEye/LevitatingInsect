@@ -156,7 +156,7 @@ class Config:
         self.stim_duration_s = 1.5
         self.stim_r0_px = 8
         self.stim_r1_px = 400
-        self.stim_bg_grey = 0.1
+        self.stim_bg_grey = 1.0  # default to WHITE background
 
         # Cameras
         self.cam0_index = 0
@@ -503,16 +503,19 @@ class LoomingStim:
     """Renders a growing-dot ("looming") stimulus via PsychoPy or OpenCV fallback.
 
     GUI settings used:
-      • Stimulus display duration (seconds), Starting/Final radius (pixels), Background shade (0–1)
+      • Stimulus display duration (seconds), Starting/Final radius (pixels), Background shade (0–1; default white)
     """
     def run(self, duration_s: float, r0: int, r1: int, bg_grey: float):
         """Present the looming stimulus for `duration_s` with radius ranging r0->r1.
+
+        Background is WHITE; dot is BLACK by default (bg_grey controls Psychopy background; default=1.0).
+        For OpenCV fallback, the background is generated from `bg_grey` (default white).
 
         Args:
             duration_s: Duration of the looming stimulus.
             r0: Starting radius in pixels.
             r1: Ending radius in pixels.
-            bg_grey: Psychopy background grey level [0–1] (ignored by OpenCV fallback).
+            bg_grey: Background grey level [0–1]; 1.0 = white (default).
 
         GUI impact:
             Reads current Stimulus panel values at trial time.
@@ -520,8 +523,9 @@ class LoomingStim:
         print("[Stim] Looming start.")
         if PSYCHOPY:
             try:
+                # White (or chosen) background, BLACK dot
                 win = visual.Window(size=(800, 600), color=[bg_grey]*3, units='pix', fullscr=False)
-                dot = visual.Circle(win, radius=r0, fillColor='white', lineColor='white')
+                dot = visual.Circle(win, radius=r0, fillColor='black', lineColor='black')
                 t0 = time.time()
                 while True:
                     t = time.time() - t0
@@ -537,19 +541,25 @@ class LoomingStim:
             except Exception as e:
                 print(f"[Stim] PsychoPy error: {e} -> OpenCV fallback.")
 
-        # OpenCV fallback
+        # OpenCV fallback (WHITE by default; uses bg_grey level)
         try:
             size = (800, 600)
             cv2.namedWindow("Looming Stimulus", cv2.WINDOW_NORMAL)
             cv2.resizeWindow("Looming Stimulus", size[0], size[1])
             t0 = time.time()
+
+            # compute background shade (0..255), default 255 (white)
+            bg = int(np.clip(bg_grey, 0.0, 1.0) * 255)
+
             while True:
                 t = time.time() - t0
                 if t >= duration_s:
                     break
                 r = int(r0 + (r1 - r0) * (t / duration_s))
-                frame = np.zeros((size[1], size[0], 3), dtype=np.uint8)
-                cv2.circle(frame, (size[0]//2, size[1]//2), r, (255, 255, 255), -1)
+                # start with white/grey background
+                frame = np.full((size[1], size[0], 3), bg, dtype=np.uint8)
+                # draw BLACK filled circle
+                cv2.circle(frame, (size[0]//2, size[1]//2), r, (0, 0, 0), -1)
                 cv2.imshow("Looming Stimulus", frame)
                 if cv2.waitKey(1) & 0xFF == 27:
                     break
@@ -787,7 +797,7 @@ class SettingsGUI(QtWidgets.QWidget):
         sl.addRow(_lbl_r1, self.sb_r1)
 
         self.sb_bg = QtWidgets.QDoubleSpinBox(); self.sb_bg.setRange(0.0, 1.0); self.sb_bg.setSingleStep(0.05); self.sb_bg.setValue(self.cfg.stim_bg_grey)
-        self.sb_bg.setToolTip("Background shade for PsychoPy display (0 = black, 1 = white). Ignored by OpenCV fallback.")
+        self.sb_bg.setToolTip("Background shade (PsychoPy; default white=1.0). OpenCV fallback also uses this level.")
         _lbl_bg = QtWidgets.QLabel("Stimulus background shade (0=black, 1=white):"); _lbl_bg.setWordWrap(True)
         sl.addRow(_lbl_bg, self.sb_bg)
 
@@ -820,7 +830,7 @@ class SettingsGUI(QtWidgets.QWidget):
             fl.addWidget(_lbl_idx, 0, 1)
             fl.addWidget(spin_index, 0, 2)
 
-            # FPS selection — updated per request
+            # FPS selection — updated as requested
             spin_fps = QtWidgets.QSpinBox()
             spin_fps.setRange(1, 10000)                 # allow up to 10,000 FPS
             spin_fps.setValue(60)                       # start at 60
@@ -996,6 +1006,7 @@ class MainApp(QtWidgets.QApplication):
 
         # Status
         self.running = False
+        our_thread = None
         self.in_trial = False
         self.thread = None
 
