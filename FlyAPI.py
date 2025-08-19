@@ -3,7 +3,7 @@ FlyPy — Trigger->Outputs build with All-in-One Settings GUI, camera previews, 
 and comprehensive docstrings (natural-English labels).
 
 On each trigger:
-  • Activates lights (serial if available; simulated otherwise)
+  • Activates lights (Elegoo UNO if available; simulated otherwise)
   • Records synchronized clips from two cameras to disk
   • Presents a looming (growing dot) visual stimulus
   • Logs trial metadata (CSV) with file paths and timestamps
@@ -166,102 +166,8 @@ class Config:
 
 
 # =========================
-# Hardware Bridge
+# Hardware Bridge (Elegoo UNO R3)
 # =========================
-
-###PRIOR STAND-IN / / WIP ONLY###
-# class HardwareBridge:
-#     """Bridge for trigger and light commands over serial, with simulation fallback.
-
-#     GUI settings used:
-#       • cfg.simulation_mode  — toggles simulated triggers
-#       • cfg.sim_trigger_interval — interval for simulated triggers
-#     """
-#     def __init__(self, cfg: Config, port="COM3", baud=9600):
-#         """Attempt to open serial port; otherwise run in simulation mode.
-
-#         Args:
-#             cfg: Shared Config with simulation settings.
-#             port: Serial port for hardware trigger/light controller.
-#             baud: Baud rate.
-
-#         GUI impact:
-#             Reads cfg.simulation_mode at creation time.
-#             No direct writes to GUI; status printed to console.
-#         """
-#         self.cfg = cfg
-#         self.simulated = cfg.simulation_mode
-#         self._last_sim = time.time()
-#         self.ser = None
-#         if not self.simulated:
-#             try:
-#                 import serial
-#                 try:
-#                     self.ser = serial.Serial(port, baud, timeout=0.01)
-#                     wait_s(2)  # allow MCU reset
-#                 except Exception as e:
-#                     print(f"[HardwareBridge] Serial open failed: {e} -> simulation.")
-#                     self.simulated = True
-#             except ImportError:
-#                 print("[HardwareBridge] pyserial missing -> simulation.")
-#                 self.simulated = True
-
-#     def check_trigger(self) -> bool:
-#         """Return True when a trigger is detected (simulated or serial).
-
-#         Behavior:
-#             • Simulated: True every cfg.sim_trigger_interval seconds.
-#             • Serial: reads lines; "T" indicates a trigger.
-
-#         GUI impact:
-#             Reads cfg.sim_trigger_interval (General settings).
-#             Drives the main loop state (Status label will reflect trial start).
-#         """
-#         if self.simulated:
-#             now = time.time()
-#             if now - self._last_sim >= self.cfg.sim_trigger_interval:
-#                 self._last_sim = now
-#                 print("[HardwareBridge] (Sim) Trigger.")
-#                 return True
-#             return False
-#         # Real serial
-#         try:
-#             if self.ser and self.ser.in_waiting:
-#                 line = self.ser.readline().decode(errors="ignore").strip()
-#                 return (line == "T")
-#         except Exception as e:
-#             print(f"[HardwareBridge] Read error: {e}")
-#         return False
-
-#     def activate_lights(self):
-#         """Activate lights (serial 'L' byte) or log in simulation.
-
-#         GUI impact:
-#             None directly; effect is observable as console log and (if hardware attached) lights turning on.
-#         """
-#         if not self.simulated and self.ser:
-#             try:
-#                 self.ser.write(b"L")
-#                 print("[HardwareBridge] Lights command sent.")
-#             except Exception as e:
-#                 print(f"[HardwareBridge] Write error: {e}")
-#         else:
-#             print("[HardwareBridge] (Sim) Lights ON.")
-
-#     def close(self):
-#         """Close serial port if open.
-
-#         GUI impact:
-#             None; invoked by application cleanup.
-#         """
-#         if not self.simulated and self.ser:
-#             try:
-#                 if getattr(self.ser, "is_open", True):
-#                     self.ser.close()
-#                     print("[HardwareBridge] Serial closed.")
-#             except Exception as e:
-#                 print(f"[HardwareBridge] Close error: {e}")
-
 class HardwareBridge:
     """USB-serial bridge for Elegoo UNO R3 (CH340) with simulation fallback.
 
@@ -306,7 +212,7 @@ class HardwareBridge:
             pid = f"{p.pid:04X}" if p.pid is not None else None
             if vid == "1A86" and pid == "7523":  # CH340/CH34x (Elegoo UNO R3)
                 return p.device
-        # Fallback: any port mentioning CH340 or UNO in its description
+        # Fallback: any port mentioning CH340 or UNO or Elegoo in its description
         for p in serial.tools.list_ports.comports():
             desc = (p.description or "").lower()
             if "ch340" in desc or "uno" in desc or "elegoo" in desc:
@@ -361,6 +267,7 @@ class HardwareBridge:
                     print("[HardwareBridge] Serial closed.")
             except Exception as e:
                 print(f"[HardwareBridge] Close error: {e}")
+
 
 # =========================
 # Camera Recorder w/ Preview
@@ -706,7 +613,7 @@ class TrialRunner:
             pass
 
     def run_trial(self):
-        """Execute one complete trial: lights -> cameras (parallel) -> looming -> log.
+        """Execute one complete trial: mark+lights -> cameras (parallel) -> mark+looming -> mark+log.
 
         Reads from GUI/Config:
             • cfg.output_root, cfg.fourcc, cfg.record_duration_s
@@ -716,7 +623,7 @@ class TrialRunner:
         Side-effects:
             • Writes two video files into Output folder/date
             • Appends a row to the CSV log
-            • Console status prints
+            • Emits Elegoo sync markers: START, STIM, END
         """
         self.trial_idx += 1
         ts = now_stamp()
@@ -727,6 +634,8 @@ class TrialRunner:
         cam1_path = os.path.join(out_dir, f"{ts}_trial{self.trial_idx:04d}_cam1{ext}")
 
         print(f"[Trial {self.trial_idx}] START {ts}")
+        # Sync mark + lights on
+        self.hardware.mark_start()
         self.hardware.activate_lights()
 
         # Record both cameras in parallel
@@ -734,11 +643,18 @@ class TrialRunner:
         t1 = threading.Thread(target=self.cam1.record_clip, args=(cam1_path, self.cfg.record_duration_s, self.cfg.fourcc), daemon=True)
         t0.start(); t1.start()
 
-        # Run looming while cameras record
+        # Mark stimulus onset and run it while cameras record
+        self.hardware.mark_stim()
         self.stim.run(self.cfg.stim_duration_s, self.cfg.stim_r0_px, self.cfg.stim_r1_px, self.cfg.stim_bg_grey)
 
+        # Wait for both cameras to finish
         t0.join(); t1.join()
 
+        # Mark trial end (optional: turn lights off if desired)
+        self.hardware.mark_end()
+        # self.hardware.light_off()
+
+        # Log trial row
         self.log_writer.writerow([
             self.trial_idx, ts, cam0_path, cam1_path,
             self.cfg.record_duration_s, self.cfg.stim_duration_s,
@@ -780,7 +696,7 @@ class SettingsGUI(QtWidgets.QWidget):
         self.cam0 = cam0
         self.cam1 = cam1
 
-        self.setWindowTitle("FlyPy — Trigger→Outputs (All-in-One GUI)")
+        self.setWindowTitle("FlyPy — Trigger->Outputs (All-in-One GUI)")
         # Fixed-size 1920x1080 canvas as requested
         self.setFixedSize(1920, 1080)
 
@@ -826,7 +742,7 @@ class SettingsGUI(QtWidgets.QWidget):
 
         self.le_root = QtWidgets.QLineEdit(self.cfg.output_root)
         self.le_root.setToolTip("Folder where all date-stamped trial folders and videos will be saved.")
-        self.btn_browse = QtWidgets.QPushButton("Browse…")
+        self.btn_browse = QtWidgets.QPushButton("Browse...")
         self.btn_browse.setToolTip("Choose a different output folder.")
         rhl = QtWidgets.QHBoxLayout()
         rhl.addWidget(self.le_root); rhl.addWidget(self.btn_browse)
@@ -904,12 +820,12 @@ class SettingsGUI(QtWidgets.QWidget):
             fl.addWidget(_lbl_idx, 0, 1)
             fl.addWidget(spin_index, 0, 2)
 
-            # >>> FPS selection — updated per request <<<
+            # FPS selection — updated per request
             spin_fps = QtWidgets.QSpinBox()
             spin_fps.setRange(1, 10000)                 # allow up to 10,000 FPS
             spin_fps.setValue(60)                       # start at 60
             spin_fps.setAccelerated(True)               # faster arrow stepping
-            spin_fps.setKeyboardTracking(True)          # allow typing; updates on the fly
+            spin_fps.setKeyboardTracking(True)          # allow typing; updates while typing
             spin_fps.setToolTip("Target recording frame rate (FPS). Type directly or use arrows. Range: 1–10,000. Actual FPS may be limited by camera/driver.")
             _lbl_tf = QtWidgets.QLabel("Target recording frame rate (fps):"); _lbl_tf.setWordWrap(True)
             fl.addWidget(_lbl_tf, 1, 1)
@@ -1172,13 +1088,13 @@ class MainApp(QtWidgets.QApplication):
         GUI impact:
             Writes status messages to Status label and prints to console.
         """
-        self.gui.lbl_status.setText("Status: Watching for triggers…")
+        self.gui.lbl_status.setText("Status: Watching for triggers...")
         print("[MainApp] Trigger loop started.")
         while self.running:
             try:
                 if not self.in_trial and self.hardware.check_trigger():
                     self.in_trial = True
-                    self.gui.lbl_status.setText("Status: Trial running…")
+                    self.gui.lbl_status.setText("Status: Trial running...")
                     self.trial_runner.run_trial()
                     self.in_trial = False
                     self.gui.lbl_status.setText("Status: Trial finished.")
@@ -1193,7 +1109,7 @@ class MainApp(QtWidgets.QApplication):
         """Start the trigger loop thread (idempotent).
 
         GUI impact:
-            Applies current settings before starting; Status reflects “Watching for triggers…”.
+            Applies current settings before starting; Status reflects “Watching for triggers...”.
         """
         if not self.running:
             self.apply_from_gui()  # ensure latest settings at start
