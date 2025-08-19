@@ -43,7 +43,7 @@ Target recording FPS → CameraRecorder.set_target_fps() + Config.camN_target_fp
 Info labels (read-only): driver-reported FPS, GUI-measured preview FPS, recording target FPS.
 
 Top Bar Controls
-▶ Start
+Start
 
 What it does: Begins the background trigger loop. The Status changes to “Watching for triggers…”.
 
@@ -53,7 +53,7 @@ Inputs used: All current values from General, Stimulus, and Camera panels (via A
 
 Outputs affected: Starts producing videos and CSV logs on every trigger.
 
-⏹ Stop
+Stop
 
 What it does: Stops the trigger loop and returns to idle. Safe to quit afterward.
 
@@ -61,7 +61,7 @@ Code path: MainApp.stop_loop().
 
 Outputs affected: No new trials will run until you press Start again.
 
-🛠 Apply Settings
+Apply Settings
 
 What it does: Copies widget values into the active Config and camera objects.
 
