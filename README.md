@@ -1,6 +1,35 @@
 # LevitatingInsect
 Repository for PsychoPy Physical Integration
 
+# FlyPy — Trigger → Cameras + Lights + Looming Stimulus (All-in-One GUI)
+
+This app coordinates a **trigger** (hardware, simulated, or manual) to:
+- Turn **lights** on/off (via Elegoo/Arduino over serial, or simulated)
+- Record **two cameras** in sync to disk
+- Show a **looming stimulus** (growing dot) on a selected monitor
+- Log trial metadata (CSV) including file paths and timing markers
+
+It ships with a **single-window GUI** (fixed 1920×1080) that exposes all settings in plain English, with tooltips.
+
+---
+
+## What’s New
+
+- **Stimulus delay** control: set a delay between **recording start** and **stimulus onset**.
+- **Display routing**: choose which **screen** shows the **Stimulus** and which screen shows the **GUI**.
+- **Fullscreen/windowed** Stimulus: fullscreen pins to the chosen monitor; windowed can be dragged anywhere and **persists** across trials.
+- **Manual “Trigger Once”** button: run a single trial immediately (great for testing without hardware).
+- CSV log now includes: `stim_delay_s`, `stim_screen_index`, `stim_fullscreen`.
+
+---
+
+## Installation
+
+### Windows (recommended)
+```bat
+Install.bat
+
+
 
 FlyPy GUI Reference
 
