@@ -3,7 +3,7 @@ FlyPy — Trigger->Outputs build with All-in-One Settings GUI, camera previews, 
 and comprehensive docstrings (natural-English labels).
 
 On each trigger:
-  • Activates lights (Elegoo UNO if available; simulated otherwise)
+  • Activates lights (serial if available; simulated otherwise)
   • Records synchronized clips from two cameras to disk
   • Presents a looming (growing dot) visual stimulus
   • Logs trial metadata (CSV) with file paths and timestamps
@@ -12,6 +12,7 @@ GUI:
   • All settings visible in one window (natural-English labels)
   • Tooltips on every control
   • Per-camera visual index (live preview with overlayed index) and FPS
+  • Video Format/Codec dropdown with captions (max res/FPS, size hint)
 """
 
 import sys
@@ -60,6 +61,61 @@ except Exception:
 # =========================
 # Utilities / Config
 # =========================
+
+# Video format presets: container + FOURCC + caption
+# Note: Actual achievable resolution/FPS depends on your hardware and build of OpenCV/FFmpeg.
+VIDEO_PRESETS = [
+    {
+        "id": "mp4_h264",
+        "label": "MP4 (H.264 / avc1) — up to 4K@60 — medium/small filesize",
+        "ext": ".mp4",
+        "fourcc": "avc1",
+        "size_hint": "medium/small",
+    },
+    {
+        "id": "mp4_mp4v",
+        "label": "MP4 (MPEG-4 Part 2 / mp4v) — up to 1080p@60 — medium/large filesize",
+        "ext": ".mp4",
+        "fourcc": "mp4v",
+        "size_hint": "medium/large",
+    },
+    {
+        "id": "webm_vp9",
+        "label": "WebM (VP9) — up to 4K@60 — small/medium filesize",
+        "ext": ".webm",
+        "fourcc": "VP90",
+        "size_hint": "small/medium",
+    },
+    {
+        "id": "avi_xvid",
+        "label": "AVI (XVID / MPEG-4 Part 2) — up to 1080p@60 — large/medium filesize",
+        "ext": ".avi",
+        "fourcc": "XVID",
+        "size_hint": "large/medium",
+    },
+    {
+        "id": "mov_h264",
+        "label": "MOV (H.264 / avc1) — up to 4K@60 — medium/small filesize",
+        "ext": ".mov",
+        "fourcc": "avc1",
+        "size_hint": "medium/small",
+    },
+    {
+        "id": "mkv_h264",
+        "label": "MKV (H.264 / avc1) — up to 4K@60 — medium/small filesize",
+        "ext": ".mkv",
+        "fourcc": "avc1",
+        "size_hint": "medium/small",
+    },
+]
+
+PRESETS_BY_ID = {p["id"]: p for p in VIDEO_PRESETS}
+
+def default_preset_id() -> str:
+    """Choose a sensible default preset."""
+    # mp4_mp4v tends to be broadly compatible across platforms
+    return "mp4_mp4v"
+
 def ensure_dir(path: str):
     """Create directory `path` if it doesn't exist.
 
@@ -126,19 +182,19 @@ class Config:
       General settings
         • “Interval between simulated triggers (seconds)” → sim_trigger_interval
         • “Output folder for all trials”                  → output_root
-        • “Video codec (FOURCC code)”                    → fourcc
-        • “Recording duration per trigger (seconds)”     → record_duration_s
-        • Simulation mode (Yes/No dialog at startup)     → simulation_mode
+        • “Video format / codec (container + FOURCC)”     → video_preset_id (+ fourcc shadow)
+        • “Recording duration per trigger (seconds)”      → record_duration_s
+        • Simulation mode (Yes/No dialog at startup)      → simulation_mode
 
       Looming stimulus (growing dot)
-        • “Stimulus display duration (seconds)”          → stim_duration_s
-        • “Starting dot radius (pixels)”                 → stim_r0_px
-        • “Final dot radius (pixels)”                    → stim_r1_px
-        • “Stimulus background shade (0=black, 1=white)” → stim_bg_grey
+        • “Stimulus display duration (seconds)”           → stim_duration_s
+        • “Starting dot radius (pixels)”                  → stim_r0_px
+        • “Final dot radius (pixels)”                     → stim_r1_px
+        • “Stimulus background shade (0=black, 1=white)”  → stim_bg_grey
 
       Camera N — preview & frame rate
-        • “Which camera to use (OpenCV device index)”    → camN_index
-        • “Target recording frame rate (fps)”            → camN_target_fps
+        • “Which camera to use (OpenCV device index)”     → camN_index
+        • “Target recording frame rate (fps)”             → camN_target_fps
         • FPS labels are informational; they don't change settings.
     """
     def __init__(self):
@@ -149,14 +205,16 @@ class Config:
 
         # Recording / output
         self.output_root = "FlyPy_Output"
-        self.fourcc = "mp4v"
+        self.video_preset_id = default_preset_id()
+        # Keep a shadow 'fourcc' for convenience with existing code paths
+        self.fourcc = PRESETS_BY_ID[self.video_preset_id]["fourcc"]
         self.record_duration_s = 3.0
 
-        # Stimulus
+        # Stimulus (WHITE background with BLACK dot by default)
         self.stim_duration_s = 1.5
         self.stim_r0_px = 8
         self.stim_r1_px = 400
-        self.stim_bg_grey = 1.0  # default to WHITE background
+        self.stim_bg_grey = 1.0  # white background
 
         # Cameras
         self.cam0_index = 0
@@ -166,13 +224,13 @@ class Config:
 
 
 # =========================
-# Hardware Bridge (Elegoo UNO R3)
+# Hardware Bridge (Elegoo UNO R3 via CH340)
 # =========================
 class HardwareBridge:
     """USB-serial bridge for Elegoo UNO R3 (CH340) with simulation fallback.
 
-    • Simulation ON  → interval-based triggers.
-    • Simulation OFF → auto-detect CH340 COM port (or use provided 'port') at 115200.
+    • Simulation ON  -> interval-based triggers.
+    • Simulation OFF -> auto-detect CH340 COM port (or use provided 'port') at 115200.
     • Reads 'T' lines as triggers. Accepts lines we send (START/STIM/END/PULSE n, LIGHT ON/OFF).
     """
     def __init__(self, cfg: Config, port: str = None, baud: int = 115200):
@@ -191,8 +249,7 @@ class HardwareBridge:
                 if self.port:
                     try:
                         self.ser = serial.Serial(self.port, self.baud, timeout=0.01)
-                        # give the board a moment after opening
-                        wait_s(1.5)
+                        wait_s(1.5)  # allow reset
                         print(f"[HardwareBridge] Opened {self.port} @ {self.baud} baud")
                     except Exception as e:
                         print(f"[HardwareBridge] Serial open failed on {self.port}: {e} -> simulation.")
@@ -212,7 +269,7 @@ class HardwareBridge:
             pid = f"{p.pid:04X}" if p.pid is not None else None
             if vid == "1A86" and pid == "7523":  # CH340/CH34x (Elegoo UNO R3)
                 return p.device
-        # Fallback: any port mentioning CH340 or UNO or Elegoo in its description
+        # Fallback: any port mentioning CH340 or UNO/Elegoo in description
         for p in serial.tools.list_ports.comports():
             desc = (p.description or "").lower()
             if "ch340" in desc or "uno" in desc or "elegoo" in desc:
@@ -416,24 +473,24 @@ class CameraRecorder:
         """
         with self.lock:
             if self.synthetic:
-                frame = np.zeros((h, w, 3), dtype=np.uint8)
+                frame = np.full((h, w, 3), 255, dtype=np.uint8)
                 cv2.putText(frame, f"{self.name} (synthetic)", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
                 cx, cy = (int(time.time()*60) % w, h//2)
-                cv2.circle(frame, (cx, cy), 15, (255, 255, 255), 2)
+                cv2.circle(frame, (cx, cy), 15, (0, 0, 0), 2)  # black dot
             else:
                 ok, bgr = self.cap.read()
                 if not ok or bgr is None:
-                    frame = np.zeros((h, w, 3), dtype=np.uint8)
+                    frame = np.full((h, w, 3), 255, dtype=np.uint8)
                     cv2.putText(frame, f"{self.name} [drop]", (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
                 else:
                     frame = cv2.resize(bgr, (w, h))
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
             if overlay_index:
                 cv2.putText(frame, f"Index {self.index}", (10, h-12),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
 
             self._last_preview_frame = frame
             self._preview_times.append(time.time())
@@ -457,65 +514,83 @@ class CameraRecorder:
         """Record a video clip to `path` for `duration_s` seconds at `target_fps`.
 
         Args:
-            path: Output file path (.mp4 or .avi; container should match FOURCC).
+            path: Output file path (container/extension should match FOURCC).
             duration_s: Duration to record.
-            fourcc_str: FOURCC string selected in GUI ("mp4v", "avc1", "XVID").
+            fourcc_str: FOURCC string selected in GUI (e.g., "mp4v", "avc1", "XVID", "VP90").
+
+        Returns:
+            The actual file path written (may differ if we fallback), or None on failure.
 
         GUI impact:
-            Uses Camera panel's Target FPS and General settings' FOURCC; files appear under Output folder/date.
+            Uses Camera panel's Target FPS and General settings; files appear under Output folder/date.
         """
         size = self._frame_size()
-        fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
-        out = cv2.VideoWriter(path, fourcc, float(self.target_fps), size)
+
+        # Attempt preferred writer
+        out = self._writer(path, size, fourcc_str)
         if not out or not out.isOpened():
-            print(f"[Camera {self.name}] VideoWriter failed for {path}")
-            return
+            print(f"[Camera {self.name}] VideoWriter failed for {path} with FOURCC={fourcc_str}. Trying fallback mp4v...")
+            try:
+                base, _old_ext = os.path.splitext(path)
+                fallback_path = base + ".mp4"
+                out = self._writer(fallback_path, size, "mp4v")
+                if not out or not out.isOpened():
+                    print(f"[Camera {self.name}] Fallback mp4v also failed.")
+                    return None
+                path = fallback_path
+                fourcc_str = "mp4v"
+            except Exception as e:
+                print(f"[Camera {self.name}] Fallback error: {e}")
+                return None
 
         t_end = time.time() + duration_s
-        print(f"[Camera {self.name}] Recording -> {path} @ ~{self.target_fps:.1f} fps")
+        print(f"[Camera {self.name}] Recording -> {path} @ ~{self.target_fps:.1f} fps (FOURCC={fourcc_str})")
         frame_index = 0
+        ok_any = False
         while time.time() < t_end:
             with self.lock:
                 if self.synthetic:
-                    frame = np.zeros((size[1], size[0], 3), dtype=np.uint8)
+                    frame = np.full((size[1], size[0], 3), 255, dtype=np.uint8)
                     cv2.putText(frame, f"{self.name} {now_stamp()}", (20, 40),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
                     cx = int((frame_index * 7) % size[0])
                     cy = int(size[1] / 2)
-                    cv2.circle(frame, (cx, cy), 20, (255, 255, 255), 2)
+                    cv2.circle(frame, (cx, cy), 20, (0, 0, 0), 2)
                 else:
                     ok, frame = self.cap.read()
                     if not ok or frame is None:
-                        frame = np.zeros((size[1], size[0], 3), dtype=np.uint8)
+                        frame = np.full((size[1], size[0], 3), 255, dtype=np.uint8)
                         cv2.putText(frame, f"{self.name} [drop] {now_stamp()}", (20, 40),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
+                    else:
+                        ok_any = True
             out.write(frame)
             frame_index += 1
             time.sleep(max(0.0, 1.0 / float(self.target_fps)))
         out.release()
+        if not ok_any and not self.synthetic:
+            print(f"[Camera {self.name}] Warning: no frames captured from camera index {self.index}.")
         print(f"[Camera {self.name}] Recording complete.")
+        return path
 
 
 # =========================
-# Looming Stimulus
+# Looming Stimulus (white background, black dot)
 # =========================
 class LoomingStim:
     """Renders a growing-dot ("looming") stimulus via PsychoPy or OpenCV fallback.
 
     GUI settings used:
-      • Stimulus display duration (seconds), Starting/Final radius (pixels), Background shade (0–1; default white)
+      • Stimulus display duration (seconds), Starting/Final radius (pixels), Background shade (0–1)
     """
     def run(self, duration_s: float, r0: int, r1: int, bg_grey: float):
         """Present the looming stimulus for `duration_s` with radius ranging r0->r1.
-
-        Background is WHITE; dot is BLACK by default (bg_grey controls Psychopy background; default=1.0).
-        For OpenCV fallback, the background is generated from `bg_grey` (default white).
 
         Args:
             duration_s: Duration of the looming stimulus.
             r0: Starting radius in pixels.
             r1: Ending radius in pixels.
-            bg_grey: Background grey level [0–1]; 1.0 = white (default).
+            bg_grey: Psychopy background grey level [0–1] (1=white). Ignored by OpenCV fallback which uses white.
 
         GUI impact:
             Reads current Stimulus panel values at trial time.
@@ -523,7 +598,6 @@ class LoomingStim:
         print("[Stim] Looming start.")
         if PSYCHOPY:
             try:
-                # White (or chosen) background, BLACK dot
                 win = visual.Window(size=(800, 600), color=[bg_grey]*3, units='pix', fullscr=False)
                 dot = visual.Circle(win, radius=r0, fillColor='black', lineColor='black')
                 t0 = time.time()
@@ -541,24 +615,18 @@ class LoomingStim:
             except Exception as e:
                 print(f"[Stim] PsychoPy error: {e} -> OpenCV fallback.")
 
-        # OpenCV fallback (WHITE by default; uses bg_grey level)
+        # OpenCV fallback: white background, black dot
         try:
             size = (800, 600)
             cv2.namedWindow("Looming Stimulus", cv2.WINDOW_NORMAL)
             cv2.resizeWindow("Looming Stimulus", size[0], size[1])
             t0 = time.time()
-
-            # compute background shade (0..255), default 255 (white)
-            bg = int(np.clip(bg_grey, 0.0, 1.0) * 255)
-
             while True:
                 t = time.time() - t0
                 if t >= duration_s:
                     break
                 r = int(r0 + (r1 - r0) * (t / duration_s))
-                # start with white/grey background
-                frame = np.full((size[1], size[0], 3), bg, dtype=np.uint8)
-                # draw BLACK filled circle
+                frame = np.full((size[1], size[0], 3), 255, dtype=np.uint8)
                 cv2.circle(frame, (size[0]//2, size[1]//2), r, (0, 0, 0), -1)
                 cv2.imshow("Looming Stimulus", frame)
                 if cv2.waitKey(1) & 0xFF == 27:
@@ -578,7 +646,7 @@ class TrialRunner:
     """Coordinates lights, cameras, stimulus, and logging for each trigger event.
 
     GUI settings used:
-      • Output folder for all trials, Video codec (FOURCC), Recording duration per trigger (seconds)
+      • Output folder for all trials, Video format/codec, Recording duration per trigger (seconds)
       • Stimulus panel fields
       • Camera target FPS (written to CSV)
     """
@@ -608,7 +676,8 @@ class TrialRunner:
         if new_file:
             self.log_writer.writerow([
                 "trial", "timestamp", "cam0_path", "cam1_path",
-                "record_duration_s", "stim_duration_s", "cam0_target_fps", "cam1_target_fps"
+                "record_duration_s", "stim_duration_s", "cam0_target_fps", "cam1_target_fps",
+                "video_preset_id", "fourcc"
             ])
 
     def close(self):
@@ -622,56 +691,68 @@ class TrialRunner:
         except Exception:
             pass
 
+    def _preset(self):
+        """Return the active video preset dict."""
+        return PRESETS_BY_ID.get(self.cfg.video_preset_id, PRESETS_BY_ID[default_preset_id()])
+
     def run_trial(self):
-        """Execute one complete trial: mark+lights -> cameras (parallel) -> mark+looming -> mark+log.
+        """Execute one complete trial: lights -> cameras (parallel) -> looming -> log.
 
         Reads from GUI/Config:
-            • cfg.output_root, cfg.fourcc, cfg.record_duration_s
-            • cfg.stim_duration_s, cfg.stim_r0_px, cfg.stim_r1_px, cfg.stim_bg_grey
+            • cfg.output_root, cfg.video_preset_id (container & fourcc), cfg.record_duration_s
+            • cfg.stim_* fields
             • cam0.target_fps, cam1.target_fps (written to CSV)
 
         Side-effects:
             • Writes two video files into Output folder/date
             • Appends a row to the CSV log
-            • Emits Elegoo sync markers: START, STIM, END
+            • Console status prints
         """
         self.trial_idx += 1
         ts = now_stamp()
         out_dir = day_folder(self.cfg.output_root)
-        # extension determines container/codec mapping via FOURCC provided
-        ext = ".mp4" if self.cfg.fourcc.lower() in ("mp4v", "avc1", "h264") else ".avi"
-        cam0_path = os.path.join(out_dir, f"{ts}_trial{self.trial_idx:04d}_cam0{ext}")
-        cam1_path = os.path.join(out_dir, f"{ts}_trial{self.trial_idx:04d}_cam1{ext}")
+
+        preset = self._preset()
+        ext = preset["ext"]
+        fourcc = preset["fourcc"]
+
+        cam0_path_req = os.path.join(out_dir, f"{ts}_trial{self.trial_idx:04d}_cam0{ext}")
+        cam1_path_req = os.path.join(out_dir, f"{ts}_trial{self.trial_idx:04d}_cam1{ext}")
 
         print(f"[Trial {self.trial_idx}] START {ts}")
-        # Sync mark + lights on
-        self.hardware.mark_start()
         self.hardware.activate_lights()
+        self.hardware.mark_start()
 
-        # Record both cameras in parallel
-        t0 = threading.Thread(target=self.cam0.record_clip, args=(cam0_path, self.cfg.record_duration_s, self.cfg.fourcc), daemon=True)
-        t1 = threading.Thread(target=self.cam1.record_clip, args=(cam1_path, self.cfg.record_duration_s, self.cfg.fourcc), daemon=True)
+        # Record both cameras in parallel, capturing the actual written paths
+        results = {"cam0": None, "cam1": None}
+        def rec0():
+            results["cam0"] = self.cam0.record_clip(cam0_path_req, self.cfg.record_duration_s, fourcc)
+        def rec1():
+            results["cam1"] = self.cam1.record_clip(cam1_path_req, self.cfg.record_duration_s, fourcc)
+
+        t0 = threading.Thread(target=rec0, daemon=True)
+        t1 = threading.Thread(target=rec1, daemon=True)
         t0.start(); t1.start()
 
-        # Mark stimulus onset and run it while cameras record
+        # Run looming while cameras record
         self.hardware.mark_stim()
         self.stim.run(self.cfg.stim_duration_s, self.cfg.stim_r0_px, self.cfg.stim_r1_px, self.cfg.stim_bg_grey)
 
-        # Wait for both cameras to finish
         t0.join(); t1.join()
-
-        # Mark trial end (optional: turn lights off if desired)
         self.hardware.mark_end()
-        # self.hardware.light_off()
+        self.hardware.light_off()
 
-        # Log trial row
+        cam0_path_actual = results["cam0"] or cam0_path_req
+        cam1_path_actual = results["cam1"] or cam1_path_req
+
         self.log_writer.writerow([
-            self.trial_idx, ts, cam0_path, cam1_path,
+            self.trial_idx, ts, cam0_path_actual, cam1_path_actual,
             self.cfg.record_duration_s, self.cfg.stim_duration_s,
-            self.cam0.target_fps, self.cam1.target_fps
+            self.cam0.target_fps, self.cam1.target_fps,
+            self.cfg.video_preset_id, fourcc
         ])
         self.log_file.flush()
-        print(f"[Trial {self.trial_idx}] END  (files: {cam0_path} , {cam1_path})")
+        print(f"[Trial {self.trial_idx}] END  (files: {cam0_path_actual} , {cam1_path_actual})")
 
 
 # =========================
@@ -752,19 +833,28 @@ class SettingsGUI(QtWidgets.QWidget):
 
         self.le_root = QtWidgets.QLineEdit(self.cfg.output_root)
         self.le_root.setToolTip("Folder where all date-stamped trial folders and videos will be saved.")
-        self.btn_browse = QtWidgets.QPushButton("Browse...")
+        self.btn_browse = QtWidgets.QPushButton("Browse…")
         self.btn_browse.setToolTip("Choose a different output folder.")
         rhl = QtWidgets.QHBoxLayout()
         rhl.addWidget(self.le_root); rhl.addWidget(self.btn_browse)
         _lbl_root = QtWidgets.QLabel("Output folder for all trials:"); _lbl_root.setWordWrap(True)
         gl.addRow(_lbl_root, rhl)
 
-        self.cb_fourcc = QtWidgets.QComboBox()
-        self.cb_fourcc.addItems(["mp4v", "avc1", "XVID"])
-        self.cb_fourcc.setCurrentText(self.cfg.fourcc)
-        self.cb_fourcc.setToolTip("Video codec (FOURCC code). 'mp4v' is broadly compatible; 'avc1' compresses better if available.")
-        _lbl_fourcc = QtWidgets.QLabel("Video codec (FOURCC code):"); _lbl_fourcc.setWordWrap(True)
-        gl.addRow(_lbl_fourcc, self.cb_fourcc)
+        # New: Video format/codec dropdown with captions
+        self.cb_format = QtWidgets.QComboBox()
+        self.cb_format.setToolTip("Select the container and codec for saved videos. Captions show typical max resolution/FPS and approximate file size.")
+        self._preset_id_by_index = {}
+        current_index = 0
+        for i, p in enumerate(VIDEO_PRESETS):
+            self.cb_format.addItem(p["label"])
+            # store id as userData
+            self.cb_format.setItemData(i, p["id"])
+            self._preset_id_by_index[i] = p["id"]
+            if p["id"] == self.cfg.video_preset_id:
+                current_index = i
+        self.cb_format.setCurrentIndex(current_index)
+        _lbl_fmt = QtWidgets.QLabel("Video file format / codec:"); _lbl_fmt.setWordWrap(True)
+        gl.addRow(_lbl_fmt, self.cb_format)
 
         self.sb_rec_dur = QtWidgets.QDoubleSpinBox()
         self.sb_rec_dur.setRange(0.2, 600.0); self.sb_rec_dur.setDecimals(2); self.sb_rec_dur.setValue(self.cfg.record_duration_s)
@@ -775,7 +865,7 @@ class SettingsGUI(QtWidgets.QWidget):
         panels.addWidget(gen, 0, 0)
 
         # Stimulus panel
-        stim = QtWidgets.QGroupBox("Looming stimulus (growing dot)")
+        stim = QtWidgets.QGroupBox("Looming stimulus (growing black dot on white background)")
         stim.setToolTip("Duration and size change of the looming dot shown after each trigger.")
         sl = QtWidgets.QFormLayout(stim)
         sl.setRowWrapPolicy(QtWidgets.QFormLayout.WrapAllRows)
@@ -797,7 +887,7 @@ class SettingsGUI(QtWidgets.QWidget):
         sl.addRow(_lbl_r1, self.sb_r1)
 
         self.sb_bg = QtWidgets.QDoubleSpinBox(); self.sb_bg.setRange(0.0, 1.0); self.sb_bg.setSingleStep(0.05); self.sb_bg.setValue(self.cfg.stim_bg_grey)
-        self.sb_bg.setToolTip("Background shade (PsychoPy; default white=1.0). OpenCV fallback also uses this level.")
+        self.sb_bg.setToolTip("Background shade for PsychoPy display (0 = black, 1 = white). OpenCV fallback uses white regardless.")
         _lbl_bg = QtWidgets.QLabel("Stimulus background shade (0=black, 1=white):"); _lbl_bg.setWordWrap(True)
         sl.addRow(_lbl_bg, self.sb_bg)
 
@@ -830,18 +920,17 @@ class SettingsGUI(QtWidgets.QWidget):
             fl.addWidget(_lbl_idx, 0, 1)
             fl.addWidget(spin_index, 0, 2)
 
-            # FPS selection — updated as requested
+            # FPS selection — typable up to 10,000
             spin_fps = QtWidgets.QSpinBox()
-            spin_fps.setRange(1, 10000)                 # allow up to 10,000 FPS
-            spin_fps.setValue(60)                       # start at 60
-            spin_fps.setAccelerated(True)               # faster arrow stepping
-            spin_fps.setKeyboardTracking(True)          # allow typing; updates while typing
+            spin_fps.setRange(1, 10000)
+            spin_fps.setValue(60)
+            spin_fps.setAccelerated(True)
+            spin_fps.setKeyboardTracking(True)
             spin_fps.setToolTip("Target recording frame rate (FPS). Type directly or use arrows. Range: 1–10,000. Actual FPS may be limited by camera/driver.")
             _lbl_tf = QtWidgets.QLabel("Target recording frame rate (fps):"); _lbl_tf.setWordWrap(True)
             fl.addWidget(_lbl_tf, 1, 1)
             fl.addWidget(spin_fps, 1, 2)
 
-            # Informational labels
             lbl_rep = QtWidgets.QLabel("Driver-reported frame rate (may be 0 on some webcams): —")
             lbl_rep.setWordWrap(True)
             lbl_rep.setToolTip("Driver-reported FPS (CAP_PROP_FPS). Some webcams return 0 or an inaccurate value here.")
@@ -1006,7 +1095,6 @@ class MainApp(QtWidgets.QApplication):
 
         # Status
         self.running = False
-        our_thread = None
         self.in_trial = False
         self.thread = None
 
@@ -1021,7 +1109,7 @@ class MainApp(QtWidgets.QApplication):
         """Read current widget values and write them into Config/Cameras.
 
         Reads/writes:
-            • General settings → cfg.sim_trigger_interval, cfg.output_root, cfg.fourcc, cfg.record_duration_s
+            • General settings → cfg.sim_trigger_interval, cfg.output_root, cfg.video_preset_id, cfg.record_duration_s
             • Looming stimulus → cfg.stim_* fields
             • Camera panels → cam.set_index(), cam.set_target_fps()
             • Updates cfg.cam* fields from CameraRecorder state
@@ -1033,7 +1121,15 @@ class MainApp(QtWidgets.QApplication):
         # General
         self.cfg.sim_trigger_interval = float(self.gui.sb_sim_interval.value())
         self.cfg.output_root = self.gui.le_root.text().strip() or self.cfg.output_root
-        self.cfg.fourcc = self.gui.cb_fourcc.currentText()
+
+        # Format/codec preset
+        idx = self.gui.cb_format.currentIndex()
+        preset_id = self.gui.cb_format.itemData(idx)
+        if not preset_id:
+            preset_id = self.gui._preset_id_by_index.get(idx, default_preset_id())
+        self.cfg.video_preset_id = preset_id
+        self.cfg.fourcc = PRESETS_BY_ID[self.cfg.video_preset_id]["fourcc"]
+
         self.cfg.record_duration_s = float(self.gui.sb_rec_dur.value())
 
         # Stimulus
@@ -1112,7 +1208,7 @@ class MainApp(QtWidgets.QApplication):
                 time.sleep(0.002)
             except Exception as e:
                 print(f"[MainApp] Loop error: {e}")
-                self.gui.lbl_status.setText(f"Status: Error — {e}")
+                self.gui.lbl_status.setText(f"Status: Error - {e}")
                 time.sleep(0.05)
         print("[MainApp] Trigger loop stopped.")
 
