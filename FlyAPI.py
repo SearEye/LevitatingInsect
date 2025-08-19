@@ -168,53 +168,153 @@ class Config:
 # =========================
 # Hardware Bridge
 # =========================
+
+###PRIOR STAND-IN / / WIP ONLY###
+# class HardwareBridge:
+#     """Bridge for trigger and light commands over serial, with simulation fallback.
+
+#     GUI settings used:
+#       • cfg.simulation_mode  — toggles simulated triggers
+#       • cfg.sim_trigger_interval — interval for simulated triggers
+#     """
+#     def __init__(self, cfg: Config, port="COM3", baud=9600):
+#         """Attempt to open serial port; otherwise run in simulation mode.
+
+#         Args:
+#             cfg: Shared Config with simulation settings.
+#             port: Serial port for hardware trigger/light controller.
+#             baud: Baud rate.
+
+#         GUI impact:
+#             Reads cfg.simulation_mode at creation time.
+#             No direct writes to GUI; status printed to console.
+#         """
+#         self.cfg = cfg
+#         self.simulated = cfg.simulation_mode
+#         self._last_sim = time.time()
+#         self.ser = None
+#         if not self.simulated:
+#             try:
+#                 import serial
+#                 try:
+#                     self.ser = serial.Serial(port, baud, timeout=0.01)
+#                     wait_s(2)  # allow MCU reset
+#                 except Exception as e:
+#                     print(f"[HardwareBridge] Serial open failed: {e} -> simulation.")
+#                     self.simulated = True
+#             except ImportError:
+#                 print("[HardwareBridge] pyserial missing -> simulation.")
+#                 self.simulated = True
+
+#     def check_trigger(self) -> bool:
+#         """Return True when a trigger is detected (simulated or serial).
+
+#         Behavior:
+#             • Simulated: True every cfg.sim_trigger_interval seconds.
+#             • Serial: reads lines; "T" indicates a trigger.
+
+#         GUI impact:
+#             Reads cfg.sim_trigger_interval (General settings).
+#             Drives the main loop state (Status label will reflect trial start).
+#         """
+#         if self.simulated:
+#             now = time.time()
+#             if now - self._last_sim >= self.cfg.sim_trigger_interval:
+#                 self._last_sim = now
+#                 print("[HardwareBridge] (Sim) Trigger.")
+#                 return True
+#             return False
+#         # Real serial
+#         try:
+#             if self.ser and self.ser.in_waiting:
+#                 line = self.ser.readline().decode(errors="ignore").strip()
+#                 return (line == "T")
+#         except Exception as e:
+#             print(f"[HardwareBridge] Read error: {e}")
+#         return False
+
+#     def activate_lights(self):
+#         """Activate lights (serial 'L' byte) or log in simulation.
+
+#         GUI impact:
+#             None directly; effect is observable as console log and (if hardware attached) lights turning on.
+#         """
+#         if not self.simulated and self.ser:
+#             try:
+#                 self.ser.write(b"L")
+#                 print("[HardwareBridge] Lights command sent.")
+#             except Exception as e:
+#                 print(f"[HardwareBridge] Write error: {e}")
+#         else:
+#             print("[HardwareBridge] (Sim) Lights ON.")
+
+#     def close(self):
+#         """Close serial port if open.
+
+#         GUI impact:
+#             None; invoked by application cleanup.
+#         """
+#         if not self.simulated and self.ser:
+#             try:
+#                 if getattr(self.ser, "is_open", True):
+#                     self.ser.close()
+#                     print("[HardwareBridge] Serial closed.")
+#             except Exception as e:
+#                 print(f"[HardwareBridge] Close error: {e}")
+
 class HardwareBridge:
-    """Bridge for trigger and light commands over serial, with simulation fallback.
+    """USB-serial bridge for Elegoo UNO R3 (CH340) with simulation fallback.
 
-    GUI settings used:
-      • cfg.simulation_mode  — toggles simulated triggers
-      • cfg.sim_trigger_interval — interval for simulated triggers
+    • Simulation ON  → interval-based triggers.
+    • Simulation OFF → auto-detect CH340 COM port (or use provided 'port') at 115200.
+    • Reads 'T' lines as triggers. Accepts lines we send (START/STIM/END/PULSE n, LIGHT ON/OFF).
     """
-    def __init__(self, cfg: Config, port="COM3", baud=9600):
-        """Attempt to open serial port; otherwise run in simulation mode.
-
-        Args:
-            cfg: Shared Config with simulation settings.
-            port: Serial port for hardware trigger/light controller.
-            baud: Baud rate.
-
-        GUI impact:
-            Reads cfg.simulation_mode at creation time.
-            No direct writes to GUI; status printed to console.
-        """
+    def __init__(self, cfg: Config, port: str = None, baud: int = 115200):
         self.cfg = cfg
         self.simulated = cfg.simulation_mode
         self._last_sim = time.time()
         self.ser = None
+        self.port = port
+        self.baud = baud
+
         if not self.simulated:
             try:
-                import serial
-                try:
-                    self.ser = serial.Serial(port, baud, timeout=0.01)
-                    wait_s(2)  # allow MCU reset
-                except Exception as e:
-                    print(f"[HardwareBridge] Serial open failed: {e} -> simulation.")
+                import serial, serial.tools.list_ports
+                if not self.port:
+                    self.port = self._autodetect_port()
+                if self.port:
+                    try:
+                        self.ser = serial.Serial(self.port, self.baud, timeout=0.01)
+                        # give the board a moment after opening
+                        wait_s(1.5)
+                        print(f"[HardwareBridge] Opened {self.port} @ {self.baud} baud")
+                    except Exception as e:
+                        print(f"[HardwareBridge] Serial open failed on {self.port}: {e} -> simulation.")
+                        self.simulated = True
+                else:
+                    print("[HardwareBridge] No Elegoo/CH340 port found -> simulation.")
                     self.simulated = True
             except ImportError:
-                print("[HardwareBridge] pyserial missing -> simulation.")
+                print("[HardwareBridge] pyserial not installed -> simulation.")
                 self.simulated = True
 
+    def _autodetect_port(self) -> str:
+        """Return the first likely Elegoo CH340 COM port or None."""
+        import serial.tools.list_ports
+        for p in serial.tools.list_ports.comports():
+            vid = f"{p.vid:04X}" if p.vid is not None else None
+            pid = f"{p.pid:04X}" if p.pid is not None else None
+            if vid == "1A86" and pid == "7523":  # CH340/CH34x (Elegoo UNO R3)
+                return p.device
+        # Fallback: any port mentioning CH340 or UNO in its description
+        for p in serial.tools.list_ports.comports():
+            desc = (p.description or "").lower()
+            if "ch340" in desc or "uno" in desc or "elegoo" in desc:
+                return p.device
+        return None
+
     def check_trigger(self) -> bool:
-        """Return True when a trigger is detected (simulated or serial).
-
-        Behavior:
-            • Simulated: True every cfg.sim_trigger_interval seconds.
-            • Serial: reads lines; "T" indicates a trigger.
-
-        GUI impact:
-            Reads cfg.sim_trigger_interval (General settings).
-            Drives the main loop state (Status label will reflect trial start).
-        """
+        """Return True when a trigger is detected (simulated or via USB line 'T')."""
         if self.simulated:
             now = time.time()
             if now - self._last_sim >= self.cfg.sim_trigger_interval:
@@ -222,36 +322,38 @@ class HardwareBridge:
                 print("[HardwareBridge] (Sim) Trigger.")
                 return True
             return False
-        # Real serial
         try:
             if self.ser and self.ser.in_waiting:
                 line = self.ser.readline().decode(errors="ignore").strip()
-                return (line == "T")
+                if line == "T":
+                    return True
         except Exception as e:
             print(f"[HardwareBridge] Read error: {e}")
         return False
 
-    def activate_lights(self):
-        """Activate lights (serial 'L' byte) or log in simulation.
+    # -------- Outgoing commands (markers & lights) --------
+    def _send_line(self, text: str):
+        """Send a single line to the board (newline-terminated); log in simulation."""
+        if self.simulated or not self.ser:
+            print(f"[HardwareBridge] (Sim) SEND: {text}")
+            return
+        try:
+            self.ser.write((text.strip() + "\n").encode("utf-8", errors="ignore"))
+        except Exception as e:
+            print(f"[HardwareBridge] Write error: {e}")
 
-        GUI impact:
-            None directly; effect is observable as console log and (if hardware attached) lights turning on.
-        """
-        if not self.simulated and self.ser:
-            try:
-                self.ser.write(b"L")
-                print("[HardwareBridge] Lights command sent.")
-            except Exception as e:
-                print(f"[HardwareBridge] Write error: {e}")
-        else:
-            print("[HardwareBridge] (Sim) Lights ON.")
+    def mark_start(self): self._send_line("START")
+    def mark_stim(self):  self._send_line("STIM")
+    def mark_end(self):   self._send_line("END")
+    def pulse_ms(self, ms: int = 20): self._send_line(f"PULSE {int(ms)}")
+    def light_on(self):   self._send_line("LIGHT ON")
+    def light_off(self):  self._send_line("LIGHT OFF")
+
+    # Backward-compat with existing code
+    def activate_lights(self): self.light_on()
 
     def close(self):
-        """Close serial port if open.
-
-        GUI impact:
-            None; invoked by application cleanup.
-        """
+        """Close serial port if open."""
         if not self.simulated and self.ser:
             try:
                 if getattr(self.ser, "is_open", True):
@@ -259,7 +361,6 @@ class HardwareBridge:
                     print("[HardwareBridge] Serial closed.")
             except Exception as e:
                 print(f"[HardwareBridge] Close error: {e}")
-
 
 # =========================
 # Camera Recorder w/ Preview
