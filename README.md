@@ -1,364 +1,231 @@
-# LevitatingInsect
-Repository for PsychoPy Physical Integration
+FlyPy — Trigger → Cameras + Lights + Looming Stimulus (All-in-One GUI)
 
-# FlyPy — Trigger → Cameras + Lights + Looming Stimulus (All-in-One GUI)
+FlyPy coordinates a trigger (hardware, simulated, or manual) to:
 
-This app coordinates a **trigger** (hardware, simulated, or manual) to:
-- Turn **lights** on/off (via Elegoo/Arduino over serial, or simulated)
-- Record **two cameras** in sync to disk
-- Show a **looming stimulus** (growing dot) on a selected monitor
-- Log trial metadata (CSV) including file paths and timing markers
+Record two cameras in sync to disk
 
-It ships with a **single-window GUI** (fixed 1920×1080) that exposes all settings in plain English, with tooltips.
+Turn lights on/off (Elegoo/Arduino over serial, or simulated)
 
----
+Present a looming stimulus (growing black dot) on a selected monitor
 
-## What’s New
+Log a CSV row per trial with file paths, timing, FPS, and settings
 
-- **Stimulus delay** control: set a delay between **recording start** and **stimulus onset**.
-- **Display routing**: choose which **screen** shows the **Stimulus** and which screen shows the **GUI**.
-- **Fullscreen/windowed** Stimulus: fullscreen pins to the chosen monitor; windowed can be dragged anywhere and **persists** across trials.
-- **Manual “Trigger Once”** button: run a single trial immediately (great for testing without hardware).
-- CSV log now includes: `stim_delay_s`, `stim_screen_index`, `stim_fullscreen`.
+The app ships with a single window GUI (plain-English controls + tooltips), live previews for both cameras, codec presets, and optional auto-update from GitHub.
 
----
+Version hint: the current app version is defined in FlyAPI.py as __version__ = "1.3.0".
 
-## Installation
+What’s New (since 1.3.x)
 
-### Windows (recommended)
-```bat
-Install.bat
+Auto-update from GitHub: Help → Check for Updates… downloads the latest portable build (from your repo’s Releases) and stages it for installation after exit.
 
+Auto-scaled GUI: the main window now maximizes to the selected GUI screen’s available size (no fixed 1920×1080).
 
+Display routing: dropdowns to choose which screen shows the Stimulus and which screen hosts the GUI; optional fullscreen for the stimulus.
 
-FlyPy GUI Reference
+Two independent delays (relative to recording start):
 
-This guide explains every control in the FlyPy GUI, what it changes internally, and which inputs/outputs are affected.
+Lights delay → lights_delay_s
 
-Layout: Single window (fixed 1920×1080). All text fields support word-wrap. Live camera previews appear on the lower half; settings are at the top.
+Stimulus delay → stim_delay_s
 
-Quick Map (Control → Code → Effects)
+Persistent stimulus window: created at app start and stays open until you quit; draggable on Windows when windowed (not fullscreen).
 
-Start / Stop / Apply Settings
+Manual Trigger button: run a single trial instantly—no hardware required.
 
-Code: MainApp.start_loop(), MainApp.stop_loop(), MainApp.apply_from_gui()
+Install & Launch
+Quick start (Python installed)
+python FlyAPI.py
 
-Effects: Starts/stops the trigger loop; applies new values from the GUI to the running system.
 
-General settings
+On launch, choose Simulation Mode:
 
-Simulated trigger interval → Config.sim_trigger_interval → Used by HardwareBridge.check_trigger() when Simulation is ON.
+Yes → triggers from a timer (sim_trigger_interval)
 
-Output folder → Config.output_root → All videos/logs saved here (<root>/<YYYYMMDD>/…).
+No → triggers from hardware (Elegoo/Arduino sends T over serial)
 
-Video codec (FOURCC) → Config.fourcc → Used by CameraRecorder.record_clip(); selects encoder.
+Windows portable build (no Python required)
 
-Recording duration per trigger → Config.record_duration_s → Length of video capture after a trigger.
+Use the provided PyInstaller setup:
 
-Looming stimulus
+build_flypy_full.bat — builds a one-folder “FlyPy-Full” (bundles Python + PsychoPy)
 
-Duration → Config.stim_duration_s → How long the dot animates during a trial.
+FlyPy_full.spec — reproducible PyInstaller spec (collects Qt, OpenCV, PsychoPy assets)
 
-Start radius / Final radius → Config.stim_r0_px / Config.stim_r1_px → Pixel size of the dot (grows r0→r1).
+Run:
 
-Background shade (0–1) → Config.stim_bg_grey → Stimulus background (1=white, 0=black).
+build_flypy_full.bat
 
-Camera N — preview & frame rate
 
-Device index → CameraRecorder.set_index() + Config.camN_index → Which camera OpenCV opens.
+Find the portable app at:
 
-Target recording FPS → CameraRecorder.set_target_fps() + Config.camN_target_fps → Intended FPS for recorded files.
+dist\FlyPy\FlyPy.exe
 
-Info labels (read-only): driver-reported FPS, GUI-measured preview FPS, recording target FPS.
 
-Top Bar Controls
-Start
+The build script also puts the official CH340/CH341 USB-serial driver in:
 
-What it does: Begins the background trigger loop. The Status changes to “Watching for triggers…”.
+dist\FlyPy\temp\drivers\CH341SER.EXE
 
-Code path: MainApp.start_loop() → starts a thread that runs MainApp.loop().
 
-Inputs used: All current values from General, Stimulus, and Camera panels (via Apply Settings automatically invoked by Start).
+If Windows doesn’t recognize your Elegoo board, run:
 
-Outputs affected: Starts producing videos and CSV logs on every trigger.
+dist\FlyPy\temp\scripts\install_drivers.bat
 
-Stop
+Hardware Overview (Elegoo/Arduino)
 
-What it does: Stops the trigger loop and returns to idle. Safe to quit afterward.
+Trigger input: your sensor (laser break, button, etc.) toggles a digital pin; the microcontroller emits T via serial when triggered.
 
-Code path: MainApp.stop_loop().
+Serial protocol (already supported):
 
-Outputs affected: No new trials will run until you press Start again.
+Host → Board: START, STIM, END, PULSE <ms>, LIGHT ON, LIGHT OFF
 
-Apply Settings
+Board → Host: T (one line per trigger)
 
-What it does: Copies widget values into the active Config and camera objects.
+The included ElegooFlyPySync.ino sketch is compatible with the above—no changes required.
 
-Code path: MainApp.apply_from_gui().
+Auto-Update from GitHub (portable builds)
 
-When to use: After changing any field. (Start also applies automatically.)
+The app can check your GitHub Releases and stage a self-update.
 
-General Settings
-Simulation mode (label)
+Menu: Help → Check for Updates…
 
-What it shows: Whether Simulation Mode is ON or OFF. Chosen at app startup via Yes/No dialog.
+If a newer release is found with asset (e.g., FlyPy-Full.zip), FlyPy downloads it to a temp folder and prepares update_on_restart.bat inside the app directory.
 
-Code fields: Config.simulation_mode
+Close the app (or click “Close & Update” if you wire a button) to apply the update and relaunch.
 
-Impacts: If ON, triggers are generated by a timer; if OFF, the app listens to Elegoo UNO over USB.
+Developer setup (one-time):
 
-Interval between simulated triggers (seconds)
+Publish portable builds as Release assets (e.g., FlyPy-Full.zip).
 
-Widget: QDoubleSpinBox
+In FlyAPI.py → MainApp.on_check_updates, set:
 
-Code fields: Config.sim_trigger_interval
+REPO = "your-github-user/your-repo"
+ASSET_NAME = "FlyPy-Full.zip"
 
-Used by: HardwareBridge.check_trigger() (simulation path)
 
-Impacts: How often a simulated trigger fires (no hardware required).
-Larger interval reduces CPU usage.
+Keep __version__ in FlyAPI.py up-to-date for comparisons.
 
-Output folder for all trials
+The updater is implemented in auto_update.py (stdlib only; no extra installs).
 
-Widget: QLineEdit + Browse…
+GUI Cheat Sheet
+Top bar
 
-Code fields: Config.output_root
+Start — begin watching for triggers (hardware or simulated)
 
-Used by: TrialRunner.run_trial() and logger setup
+Stop — stop watching
 
-Impacts (outputs):
+Trigger Once (Manual) — run one trial immediately
 
-Creates <OutputRoot>/<YYYYMMDD>/
+Apply Settings — push current GUI values into the running app
 
-Writes *_cam0.mp4 and *_cam1.mp4 (or .avi) files inside the dated folder.
+Help → Check for Updates… — query GitHub Releases and stage an update
 
-Updates/creates trials_log.csv in <OutputRoot>/.
+General
 
-Video codec (FOURCC code)
+Interval between simulated triggers (seconds) → sim_trigger_interval
 
-Widget: QComboBox (choices: mp4v, avc1, XVID)
+Output folder for all trials → output_root
 
-Code fields: Config.fourcc
+Video file format / codec → video_preset_id (updates fourcc)
 
-Used by: CameraRecorder.record_clip() (VideoWriter)
+Recording duration per trigger (seconds) → record_duration_s
 
-Impacts (outputs):
+Stimulus & Timing
 
-Encoder and container selection:
+Stimulus display duration (seconds) → stim_duration_s
 
-mp4v → .mp4 (very compatible)
+Starting / Final dot radius (px) → stim_r0_px, stim_r1_px
 
-avc1 (H.264) → .mp4 (smaller files if supported by your system)
+Background shade (0=black, 1=white) → stim_bg_grey
 
-XVID → .avi
+Delay from recording start → lights ON (seconds) → lights_delay_s (NEW)
 
-If a codec isn’t supported by your system, OpenCV may fail to open the writer.
+Delay from recording start → stimulus ON (seconds) → stim_delay_s (NEW)
 
-Recording duration per trigger (seconds)
+Timing model (per trial)
 
-Widget: QDoubleSpinBox
+Cameras start recording (time 0)
 
-Code fields: Config.record_duration_s
+After lights_delay_s → lights ON
 
-Used by: CameraRecorder.record_clip() (stop time)
+After stim_delay_s → looming stimulus ON (runs for stim_duration_s)
 
-Impacts (outputs): Video length per trial. Longer clips → larger files.
+Cameras finish; lights OFF; row logged in CSV
 
-Looming Stimulus (growing dot)
-Stimulus display duration (seconds)
+If both delays are set, they’re applied from the same origin (recording start). The app staggers waits so each event occurs at its requested absolute time.
 
-Widget: QDoubleSpinBox
+Display & Windows
 
-Code fields: Config.stim_duration_s
+Stimulus display screen → stim_screen_index (NEW)
 
-Used by: LoomingStim.run()
+GUI display screen → gui_screen_index (NEW)
 
-Impacts: How long the dot grows while cameras are recording.
+Stimulus fullscreen on selected screen → stim_fullscreen (NEW)
 
-Starting dot radius (pixels)
+Window persistence
 
-Widget: QSpinBox
+The stimulus window is created as soon as the app launches and stays open.
 
-Code fields: Config.stim_r0_px
+If windowed (fullscreen unchecked), it’s a standard OS window—drag-and-drop between monitors works on Windows.
 
-Used by: LoomingStim.run()
+If fullscreen, it pins to the selected monitor.
 
-Impacts: Initial dot size (in pixels).
+Cameras (per camera)
 
-Final dot radius (pixels)
+OpenCV device index → cam0_index / cam1_index
 
-Widget: QSpinBox
+Target recording FPS → camN_target_fps
 
-Code fields: Config.stim_r1_px
+Labels show driver-reported FPS, measured preview FPS, and target FPS (diagnostics).
 
-Used by: LoomingStim.run()
+Outputs & Logging
 
-Impacts: Final dot size (in pixels) at the end of the stimulus.
+Videos:
 
-Stimulus background shade (0 = black, 1 = white)
+<output_root>/<YYYYMMDD>/<timestamp>_trial####_cam0.<ext>
+<output_root>/<YYYYMMDD>/<timestamp>_trial####_cam1.<ext>
 
-Widget: QDoubleSpinBox
 
-Code fields: Config.stim_bg_grey (default 1.0 = white)
+CSV log (<output_root>/trials_log.csv) columns:
 
-Used by: LoomingStim.run()
+trial, timestamp,
+cam0_path, cam1_path,
+record_duration_s,
+lights_delay_s, stim_delay_s, stim_duration_s,
+stim_screen_index, stim_fullscreen,
+cam0_target_fps, cam1_target_fps,
+video_preset_id, fourcc
 
-PsychoPy path: passes as window color
 
-OpenCV fallback: fills frame with shade 0–255
-
-Impacts: The background behind the dot. (The dot itself is black.)
-
-Camera Panels (Cam 0 and Cam 1)
-
-Each panel shows a live preview (bottom overlay shows the OpenCV Index N) plus controls and read-only FPS readouts.
-
-Which camera to use (OpenCV device index)
-
-Widget: QSpinBox (0–15)
-
-Code path: CameraRecorder.set_index(index) → updates Config.camN_index
-
-Used by: OpenCV VideoCapture(index) for preview and recording
-
-Impacts (input): Selects the physical camera. If unavailable, the app falls back to a synthetic feed (clearly labeled).
-
-Tip: Change this if the preview shows the wrong device; click Apply Settings.
-
-Target recording frame rate (fps)
-
-Widget: QSpinBox (1–10,000; typable; default 60)
-
-Code path: CameraRecorder.set_target_fps(fps) → updates Config.camN_target_fps
-
-Used by: Writer in CameraRecorder.record_clip() and a hint to the capture driver (CAP_PROP_FPS)
-
-Impacts (output): Intended frames per second in the recorded file.
-Note: Actual FPS depends on camera capability/resolution/USB bandwidth. Ultra-high values (kHz) require specialized hardware.
-
-Driver-reported frame rate (may be 0 on some webcams)
-
-Widget: QLabel (read-only)
-
-Code path: CameraRecorder.reported_fps()
-
-Meaning: Reads CAP_PROP_FPS from the driver. Many webcams return 0 or an inaccurate value here.
-
-Measured preview frame rate (GUI)
-
-Widget: QLabel (read-only)
-
-Code path: CameraRecorder.measured_preview_fps()
-
-Meaning: FPS measured from the Preview update timer, not the recording file.
-
-Recording target frame rate (intended)
-
-Widget: QLabel (read-only)
-
-Code path: CameraRecorder.target_fps
-
-Meaning: Echoes the target FPS you set, for clarity.
-
-Status (bottom label)
-
-Widget: QLabel (read-only)
-
-Shows:
-
-Idle / Waiting / Idle
-
-Watching for triggers…
-
-Trial running (preview paused)
-
-Trial finished.
-
-Stopped.
-
-Error — <message>
-
-Code path: Updated by MainApp.update_previews(), MainApp.loop(), MainApp.stop_loop()
-
-What Happens On Each Trigger
-
-Sync markers sent to Elegoo (if connected): START, then later STIM, then END.
-
-Code: HardwareBridge.mark_start(), mark_stim(), mark_end()
-
-Lights ON via Elegoo command (or simulated log).
-
-Code: HardwareBridge.activate_lights() → light_on()
-
-Both cameras record in parallel for Recording duration per trigger.
-
-Code: CameraRecorder.record_clip() (each camera)
-
-Looming stimulus runs for Stimulus display duration.
-
-Code: LoomingStim.run() (PsychoPy if available; otherwise OpenCV window)
-
-CSV log is appended with trial metadata and file paths.
-
-Code: TrialRunner.run_trial() → writes to trials_log.csv
-
-Outputs (Files & Folders)
-
-Video files (per trial):
-<OutputRoot>/<YYYYMMDD>/<timestamp>_trial####_cam0(.mp4|.avi)
-<OutputRoot>/<YYYYMMDD>/<timestamp>_trial####_cam1(.mp4|.avi)
-
-Container/codec chosen by Video codec (FOURCC).
-
-CSV log:
-<OutputRoot>/trials_log.csv (appends rows with trial index, timestamp, file paths, durations, target FPS).
-
-Inputs (Triggers & Hardware)
-
-Simulation Mode ON: Triggers generated every Interval between simulated triggers seconds.
-
-Simulation Mode OFF: Triggers read from Elegoo UNO over USB serial: a line with T.
-
-Auto-detects CH340 (VID_1A86 / PID_7523) ports when possible.
-
-Commands sent to Elegoo: START, STIM, END, LIGHT ON/OFF, PULSE n.
+If a requested FOURCC/container fails on the local system, FlyPy automatically falls back to .mp4 with mp4v.
 
 Tips & Troubleshooting
 
-No camera preview:
+No hardware on hand? Use Simulation Mode = Yes or click Trigger Once (Manual).
 
-Ensure the device index matches the camera. Synthetic preview indicates an unavailable index.
+No PsychoPy? The stimulus uses an OpenCV window (already implemented).
 
-Codec not working:
+Wrong monitor? Use Display & Windows. In windowed mode, drag the stimulus where you want—it persists.
 
-Try switching FOURCC (e.g., mp4v for compatibility). Some systems need additional codecs.
+Codec errors or odd framerates? Prefer MP4 (mp4v) for broad compatibility.
 
-FPS not achieved:
+Serial not found? Install the CH340/CH341 driver (see temp/ folder in the portable app).
 
-Hardware and USB bandwidth limit real FPS. Lower resolution or target FPS if needed.
+File Map
 
-Stimulus on the wrong screen:
+FlyAPI.py — main app (GUI, cameras, stimulus, hardware, logging, updater hook)
 
-PsychoPy uses a resizable window (not full screen) by default; move it and close after the trial if desired.
+auto_update.py — GitHub Releases checker & self-update stager (Windows-safe)
 
-Behind the Scenes (per control)
-GUI Element	Config / Object	Read by (Runtime)	Notes
-Interval between simulated triggers	Config.sim_trigger_interval	HardwareBridge.check_trigger()	Only used in Simulation Mode
-Output folder	Config.output_root	TrialRunner.run_trial()	Creates date folder; writes videos & CSV
-Video codec (FOURCC)	Config.fourcc	CameraRecorder.record_clip()	Chooses encoder & container
-Record duration	Config.record_duration_s	CameraRecorder.record_clip()	Capture length
-Stimulus duration	Config.stim_duration_s	LoomingStim.run()	Dot growth time
-Start/Final radius	Config.stim_r0_px / stim_r1_px	LoomingStim.run()	Pixel radii
-Background shade	Config.stim_bg_grey	LoomingStim.run()	1.0 = white (default)
-Cam index (0/1)	CameraRecorder.set_index() → Config.camN_index	OpenCV VideoCapture	Selects device or synthetic
-Target FPS (0/1)	CameraRecorder.set_target_fps() → Config.camN_target_fps	VideoWriter & capture hint	Intended FPS (hardware-limited)
-Driver FPS label	(read) CameraRecorder.reported_fps()	—	From CAP_PROP_FPS; can be 0/incorrect
-Measured preview FPS	(read) CameraRecorder.measured_preview_fps()	—	GUI timer based
-Recording target FPS label	(read) CameraRecorder.target_fps	—	Mirror of target setting
-Safe Shutdown
+ElegooFlyPySync.ino — Arduino sketch (triggers + light/sync protocol)
 
-Press Stop then close the window.
+FlyPy_full.spec — PyInstaller spec (FlyPy-Full, includes PsychoPy)
 
-The app also registers cleanup handlers to close cameras, serial ports, and the CSV log gracefully.
+build_flypy_full.bat — one-folder build script (creates dist/FlyPy/)
 
-This documentation matches the current FlyPy GUI and code structure (MainApp, SettingsGUI, TrialRunner, CameraRecorder, HardwareBridge, LoomingStim).
+requirements.txt — core dependencies (numpy, opencv-python, PyQt5, pyserial; psychopy optional at runtime)
+
+LICENSE, README.md — docs & license
+
+License
+
+See LICENSE.
