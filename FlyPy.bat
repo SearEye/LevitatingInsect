@@ -10,7 +10,7 @@ REM   FlyPy.bat help
 REM   FlyPy.bat setup           (create venv + pip install -r requirements.txt)
 REM   FlyPy.bat setup-full      (setup + install PsychoPy)
 REM   FlyPy.bat launch          (run FlyAPI.py in venv)
-REM   FlyPy.bat build-full      (PyInstaller one-folder build WITH PsychoPy)
+REM   FlyPy.bat build-full      (PyInstaller one-folder build WITH PsychoPy; no .spec needed)
 REM   FlyPy.bat drivers         (download CH340/CH341 driver to temp\drivers and launch it)
 REM   FlyPy.bat lock            (pip freeze -> requirements.lock.txt)
 REM   FlyPy.bat clean           (remove build/, dist/)
@@ -88,7 +88,8 @@ if exist "requirements.txt" (
   echo [SETUP] Installing requirements.txt ...
   "%PIP_EXE%" install -r requirements.txt || goto :die
 ) else (
-  echo [SETUP] No requirements.txt found (continuing).
+  echo [SETUP] No requirements.txt found. Installing core deps directly...
+  "%PIP_EXE%" install numpy opencv-python PyQt5 pyserial || goto :die
 )
 echo.
 echo [SETUP] Done.
@@ -127,27 +128,24 @@ if not exist "%PYTHON_EXE%" (
   "%PIP_EXE%" install psychopy pyinstaller || goto :die
 )
 
-REM Prepare temp assets (drivers + helper scripts) that will ship inside dist\FlyPy\temp\
+REM Prepare temp assets (drivers + helper scripts) that will be bundled
 call :prepare_temp_assets
 
 echo.
-echo [BUILD] Running PyInstaller (one-folder)...
-set "SPEC=FlyPy_full.spec"
-if exist "%SPEC%" (
-  pyinstaller --noconfirm --clean "%SPEC%" || goto :die
-) else (
-  REM Fallback spec-less build (collect common deps)
-  pyinstaller ^
-    --noconfirm --clean --windowed ^
-    --name FlyPy ^
-    --hidden-import serial.tools.list_ports ^
-    --collect-all PyQt5 --collect-all cv2 --collect-all psychopy ^
-    --add-data "README.md;." --add-data "LICENSE;." ^
-    FlyAPI.py || goto :die
-  REM If we built spec-less, make sure temp\ is copied into dist\FlyPy\temp\
-  if exist "dist\FlyPy" (
-    xcopy /E /I /Y "temp" "dist\FlyPy\temp" >nul 2>nul
-  )
+echo [BUILD] Running PyInstaller (one-folder, spec-less)...
+pyinstaller ^
+  --noconfirm --clean --windowed ^
+  --name FlyPy ^
+  --hidden-import serial.tools.list_ports ^
+  --collect-all PyQt5 --collect-all cv2 --collect-all psychopy ^
+  --collect-all pyglet --collect-all sounddevice --collect-all soundfile ^
+  --add-data "README.md;." --add-data "LICENSE;." ^
+  --add-data "temp;temp" ^
+  FlyAPI.py || goto :die
+
+REM Extra safety: if add-data missed temp\, copy it
+if exist "dist\FlyPy" (
+  xcopy /E /I /Y "temp" "dist\FlyPy\temp" >nul 2>nul
 )
 
 echo.
