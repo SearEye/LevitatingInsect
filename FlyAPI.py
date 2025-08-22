@@ -19,12 +19,12 @@ GUI:
   • Stimulus fullscreen/windowed mode (windowed is draggable)
   • Manual "Trigger Once" button
   • Auto-scales GUI to the maximum usable size of the selected screen (NEW)
-  • Help → Check for Updates… menu (hooks to auto_update.py) (NEW)
+  • Help → Check for Updates… menu (now uses an inline updater) (NEW)
 
 This file is heavily annotated. Every class and function includes a docstring with plain English.
 """
 
-__version__ = "1.3.0"  # bump when you cut a release (used by auto_update)
+__version__ = "1.3.0"  # bump when you cut a release (used by the updater)
 
 import sys
 import threading
@@ -35,15 +35,16 @@ from datetime import datetime
 import atexit
 from collections import deque
 
+import json
+import shutil
+import tempfile
+import zipfile
+import urllib.request
+from urllib.error import URLError, HTTPError
+
 import numpy as np
 import cv2
 from PyQt5 import QtWidgets, QtCore, QtGui
-
-# Optional: soft import of updater (the app runs fine if this module is absent)
-try:
-    import auto_update
-except Exception:
-    auto_update = None
 
 # ---------- HiDPI scaling (set BEFORE QApplication is constructed) ----------
 try:
@@ -73,6 +74,126 @@ except Exception:
     visual = None
     core = None
     PSYCHOPY = False
+
+
+# =========================
+# Auto Update Helper (inline)
+# =========================
+_API_LATEST = "https://api.github.com/repos/{repo}/releases/latest"
+_UA = "FlyPy-Updater/1.0 (+https://github.com)"
+
+def _http_get(url: str) -> str:
+    """Return the body of a GET request to `url` (as text)."""
+    req = urllib.request.Request(url, headers={"User-Agent": _UA, "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return r.read().decode("utf-8")
+
+def _parse_ver(v: str):
+    """Parse a semantic-ish version string like 'v1.2.3' into a tuple of ints (1,2,3)."""
+    s = v.strip()
+    if s[:1] in ("v", "V"):
+        s = s[1:]
+    parts = []
+    for tok in s.split("."):
+        try:
+            parts.append(int(tok))
+        except Exception:
+            parts.append(0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
+
+def _is_newer(remote_tag: str, current: str) -> bool:
+    """True if remote_tag (e.g., 'v1.4.0') is newer than `current`."""
+    return _parse_ver(remote_tag) > _parse_ver(current)
+
+def _find_asset(assets, name: str):
+    """Pick an asset (dict) by exact filename from a GitHub release assets list."""
+    for a in assets:
+        if a.get("name", "").lower() == name.lower():
+            return a
+    return None
+
+def _download(url: str, dest: str):
+    """Download `url` to file `dest`."""
+    req = urllib.request.Request(url, headers={"User-Agent": _UA})
+    with urllib.request.urlopen(req, timeout=60) as r, open(dest, "wb") as f:
+        shutil.copyfileobj(r, f)
+
+def _app_root() -> str:
+    """Folder that contains FlyPy.exe (PyInstaller) or this script (dev)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(sys.argv[0]))
+
+def _write_update_bat(zip_path: str, app_root: str, exe_name: str = "FlyPy.exe") -> str:
+    """Write a small .bat that unpacks the zip over app_root and relaunches the app."""
+    bat_path = os.path.join(app_root, "update_on_restart.bat")
+    temp_unpack = os.path.join(app_root, "_upd_unpack")
+    with open(bat_path, "w", encoding="utf-8", newline="\r\n") as f:
+        f.write("@echo off\n")
+        f.write("setlocal EnableExtensions EnableDelayedExpansion\n")
+        f.write("echo Waiting for the app to exit...\n")
+        f.write("ping -n 3 127.0.0.1 >nul\n")
+        f.write(f"set ZIP=\"{zip_path}\"\n")
+        f.write(f"set APPROOT=\"{app_root}\"\n")
+        f.write(f"set UNPACK=\"{temp_unpack}\"\n")
+        f.write("rmdir /S /Q %UNPACK% 2>nul\n")
+        f.write("mkdir %UNPACK%\n")
+        f.write("echo Unpacking update...\n")
+        f.write("powershell -NoProfile -Command \"Expand-Archive -Path %ZIP% -DestinationPath %UNPACK% -Force\" 2>nul\n")
+        f.write("if not exist %UNPACK%\\* (\n")
+        f.write("  echo PowerShell unzip failed.\n")
+        f.write(")\n")
+        f.write("echo Applying update...\n")
+        f.write("robocopy %UNPACK% %APPROOT% /E /XO >nul\n")
+        f.write("echo Cleaning up...\n")
+        f.write("rmdir /S /Q %UNPACK% 2>nul\n")
+        f.write("del %ZIP% 2>nul\n")
+        f.write("echo Relaunching...\n")
+        f.write("start \"\" \"%APPROOT%\\{}\"\n".format(exe_name))
+        f.write("exit /b 0\n")
+    return bat_path
+
+def check_updates_and_stage(repo: str, current_version: str, asset_name: str):
+    """Check GitHub Releases; if newer exists, download asset and prep update script.
+
+    Returns:
+        (found, message)
+    """
+    try:
+        meta = json.loads(_http_get(_API_LATEST.format(repo=repo)))
+    except (URLError, HTTPError) as e:
+        return False, f"Could not contact GitHub: {e}"
+    except Exception as e:
+        return False, f"Update check failed: {e}"
+
+    remote_tag = str(meta.get("tag_name", "")).strip()
+    if not remote_tag:
+        return False, "No releases found for this repository."
+
+    if not _is_newer(remote_tag, current_version):
+        return False, f"Up to date (current {current_version}, latest {remote_tag})."
+
+    asset = _find_asset(meta.get("assets", []), asset_name)
+    if not asset:
+        return False, f"New release {remote_tag} found, but asset '{asset_name}' was not attached."
+    url = asset.get("browser_download_url")
+    if not url:
+        return False, "Asset download URL missing."
+
+    tmpdir = tempfile.mkdtemp(prefix="flypy_upd_")
+    dest_zip = os.path.join(tmpdir, asset_name)
+    try:
+        _download(url, dest_zip)
+    except Exception as e:
+        return False, f"Failed to download update: {e}"
+
+    app_root = _app_root()
+    bat = _write_update_bat(dest_zip, app_root)
+    return True, f"Update {remote_tag} downloaded. Close the app to finish installing.\n\n" \
+                 f"A helper script has been prepared:\n{bat}\n" \
+                 f"It will apply the update and relaunch."
 
 
 # =========================
@@ -171,7 +292,7 @@ class HardwareBridge:
         self._last_sim = time.time()
         self.ser = None
         self.port = port
-        self.baud = baud
+               self.baud = baud
 
         if not self.simulated:
             try:
@@ -1119,22 +1240,16 @@ class MainApp(QtWidgets.QApplication):
 
     # ---------- updater ----------
     def on_check_updates(self):
-        """Menu handler: Help → Check for Updates… (uses auto_update.py if present)."""
-        if not auto_update:
-            QtWidgets.QMessageBox.information(None, "Updates", "Auto-update module not present in this build.")
-            return
-
+        """Menu handler: Help → Check for Updates… (uses the inline updater)."""
         # Configure your repo and asset name here:
-        REPO = "your-github-user/your-repo"           # e.g., "neuro-lab/FlyPy"
-        ASSET_NAME = "FlyPy-Full.zip"                 # the asset you attach to Releases
-        CHANNEL = "releases"                          # or "latest"; we use latest release here
+        REPO = "your-github-user/your-repo"    # e.g., "neuro-lab/FlyPy"
+        ASSET_NAME = "FlyPy-Full.zip"          # the asset attached to Releases
 
         def worker():
             try:
-                found, msg = auto_update.check_and_prompt(repo=REPO,
-                                                          current_version=__version__,
-                                                          asset_name=ASSET_NAME,
-                                                          channel=CHANNEL)
+                found, msg = check_updates_and_stage(repo=REPO,
+                                                     current_version=__version__,
+                                                     asset_name=ASSET_NAME)
             except Exception as e:
                 found, msg = False, f"Update check failed: {e}"
             QtCore.QMetaObject.invokeMethod(self, "_show_update_msg",
