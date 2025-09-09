@@ -109,4 +109,39 @@ Window behavior:
 ## Logging
 
 Each trial appends one row to `FlyPy_Output\YYYYMMDD\trials_log.csv`:
+timestamp, trial_idx, cam0_path, cam1_path, record_duration_s,
+lights_delay_s, stim_delay_s, stim_duration_s,
+stim_screen_index, stim_fullscreen, cam0_target_fps, cam1_target_fps,
+video_preset_id, fourcc
+
+
+
+
+
+---
+
+## Requirements
+
+Core: `numpy`, `opencv-python`, `PyQt5`, `pyserial`  
+Optional: `psychopy` (installed automatically only on Python `< 3.11`; otherwise the stimulus uses the OpenCV fallback)
+
+See `requirements.txt`.
+
+---
+
+## Troubleshooting
+
+- **No stimulus window?** Ensure `stim_delay_s + stim_duration_s ≤ record_duration_s` and the display screen is connected.  
+- **Codec problems?** MP4/`mp4v` is the most broadly compatible. The app falls back to `.mp4` with `mp4v` if your selection fails.  
+- **No hardware triggers?** Toggle **Simulation Mode** ON and test; confirm CH340 driver installed for hardware tests.  
+- **Cameras swapped?** Change **Camera 0/1 index**; typical values are 0 and 1.
+
+---
+
+## Changelog (since 1.3.x)
+
+- **Startup speedups:** lazy PsychoPy import, lazy camera open, lazy serial open & MCU settle.  
+- **UX:** Simulation Mode is a GUI checkbox (no modal prompt); `--simulate` and `--prewarm-stim` CLI flags.  
+- **Display:** Optional pre-warm of stimulus window at launch (default OFF).  
+- **Windows:** Prefer DirectShow backend before MSMF to reduce device-probe delays.
 
