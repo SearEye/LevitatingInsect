@@ -19,9 +19,14 @@ GUI:
   • Stimulus fullscreen/windowed mode (windowed is draggable)
   • Manual "Trigger Once" button
   • Auto-scales GUI to the maximum usable size of the selected screen (NEW)
-  • Help → Check for Updates… menu (now uses an inline updater) (NEW)
+  • Help → Check for Updates… menu (inline updater hook) (NEW)
+  • Simulation Mode checkbox in GUI (no more modal prompt) (NEW)
+  • Optional “Pre-warm stimulus window at launch” checkbox (default off) (NEW)
 
-This file is heavily annotated. Every class and function includes a docstring with plain English.
+Startup efficiency:
+  • Lazy PsychoPy import (only when stimulus is shown)
+  • Lazy camera open (on first preview/record)
+  • Lazy serial open and MCU settle (on first real use)
 """
 
 __version__ = "1.3.0"  # bump when you cut a release (used by the updater)
@@ -75,7 +80,7 @@ def _ensure_psychopy_loaded() -> bool:
         return False
     try:
         # Defer heavy import until actually needed
-        psychopy = importlib.import_module("psychopy")  # noqa: F401
+        importlib.import_module("psychopy")  # noqa: F401
         visual = importlib.import_module("psychopy.visual")
         core   = importlib.import_module("psychopy.core")
         PSYCHOPY = True
@@ -152,7 +157,7 @@ def get_screen_geometries():
 VIDEO_PRESETS = [
     {
         "id": "mp4_mp4v",
-        "label": "MP4 / mp4v — very compatible (H.263-like); ~large files; 60–200 fps ok",
+        "label": "MP4 / mp4v — very compatible; ~larger files; 60–200 fps ok",
         "fourcc": "mp4v",
     },
     {
@@ -311,6 +316,8 @@ class HardwareBridge:
                     print("[HardwareBridge] Serial closed.")
             except Exception as e:
                 print(f"[HardwareBridge] Close error: {e}")
+        self.ser = None
+        self._opened = False
 
 
 # =========================
@@ -587,6 +594,7 @@ class LoomingStim:
                         t = time.time() - t0
                         if t >= duration_s:
                             break
+                        r = r0 + (r1 - r1 + 0) * (t / duration_s)  # keep form simple
                         r = r0 + (r1 - r0) * (t / duration_s)
                         dot.radius = r
                         dot.draw()
@@ -716,9 +724,6 @@ class TrialRunner:
 
         # Begin recording immediately
         print("[Trial] Recording both cameras...")
-        cam0_path, cam1_path = None, None
-        rec_thread = threading.Thread(target=lambda: self._store_cam_paths(folder))
-        # Actually record synchronously here to make delays meaningful
         cam0_path, cam1_path = self._record_both(folder)
 
         # Lights and stimulus timing (relative to recording start)
@@ -755,9 +760,6 @@ class TrialRunner:
         ])
         self.log_file.flush()
         print("[Trial] Logged.")
-
-    def _store_cam_paths(self, folder):
-        pass  # legacy compatibility (record now handled inline)
 
 
 # =========================
@@ -820,6 +822,12 @@ class SettingsGUI(QtWidgets.QWidget):
         gl = QtWidgets.QFormLayout(gen)
         gl.setRowWrapPolicy(QtWidgets.QFormLayout.WrapAllRows)
 
+        # NEW: Simulation Mode toggle
+        self.cb_simulate = QtWidgets.QCheckBox("Use simulated triggers (no hardware)")
+        self.cb_simulate.setChecked(bool(self.cfg.simulation_mode))
+        self.cb_simulate.setToolTip("If checked, triggers fire on an interval; the serial device will not be opened.")
+        gl.addRow(self.cb_simulate)
+
         self.sb_sim_interval = QtWidgets.QDoubleSpinBox()
         self.sb_sim_interval.setRange(0.1, 3600.0); self.sb_sim_interval.setDecimals(2)
         self.sb_sim_interval.setValue(self.cfg.sim_trigger_interval)
@@ -872,7 +880,7 @@ class SettingsGUI(QtWidgets.QWidget):
         self.sb_bg.setToolTip("Background shade (0=black, 1=white).")
         sl.addRow(QtWidgets.QLabel("Stimulus background shade (0=black, 1=white):"), self.sb_bg)
 
-        # NEW: delays (from recording start) — both independently configurable
+        # NEW: delays (from recording start)
         self.sb_light_delay = QtWidgets.QDoubleSpinBox()
         self.sb_light_delay.setRange(0.0, 10.0); self.sb_light_delay.setDecimals(3); self.sb_light_delay.setValue(self.cfg.lights_delay_s)
         self.sb_light_delay.setToolTip("Delay (seconds) from recording start to LIGHTS ON.")
@@ -969,7 +977,6 @@ class SettingsGUI(QtWidgets.QWidget):
 
     def update_cam_fps_labels(self):
         for g in self.cam_groups:
-            # We only have approximate preview fps; display what we computed in the overlay text
             g["lbl_rep"].setText(f"Driver-reported fps: (see overlay)")
 
     def _refresh_general_labels(self):
@@ -1017,15 +1024,12 @@ class MainApp(QtWidgets.QApplication):
         self.position_and_maximize_gui(self.cfg.gui_screen_index)
 
         # Do NOT pre-open the stimulus window by default (faster startup). Optionally prewarm later.
-        # Preview timer starts after the window first paints.
         QtCore.QTimer.singleShot(200, self._start_previews)
 
         # Optional CLI prewarm
         if getattr(self.cfg, "prewarm_stim", False) or cli.get("prewarm_stim"):
             QtCore.QTimer.singleShot(300, lambda: self.trial_runner.stim.open_persistent_window(
                 self.cfg.stim_screen_index, self.cfg.stim_fullscreen, self.cfg.stim_bg_grey))
-
-        # State flags
 
     def _start_previews(self):
         """Start the periodic preview refresh."""
@@ -1066,8 +1070,23 @@ class MainApp(QtWidgets.QApplication):
     def apply_from_gui(self):
         """Push current GUI values into Config/Cameras and update windows."""
         # General
+        prev_sim = bool(self.cfg.simulation_mode)
+        self.cfg.simulation_mode = bool(self.gui.cb_simulate.isChecked())
         self.cfg.sim_trigger_interval = float(self.gui.sb_sim_interval.value())
         self.cfg.output_root = self.gui.le_root.text().strip() or self.cfg.output_root
+
+        # If simulation mode changed, reflect on hardware bridge
+        if self.hardware.simulated != self.cfg.simulation_mode:
+            if self.cfg.simulation_mode:
+                # Switching to simulation: close serial immediately
+                self.hardware.close()
+                self.hardware.simulated = True
+            else:
+                # Switching to hardware: mark unopened; will open lazily on use
+                self.hardware.simulated = False
+                self.hardware._opened = False
+                self.hardware.ser = None
+            print(f"[MainApp] Simulation mode {'ENABLED' if self.cfg.simulation_mode else 'DISABLED'} (was {prev_sim}).")
 
         idx = self.gui.cb_format.currentIndex()
         preset_id = self.gui.cb_format.itemData(idx) or self.gui._preset_id_by_index.get(idx, default_preset_id())
@@ -1123,6 +1142,7 @@ class MainApp(QtWidgets.QApplication):
 
         ensure_dir(self.cfg.output_root)
         self.gui.lbl_status.setText("Status: Settings applied.")
+        self.gui._refresh_general_labels()
         print("[MainApp] Settings applied.")
 
     # ---------- preview ----------
