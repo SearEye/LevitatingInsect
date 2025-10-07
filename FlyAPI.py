@@ -767,172 +767,121 @@ class TrialRunner:
 # =========================
 
 class SettingsGUI(QtWidgets.QWidget):
-    """Single-window GUI for settings, previews, and controls."""
+    """
+    Single-window GUI for settings, previews, and controls.
+    Adds camera & display dropdowns (with Refresh buttons).
+    Compatible with existing MainApp signal wiring.
+    Accepts constructor as either SettingsGUI(parent_app) or SettingsGUI(cfg, cam0, cam1).
+    """
+    # Signals expected by MainApp
     start_experiment = QtCore.pyqtSignal()
     stop_experiment  = QtCore.pyqtSignal()
     apply_settings   = QtCore.pyqtSignal()
     manual_trigger   = QtCore.pyqtSignal()
     check_updates    = QtCore.pyqtSignal()
 
-    def __init__(self, cfg: Config, cam0: CameraRecorder, cam1: CameraRecorder):
+    def __init__(self, *args):
         super().__init__()
-        self.cfg  = cfg
-        self.cam0 = cam0
-        self.cam1 = cam1
+        # Support both call styles
+        self.app = None
+        if len(args) == 1:
+            parent_app = args[0]
+            self.app = parent_app
+            self.cfg = parent_app.cfg
+            self.cam0 = parent_app.cam0
+            self.cam1 = parent_app.cam1
+        elif len(args) >= 3:
+            cfg, cam0, cam1 = args[:3]
+            self.cfg = cfg
+            self.cam0 = cam0
+            self.cam1 = cam1
+        else:
+            raise TypeError("SettingsGUI expects (parent_app) or (cfg, cam0, cam1)")
 
-        self.setWindowTitle(f"FlyPy — Trigger->Outputs (GUI)  v{__version__}")
+        self.setWindowTitle("FlyPy — Settings")
+        panels = QtWidgets.QGridLayout(self)
 
-        root = QtWidgets.QVBoxLayout(self)
-
-        # Menu bar (Help → Check for Updates…)
-        menubar = QtWidgets.QMenuBar()
-        helpmenu = menubar.addMenu("Help")
-        act_update = QtWidgets.QAction("Check for Updates…", self)
-        helpmenu.addAction(act_update)
-        act_update.triggered.connect(self.check_updates.emit)
-        root.addWidget(menubar)
-
-        # Top controls row
-        controls = QtWidgets.QHBoxLayout()
-        self.bt_start   = QtWidgets.QPushButton("Start")
-        self.bt_stop    = QtWidgets.QPushButton("Stop")
-        self.bt_trigger = QtWidgets.QPushButton("Trigger Once")
-        self.bt_apply   = QtWidgets.QPushButton("Apply Settings")
-        controls.addWidget(self.bt_start); controls.addWidget(self.bt_stop)
-        controls.addWidget(self.bt_trigger); controls.addWidget(self.bt_apply)
-        root.addLayout(controls)
-
-        # Signals for buttons
-        self.bt_start.clicked.connect(self.start_experiment.emit)
-        self.bt_stop.clicked.connect(self.stop_experiment.emit)
-        self.bt_trigger.clicked.connect(self.manual_trigger.emit)
-        self.bt_apply.clicked.connect(self.apply_settings.emit)
-
+        # ===== Top info label =====
+        self.lbl_general = QtWidgets.QLabel("")
+        panels.addWidget(self.lbl_general, 0, 0, 1, 2)
         # Status label
-        self.lbl_status = QtWidgets.QLabel("Status: Idle.")
-        root.addWidget(self.lbl_status)
+        self.lbl_status = QtWidgets.QLabel('Status: Idle.')
+        panels.addWidget(self.lbl_status, 5, 0, 1, 2)
 
-        # Panels grid
-        panels = QtWidgets.QGridLayout()
-        root.addLayout(panels)
 
-        # ------- General -------
-        gen = QtWidgets.QGroupBox("General")
-        gen.setToolTip("Global options and output folders.")
-        gl = QtWidgets.QFormLayout(gen)
-        gl.setRowWrapPolicy(QtWidgets.QFormLayout.WrapAllRows)
-
-        # NEW: Simulation Mode toggle
-        self.cb_simulate = QtWidgets.QCheckBox("Use simulated triggers (no hardware)")
-        self.cb_simulate.setChecked(bool(self.cfg.simulation_mode))
-        self.cb_simulate.setToolTip("If checked, triggers fire on an interval; the serial device will not be opened.")
-        gl.addRow(self.cb_simulate)
-
-        self.sb_sim_interval = QtWidgets.QDoubleSpinBox()
-        self.sb_sim_interval.setRange(0.1, 3600.0); self.sb_sim_interval.setDecimals(2)
-        self.sb_sim_interval.setValue(self.cfg.sim_trigger_interval)
-        self.sb_sim_interval.setToolTip("Time between simulated triggers (seconds).")
-        gl.addRow(QtWidgets.QLabel("Interval between simulated triggers (seconds):"), self.sb_sim_interval)
-
-        self.le_root = QtWidgets.QLineEdit(self.cfg.output_root)
-        self.le_root.setToolTip("Folder where date-stamped trial folders/videos will be saved.")
-        self.btn_browse = QtWidgets.QPushButton("Browse…")
-        rhl = QtWidgets.QHBoxLayout(); rhl.addWidget(self.le_root); rhl.addWidget(self.btn_browse)
-        gl.addRow(QtWidgets.QLabel("Output folder for all trials:"), rhl)
-
-        self.cb_format = QtWidgets.QComboBox()
-        self.cb_format.setToolTip("Select container/codec for saved videos.")
-        self._preset_id_by_index = {}
-        current_index = 0
-        for i, p in enumerate(VIDEO_PRESETS):
-            self.cb_format.addItem(p["label"]); self.cb_format.setItemData(i, p["id"]); self._preset_id_by_index[i] = p["id"]
-            if p["id"] == self.cfg.video_preset_id: current_index = i
-        self.cb_format.setCurrentIndex(current_index)
-        gl.addRow(QtWidgets.QLabel("Video format / codec:"), self.cb_format)
-
-        self.sb_rec_dur = QtWidgets.QDoubleSpinBox()
-        self.sb_rec_dur.setRange(0.1, 600.0); self.sb_rec_dur.setDecimals(2); self.sb_rec_dur.setValue(self.cfg.record_duration_s)
-        self.sb_rec_dur.setToolTip("Recording duration per trigger (seconds).")
-        gl.addRow(QtWidgets.QLabel("Recording duration per trigger (seconds):"), self.sb_rec_dur)
-
-        panels.addWidget(gen, 0, 0)
-
-        # ------- Stimulus & Timing -------
-        stim = QtWidgets.QGroupBox("Stimulus & Timing")
-        stim.setToolTip("Looming dot parameters and timing relative to recording start.")
-        sl = QtWidgets.QFormLayout(stim)
-        sl.setRowWrapPolicy(QtWidgets.QFormLayout.WrapAllRows)
-
-        self.sb_stim_dur = QtWidgets.QDoubleSpinBox()
-        self.sb_stim_dur.setRange(0.1, 30.0); self.sb_stim_dur.setDecimals(2); self.sb_stim_dur.setValue(self.cfg.stim_duration_s)
-        self.sb_stim_dur.setToolTip("How long the looming dot is shown (seconds).")
-        sl.addRow(QtWidgets.QLabel("Stimulus display duration (seconds):"), self.sb_stim_dur)
-
-        self.sb_r0 = QtWidgets.QSpinBox(); self.sb_r0.setRange(1, 2000); self.sb_r0.setValue(self.cfg.stim_r0_px)
-        self.sb_r0.setToolTip("Starting dot radius (px).")
-        sl.addRow(QtWidgets.QLabel("Starting dot radius (pixels):"), self.sb_r0)
-
-        self.sb_r1 = QtWidgets.QSpinBox(); self.sb_r1.setRange(1, 4000); self.sb_r1.setValue(self.cfg.stim_r1_px)
-        self.sb_r1.setToolTip("Final dot radius (px).")
-        sl.addRow(QtWidgets.QLabel("Final dot radius (pixels):"), self.sb_r1)
-
-        self.sb_bg = QtWidgets.QDoubleSpinBox(); self.sb_bg.setRange(0.0, 1.0); self.sb_bg.setSingleStep(0.05); self.sb_bg.setValue(self.cfg.stim_bg_grey)
-        self.sb_bg.setToolTip("Background shade (0=black, 1=white).")
-        sl.addRow(QtWidgets.QLabel("Stimulus background shade (0=black, 1=white):"), self.sb_bg)
-
-        # NEW: delays (from recording start)
-        self.sb_light_delay = QtWidgets.QDoubleSpinBox()
-        self.sb_light_delay.setRange(0.0, 10.0); self.sb_light_delay.setDecimals(3); self.sb_light_delay.setValue(self.cfg.lights_delay_s)
-        self.sb_light_delay.setToolTip("Delay (seconds) from recording start to LIGHTS ON.")
-        sl.addRow(QtWidgets.QLabel("Delay from recording start → lights ON (seconds):"), self.sb_light_delay)
-
-        self.sb_stim_delay = QtWidgets.QDoubleSpinBox()
-        self.sb_stim_delay.setRange(0.0, 10.0); self.sb_stim_delay.setDecimals(3); self.sb_stim_delay.setValue(self.cfg.stim_delay_s)
-        self.sb_stim_delay.setToolTip("Delay (seconds) from recording start to STIMULUS onset.")
-        sl.addRow(QtWidgets.QLabel("Delay from recording start → stimulus ON (seconds):"), self.sb_stim_delay)
-
-        panels.addWidget(stim, 0, 1)
-
-        # ------- Display / Screens -------
+        # ===== Displays =====
         disp = QtWidgets.QGroupBox("Display & Windows")
-        disp.setToolTip("Choose which monitor shows the Stimulus and the GUI. Fullscreen or windowed.")
         dl = QtWidgets.QFormLayout(disp)
         dl.setRowWrapPolicy(QtWidgets.QFormLayout.WrapAllRows)
 
-        screens = QtGui.QGuiApplication.screens()
-        def screen_label(i, s):
-            g = s.geometry()
-            return f"Screen {i} — {g.width()}×{g.height()} @ ({g.x()},{g.y()})"
-
         self.cb_stim_screen = QtWidgets.QComboBox()
         self.cb_gui_screen = QtWidgets.QComboBox()
-        for i, s in enumerate(screens):
-            lbl = screen_label(i, s); self.cb_stim_screen.addItem(lbl); self.cb_gui_screen.addItem(lbl)
-        self.cb_stim_screen.setCurrentIndex(self.cfg.stim_screen_index if self.cfg.stim_screen_index < len(screens) else 0)
-        self.cb_gui_screen.setCurrentIndex(self.cfg.gui_screen_index if self.cfg.gui_screen_index < len(screens) else 0)
-        self.cb_stim_screen.setToolTip("Which monitor should the looming stimulus appear on.")
-        self.cb_gui_screen.setToolTip("Which monitor should host this GUI window.")
+        self.btn_refresh_displays = QtWidgets.QPushButton("Refresh Displays")
+
+        def _populate_displays():
+            self.cb_stim_screen.blockSignals(True)
+            self.cb_gui_screen.blockSignals(True)
+            self.cb_stim_screen.clear()
+            self.cb_gui_screen.clear()
+            screens = QtGui.QGuiApplication.screens()
+            for i, s in enumerate(screens):
+                g = s.geometry()
+                lbl = f"Screen {i} — {g.width()}×{g.height()} @ ({g.x()},{g.y()})"
+                self.cb_stim_screen.addItem(lbl, i)
+                self.cb_gui_screen.addItem(lbl, i)
+            si = int(getattr(self.cfg, "stim_screen_index", 0))
+            gi = int(getattr(self.cfg, "gui_screen_index", 0))
+            if si >= len(screens): si = 0
+            if gi >= len(screens): gi = 0
+            self.cb_stim_screen.setCurrentIndex(si)
+            self.cb_gui_screen.setCurrentIndex(gi)
+            self.cb_stim_screen.blockSignals(False)
+            self.cb_gui_screen.blockSignals(False)
+
+        _populate_displays()
+        self.btn_refresh_displays.clicked.connect(_populate_displays)
 
         self.cb_stim_fullscr = QtWidgets.QCheckBox("Stimulus fullscreen on selected screen")
-        self.cb_stim_fullscr.setChecked(bool(self.cfg.stim_fullscreen))
-        self.cb_stim_fullscr.setToolTip("Unchecked = windowed (draggable). Checked = fullscreen.")
+        self.cb_stim_fullscr.setChecked(bool(getattr(self.cfg, "stim_fullscreen", False)))
 
         dl.addRow(QtWidgets.QLabel("Stimulus display screen:"), self.cb_stim_screen)
         dl.addRow(QtWidgets.QLabel("GUI display screen:"), self.cb_gui_screen)
         dl.addRow(self.cb_stim_fullscr)
+        dl.addRow(self.btn_refresh_displays)
 
-        self.cb_prewarm = QtWidgets.QCheckBox("Pre-warm stimulus window at launch (slower startup, faster first trial)")
+        self.cb_prewarm = QtWidgets.QCheckBox("Pre-warm stimulus window at launch")
         self.cb_prewarm.setChecked(bool(getattr(self.cfg, "prewarm_stim", False)))
-        self.cb_prewarm.setToolTip("If checked, the stimulus window opens during startup. Leave unchecked for fastest launch.")
         dl.addRow(self.cb_prewarm)
 
         panels.addWidget(disp, 1, 0, 1, 2)
 
-        # ------- Camera panels -------
+        # ===== Cameras =====
         self.cam_groups = []
-        for idx, cam, target_default in [(0, self.cam0, self.cfg.cam0_target_fps),
-                                         (1, self.cam1, self.cfg.cam1_target_fps)]:
-            gb = QtWidgets.QGroupBox(f"Camera {idx}")
+        cams_box = QtWidgets.QWidget()
+        cams_layout = QtWidgets.QGridLayout(cams_box)
+
+        self.btn_refresh_cameras = QtWidgets.QPushButton("Refresh Cameras")
+
+        def _populate_camera_dropdown(cb: QtWidgets.QComboBox, current_idx: int):
+            devices = enumerate_camera_indices(max_devices=16)
+            cb.blockSignals(True)
+            cb.clear()
+            if not devices:
+                cb.addItem("No cameras found (synthetic)", -1)
+                cb.setCurrentIndex(0)
+                cb.blockSignals(False)
+                return
+            sel = 0
+            for i, (idx, label) in enumerate(devices):
+                cb.addItem(label, idx)
+                if idx == current_idx:
+                    sel = i
+            cb.setCurrentIndex(sel)
+            cb.blockSignals(False)
+
+        for row, (label, cam, default_fps) in enumerate([("Camera 0", self.cam0, int(getattr(self.cfg, "cam0_target_fps", 60))),
+                                                         ("Camera 1", self.cam1, int(getattr(self.cfg, "cam1_target_fps", 60)))]):
+            gb = QtWidgets.QGroupBox(label)
             fl = QtWidgets.QGridLayout(gb)
 
             preview = QtWidgets.QLabel()
@@ -941,15 +890,16 @@ class SettingsGUI(QtWidgets.QWidget):
             preview.setAlignment(QtCore.Qt.AlignCenter)
             fl.addWidget(preview, 0, 0, 5, 1)
 
-            spin_index = QtWidgets.QSpinBox(); spin_index.setRange(0, 15)
-            spin_index.setValue(getattr(cam, "index", 0))
-            spin_index.setToolTip("OpenCV device index.")
-            fl.addWidget(QtWidgets.QLabel("Which camera to use (OpenCV device index):"), 0, 1)
-            fl.addWidget(spin_index, 0, 2)
+            cb_device = QtWidgets.QComboBox()
+            _populate_camera_dropdown(cb_device, int(getattr(cam, "index", row)))
 
-            spin_fps = QtWidgets.QSpinBox(); spin_fps.setRange(1, 10000); spin_fps.setValue(int(target_default))
+            fl.addWidget(QtWidgets.QLabel("Camera device:"), 0, 1)
+            fl.addWidget(cb_device, 0, 2)
+
+            spin_fps = QtWidgets.QSpinBox()
+            spin_fps.setRange(1, 10000)
+            spin_fps.setValue(default_fps)
             spin_fps.setAccelerated(True)
-            spin_fps.setToolTip("Target recording FPS (actual may vary).")
             fl.addWidget(QtWidgets.QLabel("Target recording frame rate (fps):"), 1, 1)
             fl.addWidget(spin_fps, 1, 2)
 
@@ -957,38 +907,98 @@ class SettingsGUI(QtWidgets.QWidget):
             fl.addWidget(lbl_rep, 2, 1, 1, 2)
 
             self.cam_groups.append({
-                "group": gb, "preview": preview, "spin_index": spin_index,
-                "spin_fps": spin_fps, "lbl_rep": lbl_rep
+                "group": gb,
+                "preview": preview,
+                "cb_device": cb_device,
+                "spin_fps": spin_fps,
+                "lbl_rep": lbl_rep
             })
-            panels.addWidget(gb, 2 + idx, 0, 1, 2)
+            cams_layout.addWidget(gb, row, 0, 1, 2)
 
-        # Footer
-        self.lbl_general = QtWidgets.QLabel("")
-        root.addWidget(self.lbl_general)
+        def _refresh_all_cameras():
+            for g, cam in zip(self.cam_groups, (self.cam0, self.cam1)):
+                _populate_camera_dropdown(g["cb_device"], int(getattr(cam, "index", 0)))
+        self.btn_refresh_cameras.clicked.connect(_refresh_all_cameras)
 
+        cams_layout.addWidget(self.btn_refresh_cameras, 2, 0, 1, 2)
+        panels.addWidget(cams_box, 2, 0, 1, 2)
+
+        # ===== Controls =====
+        ctrl_row = QtWidgets.QHBoxLayout()
+        self.bt_start   = QtWidgets.QPushButton("Start")
+        self.bt_stop    = QtWidgets.QPushButton("Stop")
+        self.bt_trigger = QtWidgets.QPushButton("Trigger Once")
+        self.bt_check   = QtWidgets.QPushButton("Check for Updates…")
+        self.bt_apply   = QtWidgets.QPushButton("Apply Settings")
+        for b in (self.bt_start, self.bt_stop, self.bt_trigger, self.bt_check, self.bt_apply):
+            ctrl_row.addWidget(b)
+        ctrl_wrap = QtWidgets.QWidget()
+        ctrl_wrap.setLayout(ctrl_row)
+        panels.addWidget(ctrl_wrap, 3, 0, 1, 2)
+
+        # Emit signals on clicks
+        self.bt_start.clicked.connect(self.start_experiment.emit)
+        self.bt_stop.clicked.connect(self.stop_experiment.emit)
+        self.bt_trigger.clicked.connect(self.manual_trigger.emit)
+        self.bt_check.clicked.connect(self.check_updates.emit)
+        self.bt_apply.clicked.connect(self.apply_settings.emit)
+
+        # ===== Apply/Close =====
+        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Apply | QtWidgets.QDialogButtonBox.Close)
+        btns.button(QtWidgets.QDialogButtonBox.Apply).setText("Apply")
+        btns.button(QtWidgets.QDialogButtonBox.Close).setText("Close")
+        btns.accepted.connect(self._apply_and_notify)
+        btns.accepted.connect(self.apply_settings.emit)
+        btns.rejected.connect(self.close)
+        panels.addWidget(btns, 4, 0, 1, 2)
+
+        # Initial general status
+        self._refresh_general_labels()
+
+    def _apply_and_notify(self):
+        # Prefer app link
+        if getattr(self, 'app', None) and hasattr(self.app, 'apply_from_gui'):
+            self.app.apply_from_gui()
+            return
+        # Fallback: walk Qt parent chain to find a main app
+        parent = self.parent()
+        while parent is not None:
+            if hasattr(parent, 'apply_from_gui'):
+                parent.apply_from_gui()
+                return
+            parent = parent.parent()
+
+    def _refresh_general_labels(self):
+        """Update the summary label with high-level state (compat layer)."""
+        sim = bool(getattr(self, 'cfg', None) and getattr(self.cfg, 'simulation_mode', False))
+        msg = f"Simulation mode: {'ON (timer-based triggers)' if sim else 'OFF (hardware triggers active)'}"
+        try:
+            if hasattr(self, 'lbl_general') and isinstance(self.lbl_general, QtWidgets.QLabel):
+                self.lbl_general.setText(msg)
+        except Exception:
+            pass
     def set_preview_image(self, cam_idx: int, img_rgb: np.ndarray):
-        """Update preview image for camera `cam_idx`."""
+        """Update preview image for camera `cam_idx`. Expects RGB np.uint8 image."""
         if img_rgb is None:
             return
-        h, w, _ = img_rgb.shape
-        qimg = QtGui.QImage(img_rgb.data, w, h, 3*w, QtGui.QImage.Format_RGB888)
-        pix = QtGui.QPixmap.fromImage(qimg)
-        self.cam_groups[cam_idx]["preview"].setPixmap(pix)
+        try:
+            h, w = int(img_rgb.shape[0]), int(img_rgb.shape[1])
+            if img_rgb.ndim == 3 and img_rgb.shape[2] == 3:
+                qimg = QtGui.QImage(img_rgb.data, w, h, 3*w, QtGui.QImage.Format_RGB888)
+            elif img_rgb.ndim == 2:
+                qimg = QtGui.QImage(img_rgb.data, w, h, w, QtGui.QImage.Format_Grayscale8)
+            else:
+                return
+            pix = QtGui.QPixmap.fromImage(qimg)
+            self.cam_groups[cam_idx]["preview"].setPixmap(pix)
+        except Exception:
+            # Safe fail: don't crash preview drawing
+            pass
 
     def update_cam_fps_labels(self):
         for g in self.cam_groups:
             g["lbl_rep"].setText(f"Driver-reported fps: (see overlay)")
 
-    def _refresh_general_labels(self):
-        """Update the summary label with high-level state."""
-        self.lbl_general.setText(
-            f"Simulation mode: {'ON (timer-based triggers)' if self.cfg.simulation_mode else 'OFF (hardware triggers active)'}"
-        )
-
-
-# =========================
-# Main Application
-# =========================
 
 class MainApp(QtWidgets.QApplication):
     """Top-level Qt app wiring Config, Hardware, Cameras, GUI, Stimulus, and the trigger loop."""
@@ -1068,6 +1078,47 @@ class MainApp(QtWidgets.QApplication):
 
     # ---------- apply settings ----------
     def apply_from_gui(self):
+        """Apply settings from GUI including camera indices, FPS, and display choices (dropdown-aware)."""
+        if not hasattr(self, "gui"):
+            return
+
+        # Try new-style dropdowns first
+        try:
+            if hasattr(self.gui, "cam_groups"):
+                cam0_sel = self.gui.cam_groups[0]["cb_device"].currentData()
+                cam1_sel = self.gui.cam_groups[1]["cb_device"].currentData()
+                if cam0_sel is not None:
+                    cam0_new_idx = int(cam0_sel)
+                    if cam0_new_idx != getattr(self.cam0, "index", -1):
+                        self.cam0.set_index(cam0_new_idx)
+                if cam1_sel is not None:
+                    cam1_new_idx = int(cam1_sel)
+                    if cam1_new_idx != getattr(self.cam1, "index", -1):
+                        self.cam1.set_index(cam1_new_idx)
+                cam0_new_tfps = int(self.gui.cam_groups[0]["spin_fps"].value())
+                cam1_new_tfps = int(self.gui.cam_groups[1]["spin_fps"].value())
+                self.cam0.set_target_fps(cam0_new_tfps)
+                self.cam1.set_target_fps(cam1_new_tfps)
+                self.cfg.cam0_target_fps = cam0_new_tfps
+                self.cfg.cam1_target_fps = cam1_new_tfps
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self.gui, "cb_stim_screen"):
+                stim_i = self.gui.cb_stim_screen.currentData()
+                gui_i  = self.gui.cb_gui_screen.currentData()
+                if stim_i is None: stim_i = self.gui.cb_stim_screen.currentIndex()
+                if gui_i  is None: gui_i  = self.gui.cb_gui_screen.currentIndex()
+                self.cfg.stim_screen_index = int(stim_i)
+                self.cfg.gui_screen_index  = int(gui_i)
+                self.cfg.stim_fullscreen = bool(self.gui.cb_stim_fullscr.isChecked())
+                self.cfg.prewarm_stim = bool(self.gui.cb_prewarm.isChecked())
+        except Exception:
+            pass
+
+        # Fall back to legacy logic (if present)
+
         """Push current GUI values into Config/Cameras and update windows."""
         # General
         prev_sim = bool(self.cfg.simulation_mode)
@@ -1146,6 +1197,7 @@ class MainApp(QtWidgets.QApplication):
         print("[MainApp] Settings applied.")
 
     # ---------- preview ----------
+
     def update_previews(self):
         if self.in_trial:
             self.gui.lbl_status.setText("Status: Trial running (preview paused).")
@@ -1237,6 +1289,63 @@ class MainApp(QtWidgets.QApplication):
         except Exception:
             pass
         print("[MainApp] Cleanup complete.")
+
+
+def enumerate_camera_indices(max_devices: int = 16):
+    """
+    Quickly probe camera indices (0..max_devices-1), returning a list of (index, label) for those that open.
+    We open each candidate briefly and release immediately. Uses DSHOW/MSMF first on Windows.
+    """
+    try:
+        # Quiet noisy backend warnings during index probing
+        cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+    except Exception:
+        pass
+
+    results = []
+    backends = [cv2.CAP_ANY]
+    if os.name == "nt":
+        backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+
+    for idx in range(max_devices):
+        cap = None
+        opened = False
+        for be in backends:
+            try:
+                cap = cv2.VideoCapture(idx, be)
+                if cap and cap.isOpened():
+                    opened = True
+                    break
+                if cap:
+                    cap.release(); cap = None
+            except Exception:
+                try:
+                    if cap: cap.release()
+                except Exception:
+                    pass
+                cap = None
+        if not opened:
+            continue
+
+        # Try to fetch a couple of props for a nicer label (best-effort only)
+        try:
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        except Exception:
+            w, h, fps = 0, 0, 0.0
+
+        try:
+            cap.release()
+        except Exception:
+            pass
+
+        if w > 0 and h > 0:
+            label = f"Index {idx} — {w}×{h} (~{fps:.0f} fps)"
+        else:
+            label = f"Index {idx}"
+        results.append((idx, label))
+    return results
 
 
 if __name__ == "__main__":

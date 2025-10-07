@@ -145,3 +145,9 @@ See `requirements.txt`.
 - **Display:** Optional pre-warm of stimulus window at launch (default OFF).  
 - **Windows:** Prefer DirectShow backend before MSMF to reduce device-probe delays.
 
+
+## Device selection (cameras & displays)
+
+- In the Settings window, choose cameras from the **Camera device** dropdowns. Click **Refresh Cameras** after plugging in/out.
+- Choose which monitor shows the **Stimulus** and which shows the **GUI** using the new dropdowns. Click **Refresh Displays** if monitors change.
+- The Stimulus can run fullscreen on the chosen screen (toggle in the same section).
