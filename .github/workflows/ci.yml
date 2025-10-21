@@ -1,0 +1,45 @@
+name: FlyPy CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11']   # 3.10 installs PsychoPy; 3.11 skips it via marker
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-${{ matrix.python-version }}-
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Smoke-test imports
+        shell: python
+        run: |
+          import sys
+          import numpy, cv2
+          from PyQt5 import QtWidgets  # noqa: F401
+          try:
+              import psychopy  # only present on 3.10 due to marker
+              print("psychopy import: OK")
+          except Exception as e:
+              print("psychopy import skipped or failed (expected on 3.11):", e)
+          import serial  # pyserial
+          print("Core imports OK on Python", sys.version)

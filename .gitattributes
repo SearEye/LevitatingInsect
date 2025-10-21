@@ -1,0 +1,30 @@
+# Normalize line endings for text
+* text=auto
+
+# Explicit EOLs by type
+*.py     text eol=lf
+*.sh     text eol=lf
+*.md     text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.csv    text eol=lf
+*.txt    text eol=lf
+*.bat    text eol=crlf
+*.cmd    text eol=crlf
+*.ps1    text eol=crlf
+
+# Treat media/binaries as binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.mp4 binary
+*.avi binary
+*.mkv binary
+
+# Keep Git from messing with archives
+*.zip binary
+*.7z  binary
+*.tar binary
+*.gz  binary
