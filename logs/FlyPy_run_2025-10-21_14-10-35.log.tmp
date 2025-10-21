@@ -1,0 +1,21 @@
+2025-10-21 14:10:35.243 [INFO] === FlyPy Log Start v1.35.0 ===
+2025-10-21 14:10:35.633 [INFO] === FlyPy Startup ===
+2025-10-21 14:10:35.634 [INFO] Version: 1.35.0
+2025-10-21 14:10:35.634 [INFO] OpenCV: OK
+2025-10-21 14:10:35.668 [INFO] PySpin: OK
+2025-10-21 14:10:35.669 [INFO] ======================
+2025-10-21 14:10:36.903 [INFO] [Devices] Refreshed: 2 PySpin, 1 OpenCV
+2025-10-21 14:11:20.430 [INFO] [cam0] set backend=PySpin ident=24102007 (lazy open)
+2025-10-21 14:11:20.432 [INFO] [cam1] set backend=PySpin ident=24102017 (lazy open)
+2025-10-21 14:11:20.432 [INFO] [Main] Settings applied
+2025-10-21 14:11:27.068 [INFO] [PySpin] ROI note: Spinnaker: GenICam::AccessException= Node is not writable. : AccessException thrown in node 'Width' while calling 'Width.SetValue()' (file 'IntegerT.h', line 77) [-2006]
+2025-10-21 14:11:27.083 [INFO] [PySpin] open: serial=24102007 size=(640, 480) fps=522.0 trig=Free
+2025-10-21 14:11:27.083 [INFO] [cam0] PySpin open: serial=24102007 (640, 480) @ 522.0fps trig=Free
+2025-10-21 14:11:29.749 [INFO] [PySpin] ROI note: Spinnaker: GenICam::AccessException= Node is not writable. : AccessException thrown in node 'Width' while calling 'Width.SetValue()' (file 'IntegerT.h', line 77) [-2006]
+2025-10-21 14:11:29.766 [INFO] [PySpin] open: serial=24102017 size=(640, 480) fps=522.0 trig=Free
+2025-10-21 14:11:29.767 [INFO] [cam1] PySpin open: serial=24102017 (640, 480) @ 522.0fps trig=Free
+2025-10-21 14:11:29.767 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:11:30.042 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:11:37.678 [INFO] [cam0] set backend=PySpin ident=24102007 (lazy open)
+2025-10-21 14:11:37.678 [INFO] [cam1] set backend=PySpin ident=24102017 (lazy open)
+2025-10-21 14:11:37.679 [INFO] [Main] Settings applied

@@ -1,0 +1,174 @@
+2025-10-21 14:14:51.916 [INFO] === FlyPy Log Start v1.35.3 ===
+2025-10-21 14:14:52.288 [INFO] === FlyPy Startup ===
+2025-10-21 14:14:52.289 [INFO] Version: 1.35.3
+2025-10-21 14:14:52.289 [INFO] OpenCV: OK
+2025-10-21 14:14:52.321 [INFO] PySpin: OK
+2025-10-21 14:14:52.321 [INFO] ======================
+2025-10-21 14:14:53.487 [INFO] [Devices] Refreshed: 2 PySpin, 1 OpenCV
+2025-10-21 14:14:53.487 [INFO] [cam0] set backend=PySpin ident=24102007 (lazy open)
+2025-10-21 14:14:53.488 [INFO] [cam1] set backend=PySpin ident=24102017 (lazy open)
+2025-10-21 14:14:53.488 [INFO] [Main] Settings applied
+2025-10-21 14:15:03.042 [INFO] [PySpin] ROI note: Spinnaker: GenICam::AccessException= Node is not writable. : AccessException thrown in node 'Width' while calling 'Width.SetValue()' (file 'IntegerT.h', line 77) [-2006]
+2025-10-21 14:15:03.050 [INFO] [PySpin] open: serial=24102007 size=(640, 480) fps=522.0 trig=Free
+2025-10-21 14:15:03.050 [INFO] [cam0] PySpin open: serial=24102007 (640, 480) @ 522.0fps trig=Free
+2025-10-21 14:15:05.735 [INFO] [PySpin] ROI note: Spinnaker: GenICam::AccessException= Node is not writable. : AccessException thrown in node 'Width' while calling 'Width.SetValue()' (file 'IntegerT.h', line 77) [-2006]
+2025-10-21 14:15:05.753 [INFO] [PySpin] open: serial=24102017 size=(640, 480) fps=522.0 trig=Free
+2025-10-21 14:15:05.753 [INFO] [cam1] PySpin open: serial=24102017 (640, 480) @ 522.0fps trig=Free
+2025-10-21 14:15:05.754 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:06.032 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:06.340 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:06.661 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:06.961 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:07.275 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:07.588 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:07.900 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:08.215 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:08.525 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:08.838 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:09.152 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:09.466 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:09.777 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:10.094 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:10.399 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:10.715 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:11.034 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:11.349 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:12.032 [INFO] [Devices] Refreshed: 2 PySpin, 1 OpenCV
+2025-10-21 14:15:12.035 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:12.529 [INFO] [Devices] Refreshed: 2 PySpin, 1 OpenCV
+2025-10-21 14:15:13.021 [INFO] [Devices] Refreshed: 2 PySpin, 1 OpenCV
+2025-10-21 14:15:13.023 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:13.216 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:13.525 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:13.839 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:14.161 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:14.465 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:14.775 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:15.087 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:15.400 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:15.716 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:16.034 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:16.342 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:16.660 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:16.966 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:17.276 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:17.589 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:17.902 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:18.212 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:18.528 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:18.843 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:19.155 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:19.467 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:19.778 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:20.091 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:20.403 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:20.718 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:21.033 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:21.352 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:21.650 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:21.973 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:22.286 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:22.597 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:22.910 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:23.226 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:23.538 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:23.849 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:24.163 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:24.464 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:24.777 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:25.089 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:25.415 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:25.722 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:26.049 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:26.370 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:26.707 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:27.020 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:27.334 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:27.645 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:27.960 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:28.260 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:28.577 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:28.889 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:29.198 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:29.514 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:29.823 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:30.148 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:30.460 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:30.770 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:31.082 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:31.395 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:31.709 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:32.023 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:32.322 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:32.634 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:32.949 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:33.262 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:33.573 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:33.886 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:34.198 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:34.512 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:34.824 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:35.135 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:35.447 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:35.761 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:36.083 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:36.385 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:36.707 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:37.019 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:37.324 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:37.643 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:37.948 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:38.268 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:38.582 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:38.882 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:39.196 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:39.507 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:39.824 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:40.132 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:40.457 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:40.763 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:41.071 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:41.395 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:41.705 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:42.362 [INFO] [Devices] Refreshed: 2 PySpin, 1 OpenCV
+2025-10-21 14:15:42.362 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:42.636 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:42.947 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:43.267 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:43.573 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:15:43.649 [INFO] [cam0] set backend=OpenCV ident=0 (lazy open)
+2025-10-21 14:15:43.649 [INFO] [cam1] set backend=PySpin ident=24102017 (lazy open)
+2025-10-21 14:15:43.650 [INFO] [Main] Settings applied
+2025-10-21 14:15:44.065 [INFO] [PySpin] open: serial=24102017 size=(720, 540) fps=522.0 trig=Free
+2025-10-21 14:15:44.066 [INFO] [cam1] PySpin open: serial=24102017 (720, 540) @ 522.0fps trig=Free
+2025-10-21 14:15:48.565 [INFO] [OpenCV] index 0 opened via backend=700
+2025-10-21 14:15:48.565 [INFO] [cam0] OpenCV open: index 0
+2025-10-21 14:16:02.419 [INFO] [cam0] set backend=PySpin ident=24102007 (lazy open)
+2025-10-21 14:16:02.432 [INFO] [cam1] set backend=PySpin ident=24102017 (lazy open)
+2025-10-21 14:16:02.433 [INFO] [Main] Settings applied
+2025-10-21 14:16:02.605 [INFO] [PySpin] open: serial=24102017 size=(720, 540) fps=522.0 trig=Free
+2025-10-21 14:16:02.606 [INFO] [cam1] PySpin open: serial=24102017 (720, 540) @ 522.0fps trig=Free
+2025-10-21 14:16:05.020 [INFO] [Devices] Refreshed: 2 PySpin, 1 OpenCV
+2025-10-21 14:16:11.995 [CRITICAL] UNCAUGHT EXCEPTION:
+Traceback (most recent call last):
+  File "C:\Users\Murpheylab\Desktop\LevitatingInsect-main\FlyAPI.py", line 939, in _toggle_adv
+    f.setVisible(not f.isVisible())
+AttributeError: 'bool' object has no attribute 'setVisible'
+
+2025-10-21 14:16:13.760 [CRITICAL] UNCAUGHT EXCEPTION:
+Traceback (most recent call last):
+  File "C:\Users\Murpheylab\Desktop\LevitatingInsect-main\FlyAPI.py", line 939, in _toggle_adv
+    f.setVisible(not f.isVisible())
+AttributeError: 'bool' object has no attribute 'setVisible'
+
+2025-10-21 14:16:15.155 [INFO] [PySpin] ROI note: Spinnaker: GenICam::AccessException= Node is not writable. : AccessException thrown in node 'Width' while calling 'Width.SetValue()' (file 'IntegerT.h', line 77) [-2006]
+2025-10-21 14:16:15.177 [INFO] [PySpin] open: serial=24102007 size=(640, 480) fps=523.0 trig=Free
+2025-10-21 14:16:15.177 [INFO] [cam0] PySpin open: serial=24102007 (640, 480) @ 523.0fps trig=Free
+2025-10-21 14:16:15.177 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:16:15.446 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:16:15.765 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:16:16.074 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:16:16.384 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:16:16.700 [WARNING] [PySpin] BeginAcquisition: Spinnaker: Camera is already streaming [-1004]
+2025-10-21 14:16:19.220 [INFO] [Main] Cleanup…
+2025-10-21 14:16:19.281 [INFO] [Main] Cleanup done

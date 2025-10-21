@@ -1,0 +1,8 @@
+2025-10-21 13:45:51.268 [INFO] === FlyPy Log Start v1.34.2 ===
+2025-10-21 13:45:51.887 [INFO] === FlyPy Startup ===
+2025-10-21 13:45:51.887 [INFO] Version: 1.34.2
+2025-10-21 13:45:51.887 [INFO] OpenCV: OK
+2025-10-21 13:45:52.351 [INFO] PySpin: OK
+2025-10-21 13:45:52.351 [INFO] ======================
+2025-10-21 13:45:53.550 [INFO] [Devices] Refreshed: 0 PySpin, 1 OpenCV
+2025-10-21 13:47:10.380 [WARNING] [PySpin] ReleaseInstance warning: Spinnaker: Can't clear a interface because something still holds a reference to the interface [-1004]

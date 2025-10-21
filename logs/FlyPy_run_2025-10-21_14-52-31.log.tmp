@@ -1,0 +1,78 @@
+2025-10-21 14:52:31.519 [INFO] === FlyPy Log Start v1.35.4 ===
+2025-10-21 14:52:31.964 [INFO] === FlyPy Startup ===
+2025-10-21 14:52:31.965 [INFO] Version: 1.35.4
+2025-10-21 14:52:31.965 [INFO] OpenCV: OK
+2025-10-21 14:52:32.000 [INFO] PySpin: OK
+2025-10-21 14:52:32.000 [INFO] ======================
+2025-10-21 14:52:33.192 [INFO] [Devices] Refreshed: 2 PySpin, 1 OpenCV
+2025-10-21 14:52:33.192 [INFO] [cam0] set backend=PySpin ident=24102007 (lazy open)
+2025-10-21 14:52:33.193 [INFO] [cam1] set backend=PySpin ident=24102017 (lazy open)
+2025-10-21 14:52:33.193 [INFO] [Main] Settings applied
+2025-10-21 14:52:41.575 [INFO] [cam0] set backend=PySpin ident=24102007 (lazy open)
+2025-10-21 14:52:41.575 [INFO] [cam1] set backend=PySpin ident=24102017 (lazy open)
+2025-10-21 14:52:41.576 [INFO] [Main] Settings applied
+2025-10-21 14:52:41.576 [INFO] PsychoPy not available (No module named 'psychopy') → using OpenCV fallback
+2025-10-21 14:53:37.320 [INFO] [Main] Trigger loop started
+2025-10-21 14:53:37.320 [INFO] [Main] Start
+2025-10-21 14:53:37.335 [INFO] [HW] No CH340/UNO port found → simulation
+2025-10-21 14:53:37.341 [INFO] [HW] (Sim) Trigger
+2025-10-21 14:53:37.343 [INFO] [HW] (Sim) SEND: MARK START
+2025-10-21 14:53:37.343 [INFO] [Trial] Recording…
+2025-10-21 14:53:37.529 [INFO] [PySpin] open: serial=24102017 size=(720, 540) fps=522.0 trig=Free
+2025-10-21 14:53:37.529 [INFO] [PySpin] open: serial=24102007 size=(720, 540) fps=522.0 trig=Free
+2025-10-21 14:53:37.529 [INFO] [cam1] PySpin open: serial=24102017 (720, 540) @ 522.0fps trig=Free
+2025-10-21 14:53:37.529 [INFO] [cam0] PySpin open: serial=24102007 (720, 540) @ 522.0fps trig=Free
+2025-10-21 14:53:41.221 [INFO] [cam1] Recorded 1302 frames (drops=160) → FlyPy_Output\20251021\trial_2025-10-21_14-53-37\cam1.avi
+2025-10-21 14:53:41.249 [INFO] [cam0] Recorded 1302 frames (drops=185) → FlyPy_Output\20251021\trial_2025-10-21_14-53-37\cam0.avi
+2025-10-21 14:53:41.250 [INFO] [HW] (Sim) SEND: LIGHT ON
+2025-10-21 14:53:41.250 [INFO] [Stim] Looming start
+2025-10-21 14:53:42.766 [INFO] [Stim] Done (OpenCV)
+2025-10-21 14:53:42.766 [INFO] [HW] (Sim) SEND: LIGHT OFF
+2025-10-21 14:53:42.766 [INFO] [HW] (Sim) SEND: MARK END
+2025-10-21 14:53:42.766 [INFO] [Trial] Logged
+2025-10-21 14:53:42.782 [INFO] [HW] (Sim) Trigger
+2025-10-21 14:53:42.783 [INFO] [HW] (Sim) SEND: MARK START
+2025-10-21 14:53:42.783 [INFO] [Trial] Recording…
+2025-10-21 14:53:45.915 [INFO] [Main] Stop
+2025-10-21 14:53:46.447 [INFO] [cam0] Recorded 1297 frames (drops=30) → FlyPy_Output\20251021\trial_2025-10-21_14-53-42\cam0.avi
+2025-10-21 14:53:46.450 [INFO] [cam1] Recorded 1297 frames (drops=20) → FlyPy_Output\20251021\trial_2025-10-21_14-53-42\cam1.avi
+2025-10-21 14:53:46.450 [INFO] [HW] (Sim) SEND: LIGHT ON
+2025-10-21 14:53:46.450 [INFO] [Stim] Looming start
+2025-10-21 14:53:47.966 [INFO] [Stim] Done (OpenCV)
+2025-10-21 14:53:47.966 [INFO] [HW] (Sim) SEND: LIGHT OFF
+2025-10-21 14:53:47.966 [INFO] [HW] (Sim) SEND: MARK END
+2025-10-21 14:53:47.966 [INFO] [Trial] Logged
+2025-10-21 14:53:47.982 [INFO] [Main] Trigger loop exiting
+2025-10-21 14:54:06.771 [INFO] [cam0] set backend=PySpin ident=24102007 (lazy open)
+2025-10-21 14:54:06.777 [INFO] [cam1] set backend=PySpin ident=24102017 (lazy open)
+2025-10-21 14:54:06.778 [INFO] [Main] Settings applied
+2025-10-21 14:54:13.169 [INFO] [Main] Trigger loop started
+2025-10-21 14:54:13.169 [INFO] [Main] Start
+2025-10-21 14:54:13.169 [INFO] [HW] (Sim) Trigger
+2025-10-21 14:54:13.171 [INFO] [HW] (Sim) SEND: MARK START
+2025-10-21 14:54:13.171 [INFO] [Trial] Recording…
+2025-10-21 14:54:13.369 [INFO] [PySpin] open: serial=24102007 size=(720, 540) fps=522.0 trig=Free
+2025-10-21 14:54:13.369 [INFO] [cam0] PySpin open: serial=24102007 (720, 540) @ 522.0fps trig=Free
+2025-10-21 14:54:13.373 [INFO] [PySpin] open: serial=24102017 size=(720, 540) fps=522.0 trig=Free
+2025-10-21 14:54:13.373 [INFO] [cam1] PySpin open: serial=24102017 (720, 540) @ 522.0fps trig=Free
+2025-10-21 14:54:17.053 [INFO] [cam1] Recorded 1302 frames (drops=61) → FlyPy_Output\20251021\trial_2025-10-21_14-54-13\cam1.avi
+2025-10-21 14:54:17.055 [INFO] [cam0] Recorded 1302 frames (drops=69) → FlyPy_Output\20251021\trial_2025-10-21_14-54-13\cam0.avi
+2025-10-21 14:54:17.055 [INFO] [HW] (Sim) SEND: LIGHT ON
+2025-10-21 14:54:17.056 [INFO] [Stim] Looming start
+2025-10-21 14:54:18.569 [INFO] [Stim] Done (OpenCV)
+2025-10-21 14:54:18.569 [INFO] [HW] (Sim) SEND: LIGHT OFF
+2025-10-21 14:54:18.569 [INFO] [HW] (Sim) SEND: MARK END
+2025-10-21 14:54:18.569 [INFO] [Trial] Logged
+2025-10-21 14:54:18.581 [INFO] [HW] (Sim) Trigger
+2025-10-21 14:54:18.583 [INFO] [HW] (Sim) SEND: MARK START
+2025-10-21 14:54:18.583 [INFO] [Trial] Recording…
+2025-10-21 14:54:20.882 [INFO] [Main] Stop
+2025-10-21 14:54:22.247 [INFO] [cam1] Recorded 1296 frames (drops=19) → FlyPy_Output\20251021\trial_2025-10-21_14-54-18\cam1.avi
+2025-10-21 14:54:22.264 [INFO] [cam0] Recorded 1296 frames (drops=38) → FlyPy_Output\20251021\trial_2025-10-21_14-54-18\cam0.avi
+2025-10-21 14:54:22.264 [INFO] [HW] (Sim) SEND: LIGHT ON
+2025-10-21 14:54:22.264 [INFO] [Stim] Looming start
+2025-10-21 14:54:23.775 [INFO] [Stim] Done (OpenCV)
+2025-10-21 14:54:23.775 [INFO] [HW] (Sim) SEND: LIGHT OFF
+2025-10-21 14:54:23.776 [INFO] [HW] (Sim) SEND: MARK END
+2025-10-21 14:54:23.776 [INFO] [Trial] Logged
+2025-10-21 14:54:23.791 [INFO] [Main] Trigger loop exiting
