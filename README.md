@@ -1,153 +1,307 @@
-# FlyPy — Trigger → Cameras + Lights + Looming Stimulus (All-in-One GUI)
+FlyPy – Levitating Insect Camera + Stimulus Rig
 
-Single-window app that coordinates a trigger (hardware, simulated, or manual) to:
+Unified GUI to trigger and record from two high-speed cameras (FLIR/Point Grey via PySpin or generic USB via OpenCV), drive lights, and present a looming “falling object” stimulus. Designed for fruit fly (Drosophila) escape experiments.
 
-- Record two cameras in sync to disk  
-- Turn lights on/off (Elegoo/Arduino over serial, or simulated)  
-- Present a looming stimulus (growing black dot) on a chosen monitor  
-- Log one CSV row per trial with file paths, timing, FPS, and settings  
+Repo: https://github.com/SearEye/LevitatingInsect
 
-Version: the current app version is defined in `FlyAPI.py` as `__version__ = "1.3.0"`.
+Main app: FlyAPI.py (PyQt5 GUI)
+Latest tested version: v1.35.4 (Windows 10/11, Python 3.10)
 
----
+Highlights (v1.35.4)
 
-## Change These First (Most Common Setup)
+✅ Dual camera capture with per-camera backend selection: PySpin (Spinnaker) or OpenCV
 
-**General**
-- **Simulation Mode** — use simulated triggers (no hardware).  
-- **Interval between simulated triggers (s)** → `sim_trigger_interval`  
-- **Output folder** → `output_root`  
-- **Video format / codec** → `video_preset_id` (sets `fourcc`)  
-- **Recording duration per trigger (s)** → `record_duration_s`  
+✅ Device picker shows PySpin cameras by DeviceSerialNumber (e.g., 24102007, 24102017) – opens the correct camera
 
-**Stimulus & Timing**
-- **Stimulus duration (s)** → `stim_duration_s`  
-- **Dot radii (px)** → `stim_r0_px`, `stim_r1_px`  
-- **Background shade (0=black, 1=white)** → `stim_bg_grey`  
-- **Delay from recording start → lights ON (s)** → `lights_delay_s`  
-- **Delay from recording start → stimulus ON (s)** → `stim_delay_s`  
+✅ Previews are optional (off by default). Full-resolution, high-FPS recording regardless of preview state
 
-**Display & Windows**
-- **Stimulus display screen** → `stim_screen_index`  
-- **GUI display screen** → `gui_screen_index`  
-- **Stimulus fullscreen** → `stim_fullscreen`  
-- **Pre-warm stimulus window at launch** (optional; slower startup, faster first trial) → `prewarm_stim`
+✅ Advanced camera settings (toggle panel): ROI (W/H), Exposure (µs), Hardware trigger (Line0)
 
-**Cameras**
-- **Camera 0/1 index** → `cam0_index`, `cam1_index`  
-- **Target FPS** → `cam0_target_fps`, `cam1_target_fps`
+✅ Looming stimulus (black dot on white) with start/end size, duration, screen selector, fullscreen toggle
 
-> Delays are **absolute from recording start**. The app ensures events occur at their requested absolute times.
+✅ Simulation mode (timer-based triggers) for bench testing
 
----
+✅ Max FPS probe utility
 
-## Quick Start
+✅ Robust logging to Desktop\LevitatingInsect-main\logs with start/stop timestamps
 
-### A) Run with Python (recommended during development)
+✅ Handles common PySpin quirks:
 
-1. Install Python 3.10 (PsychoPy is only supported on `<3.11`; the app will fall back to OpenCV if PsychoPy is absent).  
-2. `pip install -r requirements.txt`  
-3. Launch: `python FlyAPI.py`  
-   - Optional flags:  
-     - `--simulate` → start with Simulation Mode ON  
-     - `--prewarm-stim` → open stimulus window during startup
+“Camera is already streaming” is auto-suppressed
 
-### B) Windows portable build (PyInstaller)
+Keeps a process-lifetime Spinnaker System instance to avoid ReleaseInstance crashes
 
-- Use the provided build scripts (see repository) to generate a one-folder distribution.  
-- Launch the bundled `FlyPy.exe`.  
-- CH340/CH341 drivers are in `dist\FlyPy\temp\drivers\` (or run the driver from the batch helper).
+Contents
 
----
+FlyAPI.py – the GUI application
 
-## Why startup is fast now
+requirements.txt – Python dependencies
 
-- **Lazy PsychoPy import** — only when stimulus is actually shown.  
-- **Lazy camera open** — devices open on first preview/record, not at app launch.  
-- **Lazy serial open + MCU settle** — the Elegoo/UNO port opens the first time it’s needed.  
-- **No modal “Simulation?” prompt** — Simulation Mode is a checkbox in the GUI (and `--simulate` flag).  
-- **Optional “Pre-warm stimulus”** — disabled by default; enables instant first stimulus if you want it.
+requirements.lock.txt – pinned versions (optional)
 
----
+auto_update.py – optional helper
 
-## GUI Reference
+ElegooFlyPySync.ino – microcontroller firmware (trigger/light sync)
 
-**Start** — begin watching for triggers (hardware or simulated)  
-**Stop** — stop watching  
-**Trigger Once (Manual)** — run one trial now (no hardware needed)  
-**Apply Settings** — push current GUI values into the running app  
-**Help → Check for Updates…** — check GitHub Releases and stage an update
+FlyPy_RunOnly.bat – run launcher (Windows)
 
-Window behavior:
-- GUI auto-maximizes to your selected **GUI display screen**.
-- Stimulus appears on **Stimulus display screen**; windowed mode is draggable; fullscreen pins to that monitor.
-- If **Pre-warm stimulus** is enabled, the stimulus window opens at launch; otherwise it opens on first use.
+FlyPy_SetupOnly.bat / FlyPy_AllInOne.bat – convenience installers (Windows)
 
----
+LICENSE, .gitignore, .gitattributes, README.md
 
-## Hardware Notes
+Quick start (Windows)
+1) Install prerequisites
 
-- **Elegoo/UNO (CH340)**  
-  - On first use, FlyPy auto-detects the serial port. If found, it opens the port and waits ~1.2 s for MCU settle.  
-  - Commands used: `MARK START`, `MARK END`, `LIGHT ON`, `LIGHT OFF` (newline-terminated).  
-  - If the port cannot be opened, FlyPy automatically switches to Simulation Mode (and logs this).
+Python 3.10 (64-bit) recommended
 
-- **Trigger**  
-  - Hardware: device sends a line `T` when the laser beam is broken (or similar).  
-  - Simulation: an internal timer fires based on `sim_trigger_interval`.
+FLIR Spinnaker SDK + PySpin (for Blackfly etc.)
 
----
+Install Spinnaker SDK (64-bit)
 
-## Cameras
+Ensure these folders are on your PATH (example):
 
-- Device indices are OpenCV indices (0, 1, …).  
-- On Windows, FlyPy prefers DirectShow, then MSMF, then CAP_ANY.  
-- If a camera fails to open, FlyPy uses a **synthetic** source (white frame with a moving marker) so workflows remain testable.
+C:\Program Files\FLIR Systems\Spinnaker\bin64\
 
----
+C:\Program Files\FLIR Systems\Spinnaker\bin64\vs2015\ (or your compiler subfolder)
 
-## Logging
+PySpin is provided by the SDK installer (wheel). Verify with python -c "import PySpin; print('ok')"
 
-Each trial appends one row to `FlyPy_Output\YYYYMMDD\trials_log.csv`:
-timestamp, trial_idx, cam0_path, cam1_path, record_duration_s,
-lights_delay_s, stim_delay_s, stim_duration_s,
-stim_screen_index, stim_fullscreen, cam0_target_fps, cam1_target_fps,
-video_preset_id, fourcc
+OpenCV & PyQt5 and friends:
+
+From the repo root:
+
+py -3.10 -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
 
 
+Tip: If you only use USB webcams, you can skip Spinnaker/PySpin.
+
+2) Run
+
+Double-click FlyPy_RunOnly.bat or:
+
+.venv\Scripts\python.exe FlyAPI.py
 
 
+Optional flags:
 
----
+--simulate : run without hardware, timer-based triggers
 
-## Requirements
+--prewarm-stim : open the stimulus window at launch
 
-Core: `numpy`, `opencv-python`, `PyQt5`, `pyserial`  
-Optional: `psychopy` (installed automatically only on Python `< 3.11`; otherwise the stimulus uses the OpenCV fallback)
+Using the GUI
+Top bar
 
-See `requirements.txt`.
+Quick Preset → fast setup for Blackfly @ 522 fps / 300 fps or OpenCV baseline
 
----
+Apply Preset, Probe Max FPS, Refresh Cameras
 
-## Troubleshooting
+Controls
 
-- **No stimulus window?** Ensure `stim_delay_s + stim_duration_s ≤ record_duration_s` and the display screen is connected.  
-- **Codec problems?** MP4/`mp4v` is the most broadly compatible. The app falls back to `.mp4` with `mp4v` if your selection fails.  
-- **No hardware triggers?** Toggle **Simulation Mode** ON and test; confirm CH340 driver installed for hardware tests.  
-- **Cameras swapped?** Change **Camera 0/1 index**; typical values are 0 and 1.
+Start / Stop a trigger-watch loop
 
----
+Trigger Once for a single trial
 
-## Changelog (since 1.3.x)
+Apply Settings to push current UI state to the runtime
 
-- **Startup speedups:** lazy PsychoPy import, lazy camera open, lazy serial open & MCU settle.  
-- **UX:** Simulation Mode is a GUI checkbox (no modal prompt); `--simulate` and `--prewarm-stim` CLI flags.  
-- **Display:** Optional pre-warm of stimulus window at launch (default OFF).  
-- **Windows:** Prefer DirectShow backend before MSMF to reduce device-probe delays.
+General
+
+Test/Simulation Mode (timer triggers) and interval (s)
+
+Output folder
+
+Video format/codec (AVI/MJPG, AVI/XVID, MP4/mp4v)
+
+Recording duration (s)
+
+Stimulus & Timing (Falling Object / Growing Dot)
+
+Stimulus total time (s) (growth duration)
+
+Stimulus Start Size (radius px)
+
+Stimulus End Size (radius px)
+
+Background shade (0 black → 1 white; dot is black)
+
+Delays: record→lights ON, record→stimulus ON
+
+Display & Windows
+
+Stimulus display screen (drop-down of monitors)
+
+GUI display screen
+
+Stimulus fullscreen (toggle)
+
+Pre-warm stimulus window (optional)
+
+Camera 0 / Camera 1 panels (independent)
+
+Backend: OpenCV or PySpin
+
+Device: list of detected devices
+
+PySpin devices appear as: PySpin <DeviceSerialNumber> — <Model>
+
+OpenCV devices as: OpenCV index N
+
+Manual index/serial: override field
+
+Target FPS
+
+Advanced… (toggle)
+
+ROI Width/Height (0 = max)
+
+Exposure (µs)
+
+Hardware trigger (Line0)
+
+Show Preview (off by default)
+
+Driver-reported FPS (approximate) label
+
+Important: The two camera panels must reference different devices (e.g., PySpin serial 24102017 vs 24102007, or different OpenCV indices). Use Refresh Cameras after plugging in devices.
+
+Recording & Output
+
+Each trigger (manual or from the hardware/CH340/UNO) creates:
+
+FlyPy_Output/<YYYYMMDD>/trial_<timestamp>/
+  cam0.<ext>
+  cam1.<ext>
 
 
-## Device selection (cameras & displays)
+Container/codec follows your “Video format / codec” choice. MJPG in AVI is the most robust for very high FPS.
 
-- In the Settings window, choose cameras from the **Camera device** dropdowns. Click **Refresh Cameras** after plugging in/out.
-- Choose which monitor shows the **Stimulus** and which shows the **GUI** using the new dropdowns. Click **Refresh Displays** if monitors change.
-- The Stimulus can run fullscreen on the chosen screen (toggle in the same section).
+A CSV trials_log.csv is kept at the root of FlyPy_Output with the per-trial config and file paths.
+
+Logging
+
+Session logs go to:
+
+C:\Users\Murpheylab\Desktop\LevitatingInsect-main\logs\
+    FlyPy_run_<START>.log.tmp
+    FlyPy_run_<START>__ENDED_<END>.log
+
+
+On clean or crash exit, the .tmp file is renamed with an __ENDED_<timestamp> suffix.
+
+Triggers & Lights
+
+The app can talk to an Elegoo/UNO (CH340) over serial for MARK START/END and LIGHT ON/OFF.
+
+If no CH340/UNO is found, it simulates those messages and you can still run full trials.
+
+Recommended FPS for Drosophila escape (wings)
+
+To capture wing kinematics during escape, we recommend ≥ 750 fps (ideally 750–1000 fps).
+
+If only onset/timing is required (not detailed wing motion), you can go lower; for full wingbeat envelopes, go higher.
+
+Troubleshooting
+Both previews show the same camera
+
+Ensure distinct devices are selected:
+
+PySpin: set different serials (e.g., 24102017 and 24102007)
+
+OpenCV: set different indices (e.g., 0 and 1)
+
+Click Refresh Cameras, then re-assign.
+
+If you only have one physical device connected, the other panel may show “synthetic”.
+
+PySpin warning on exit:
+
+Spinnaker: Can't clear an interface because something still holds a reference [-1004]
+
+The app keeps a process-lifetime Spinnaker System to avoid mid-run releases.
+
+If you still see this at exit, it’s benign. If cameras don’t re-enumerate across runs, unplug/replug or power-cycle.
+
+BeginAcquisition: Camera is already streaming
+
+Now handled once internally. If image retrieval still fails, call Refresh Cameras or power-cycle that camera.
+
+OpenCV warnings: DSHOW/MSMF “can’t be used to capture by index”
+
+Try a different index or use the PySpin backend for FLIR cameras.
+
+Video writer warnings: “write frame skipped / expected 1 channel but got 3”
+
+The app writes color frames; this warning appears with odd system ffmpeg builds but files still save.
+Switch to AVI/MJPG if you hit reliability issues.
+
+Stimulus window errors on move/resize
+
+If the second monitor is added/removed while running, re-select the target screen and Apply Settings.
+
+Performance tips
+
+Disk throughput matters at >500 fps. Use SSD/NVMe and MJPG AVI if stability is a concern.
+
+Keep previews off during experiments to save CPU/GPU; recording is full-res regardless.
+
+Use the Max FPS probe (3 s) to set Target FPS to ~90% of measured for stability.
+
+Building / Development
+git clone https://github.com/SearEye/LevitatingInsect
+cd LevitatingInsect
+py -3.10 -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+python FlyAPI.py --simulate
+
+
+Command-line flags
+
+--simulate – timer triggers without hardware
+
+--prewarm-stim – open stimulus window on startup
+
+Changelog (abridged)
+
+v1.35.4
+
+PySpin selection by DeviceSerialNumber → consistent multi-camera assignment (24102007 vs 24102017)
+
+Suppress repeated “already streaming” BeginAcquisition warnings
+
+Advanced… toggle fixed (Qt clicked(bool) signature)
+
+Persistent Spinnaker System; safer shutdown; enriched logs
+
+Preview toggles default OFF; full-res recording; FPS probe
+
+Stimulus: black dot on white; start/end size; screen picker; fullscreen; simulation mode
+
+(See logs in logs/ for exact run histories.)
+
+License
+
+See LICENSE in this repository.
+
+Acknowledgements
+
+FLIR/Point Grey Spinnaker/PySpin
+
+OpenCV, PyQt5
+
+PsychoPy (used when available; falls back to OpenCV otherwise)
+
+Contact
+
+Please open an issue on the GitHub repo with:
+
+logs/FlyPy_run_...__ENDED_...log
+
+Your Python & OS version
+
+Camera models/serials and chosen backends
+
+A short description of what you clicked before the problem occurred
+
+Happy recording! 🪰📹
