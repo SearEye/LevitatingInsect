@@ -1,14 +1,11 @@
 # FlyAPI.py
 # FlyPy — Unified Trigger → Cameras + Lights + Looming Stimulus
-# v1.35.4
-# - FIX: PySpin device selection now matches DeviceSerialNumber (not UniqueID),
-#        so each serial (e.g., 24102007 vs 24102017) opens the correct camera.
-# - FIX: Handle "BeginAcquisition: Camera is already streaming" once, avoid spam.
-# - FIX: Advanced… toggle handler signature accepts clicked(bool), no crash.
-# - Keeps: process-lifetime PySpin System; distinct default assignment after Refresh.
-# - Keeps: logs under Desktop\LevitatingInsect-main\logs with end timestamp
-# - Keeps: preview toggles off by default, full-res recording only, FPS probe
-# - Keeps: stimulus start/end size, fullscreen/screen chooser, simulation mode
+# v1.35.7
+# - CHANGE: Hardware trigger now fires ONLY when Arduino outputs the single char '0'
+#           (configurable via Config.serial_trigger_token; default "0").
+# - Adds serial-token filter that ignores "A:" (analog stream), "C:" (command replies), and "state:" (STATE mode).
+# - Drains serial buffer aggressively so trigger tokens aren't buried by streaming lines.
+# - Keeps: PySpin device selection by DeviceSerialNumber, Preview logic, GUI, etc.
 
 import os, sys, time, csv, atexit, threading, queue, logging, shutil
 from collections import deque
@@ -18,7 +15,7 @@ import importlib
 import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
 
-__version__ = "1.35.4"
+__version__ = "1.35.7"
 
 # -------------------- Logging --------------------
 LOG_DIR_DEFAULT = r"C:\Users\Murpheylab\Desktop\LevitatingInsect-main\logs"
@@ -147,6 +144,12 @@ class Config:
         self.stim_fullscreen=False
         self.gui_screen_index=0
 
+        # Trigger gating and timing
+        self.require_tripwire=True
+        self.trigger_to_record_delay_s=0.0
+        self.manual_tripwire_timeout_s=10.0
+        self.manual_tripwire_wait_forever=False
+
         # Cameras
         self.cam0_backend="PySpin"; self.cam1_backend="PySpin"
         self.cam0_id=""; self.cam1_id=""
@@ -156,6 +159,10 @@ class Config:
         self.cam0_exposure_us=1500; self.cam1_exposure_us=1500
         self.cam0_hw_trigger=False; self.cam1_hw_trigger=False
         self.cam_async_writer=True
+
+        # ---- MOD: serial trigger token expected from Arduino (default "0") ----
+        # If your Arduino outputs a different token, change it here.
+        self.serial_trigger_token = "0"
 
 # -------------------- Hardware Bridge --------------------
 class HardwareBridge:
@@ -185,14 +192,25 @@ class HardwareBridge:
                 try:
                     self.ser=serial.Serial(self.port,self.baud,timeout=0.01)
                     wait_s(1.2)
-                    LOGGER.info("[HW] Serial open: %s @ %d", self.port, self.baud)
+                    LOGGER.info("[HW] Serial open: %s @ %d (expect token='%s')",
+                                self.port, self.baud, self.cfg.serial_trigger_token)
                 except Exception as e:
                     LOGGER.warning("[HW] Open failed: %s → simulation", e); self.simulated=True
             else:
                 LOGGER.info("[HW] No CH340/UNO port found → simulation"); self.simulated=True
         except Exception as e:
             LOGGER.info("[HW] pyserial not available (%s) → simulation", e); self.simulated=True
+
     def check_trigger(self)->bool:
+        """
+        MOD: Only fires when a line read from serial equals the configured token (default '0').
+        Ignores:
+          - 'A:<num>' analog trace lines
+          - 'C: ...' reply/status lines from Arduino
+          - 'state:...' lines from OUTPUT STATE mode
+          - blank lines
+        Legacy 'T' is intentionally ignored to prevent accidental triggers.
+        """
         if self.simulated:
             now=time.time()
             if now-self._last_sim>=self.cfg.sim_trigger_interval:
@@ -200,11 +218,29 @@ class HardwareBridge:
             return False
         self._open_if_needed()
         try:
-            if self.ser and self.ser.in_waiting:
-                line=self.ser.readline().decode(errors="ignore").strip()
-                if line=="T": return True
-        except Exception as e: LOGGER.warning("[HW] Read error: %s", e)
+            if self.ser:
+                # Drain a good chunk of lines quickly so the token isn't buried by A: spam
+                max_reads = 300
+                while self.ser.in_waiting and max_reads > 0:
+                    max_reads -= 1
+                    line=self.ser.readline().decode("utf-8", errors="ignore").strip()
+                    if not line:
+                        continue
+                    if line.startswith("A:") or line.startswith("C:") or line.startswith("state:"):
+                        # Ignore analog stream, command replies, and state chatter
+                        continue
+                    # ONLY accept the configured token (default "0") as a trigger
+                    if line == str(self.cfg.serial_trigger_token):
+                        LOGGER.debug("[HW] Trigger token received: %r", line)
+                        return True
+                    # Helpful debug if we see a legacy/mismatched token
+                    if line in ("T","0") and line != str(self.cfg.serial_trigger_token):
+                        LOGGER.debug("[HW] Saw serial token '%s' but expected '%s' (is Arduino OUTPUT mode correct?)",
+                                     line, self.cfg.serial_trigger_token)
+        except Exception as e:
+            LOGGER.warning("[HW] Read error: %s", e)
         return False
+
     def _send(self,text:str):
         self._open_if_needed()
         if self.simulated or not self.ser: LOGGER.info("[HW] (Sim) SEND: %s", text); return
@@ -487,7 +523,6 @@ class SpinnakerCamera(BaseCamera):
             except Exception as e:
                 msg = str(e).lower()
                 if "already streaming" in msg:
-                    # Treat as already started to avoid repeated warnings
                     self._acq=True
                 else:
                     LOGGER.warning("[PySpin] BeginAcquisition: %s", e)
@@ -897,6 +932,29 @@ class SettingsGUI(QtWidgets.QWidget):
         sl.addRow("Background shade (0=black, 1=white):", self.sb_bg)
         sl.addRow("Delay: record → lights ON (s):", self.sb_light_delay)
         sl.addRow("Delay: record → stimulus ON (s):", self.sb_stim_delay)
+        self.cb_require_trip = QtWidgets.QCheckBox("Require laser tripwire for manual trigger")
+        self.cb_require_trip.setChecked(self.cfg.require_tripwire)
+        self.sb_trig_rec_delay = QtWidgets.QDoubleSpinBox()
+        self.sb_trig_rec_delay.setRange(0.000, 10.000)
+        self.sb_trig_rec_delay.setDecimals(3)
+        self.sb_trig_rec_delay.setSingleStep(0.005)
+        self.sb_trig_rec_delay.setValue(self.cfg.trigger_to_record_delay_s)
+        sl.addRow(self.cb_require_trip)
+        sl.addRow("Delay: trigger → recording start (s):", self.sb_trig_rec_delay)
+        self.cb_trip_forever = QtWidgets.QCheckBox("Wait indefinitely for tripwire on Manual trigger")
+        self.cb_trip_forever.setChecked(self.cfg.manual_tripwire_wait_forever)
+        self.sb_trip_timeout = QtWidgets.QDoubleSpinBox()
+        self.sb_trip_timeout.setRange(0.00, 3600.00)
+        self.sb_trip_timeout.setDecimals(2)
+        self.sb_trip_timeout.setSingleStep(0.50)
+        self.sb_trip_timeout.setValue(self.cfg.manual_tripwire_timeout_s)
+        sl.addRow(self.cb_trip_forever)
+        sl.addRow("Manual tripwire timeout (s):", self.sb_trip_timeout)
+        def _toggle_timeout_box(checked):
+            self.sb_trip_timeout.setEnabled(not checked)
+        self.cb_trip_forever.toggled.connect(_toggle_timeout_box)
+        _toggle_timeout_box(self.cb_trip_forever.isChecked())
+
         grid.addWidget(stim, 1, 0, 1, 2)
 
         # Display & Windows
@@ -1074,6 +1132,7 @@ class MainApp(QtWidgets.QApplication):
             import PySpin as _ps; LOGGER.info("PySpin: OK")
         except Exception as e:
             LOGGER.info("PySpin: MISSING (%s) — install Spinnaker SDK + PySpin", e)
+        LOGGER.info("Hardware serial trigger token expected: %r", self.cfg.serial_trigger_token)
         LOGGER.info("======================")
 
     def show_scaled_gui(self, screen_index:int):
@@ -1167,13 +1226,11 @@ class MainApp(QtWidgets.QApplication):
             elif len(devs) == 1 and ((not id0 and not id1) or (be0==be1 and id0==id1)):
                 d0 = devs[0]
                 _set_box(self.gui.cam_boxes[0], d0["backend"], d0["ident"])
-                # pick a different OpenCV index for cam1 to avoid mirroring (likely becomes synthetic until plugged)
                 fallback_ident = "1" if str(d0["ident"])!="1" else "0"
                 _set_box(self.gui.cam_boxes[1], "OpenCV", fallback_ident)
 
             # Case 3: one panel empty → fill it with the first device that does NOT match the other panel
             elif len(devs) >= 1:
-                # Refresh latest values
                 id0 = self.gui.cam_boxes[0]["le_ident"].text().strip(); be0 = "OpenCV" if self.gui.cam_boxes[0]["cb_backend"].currentIndex()==0 else "PySpin"
                 id1 = self.gui.cam_boxes[1]["le_ident"].text().strip(); be1 = "OpenCV" if self.gui.cam_boxes[1]["cb_backend"].currentIndex()==0 else "PySpin"
                 if not id0:
@@ -1185,7 +1242,6 @@ class MainApp(QtWidgets.QApplication):
 
             LOGGER.info("[Devices] Refreshed: %d PySpin, %d OpenCV", len(spin_list), len(ocv_list))
 
-            # Apply immediately if we auto-changed anything so previews open the right feeds
             if changed:
                 self.apply_from_gui()
 
@@ -1255,11 +1311,18 @@ class MainApp(QtWidgets.QApplication):
             LOGGER.error("[Main] apply_from_gui error: %s", e)
 
     def update_previews(self):
+        """
+        Option B fix:
+        - Do NOT overwrite status with 'Idle' while the trigger loop is running.
+        - Only show 'Idle' when not running.
+        """
         try:
             if self.in_trial:
                 self.gui.lbl_status.setText("Status: Trial running (preview paused)")
                 self.gui.update_cam_fps_labels(self.cam0.driver_fps(), self.cam1.driver_fps())
                 return
+
+            # Normal preview refresh
             for i, node in enumerate((self.cam0, self.cam1)):
                 if not self.gui.cam_boxes[i]["cb_show"].isChecked():
                     self.gui.set_preview_image(i, None)
@@ -1268,8 +1331,12 @@ class MainApp(QtWidgets.QApplication):
                 w,h=p.width(),p.height()
                 img=node.grab_preview(w,h)
                 self.gui.set_preview_image(i,img)
+
             self.gui.update_cam_fps_labels(self.cam0.driver_fps(), self.cam1.driver_fps())
-            self.gui.lbl_status.setText("Status: Waiting / Idle.")
+
+            # Only set Idle when not running; otherwise leave the current status message
+            if not self.running:
+                self.gui.lbl_status.setText("Status: Waiting / Idle.")
         except Exception as e:
             LOGGER.error("[GUI] update_previews error: %s", e)
 
@@ -1279,6 +1346,13 @@ class MainApp(QtWidgets.QApplication):
         try:
             while self.running:
                 if self.hw.check_trigger():
+                    delay = float(getattr(self.cfg, "trigger_to_record_delay_s", 0.0) or 0.0)
+                    if delay > 0:
+                        self.gui.lbl_status.setText(f"Status: Triggered — waiting {delay:.3f}s to start…")
+                        t0 = time.time()
+                        while (time.time()-t0) < delay:
+                            QtWidgets.QApplication.processEvents()
+                            time.sleep(0.01)
                     self.in_trial=True
                     self.gui.lbl_status.setText("Status: Triggered — running trial…")
                     try:
@@ -1286,7 +1360,7 @@ class MainApp(QtWidgets.QApplication):
                     except Exception as e:
                         LOGGER.error("[Main] Trial error: %s", e)
                     self.in_trial=False
-                    self.gui.lbl_status.setText("Status: Waiting / Idle.")
+                    self.gui.lbl_status.setText("Status: Watching for triggers…")
                 time.sleep(0.005)
         finally:
             LOGGER.info("[Main] Trigger loop exiting")
@@ -1311,10 +1385,40 @@ class MainApp(QtWidgets.QApplication):
         if self.in_trial: return
         self.in_trial=True
         try:
+            if bool(getattr(self.cfg, 'require_tripwire', True)):
+                wait_forever = bool(getattr(self.cfg, 'manual_tripwire_wait_forever', False))
+                timeout_s = float(getattr(self.cfg, 'manual_tripwire_timeout_s', 10.0))
+                if wait_forever:
+                    self.gui.lbl_status.setText('Status: Manual — waiting for tripwire (no timeout)…')
+                    while True:
+                        if self.hw.check_trigger():
+                            break
+                        QtWidgets.QApplication.processEvents()
+                        time.sleep(0.01)
+                else:
+                    self.gui.lbl_status.setText(f'Status: Manual — waiting for tripwire ({timeout_s:.1f}s timeout)…')
+                    t0=time.time(); got=False
+                    while (time.time()-t0) < timeout_s:
+                        if self.hw.check_trigger():
+                            got=True; break
+                        QtWidgets.QApplication.processEvents()
+                        time.sleep(0.01)
+                    if not got:
+                        self.gui.lbl_status.setText('Status: Manual — tripwire timeout (no event).')
+                        return
+            delay = float(getattr(self.cfg, 'trigger_to_record_delay_s', 0.0) or 0.0)
+            if delay > 0:
+                self.gui.lbl_status.setText(f'Status: Manual — waiting {delay:.3f}s to start…')
+                t0=time.time()
+                while (time.time()-t0) < delay:
+                    QtWidgets.QApplication.processEvents()
+                    time.sleep(0.01)
+            self.gui.lbl_status.setText('Status: Manual — running trial…')
             self.runner.run_one()
         except Exception as e:
-            LOGGER.error("[Main] Manual trial error: %s", e)
-        self.in_trial=False
+            LOGGER.error('[Main] Manual trial error: %s', e)
+        finally:
+            self.in_trial=False
 
     def start_probe(self):
         try: self.apply_from_gui()
