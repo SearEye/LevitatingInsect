@@ -1,24 +1,16 @@
 # FlyAPI.py
 # FlyPy — Unified Trigger → Cameras + Lights + Looming Stimulus
-# v1.35.4
-# - FIX: PySpin device selection now matches DeviceSerialNumber (not UniqueID),
-#        so each serial (e.g., 24102007 vs 24102017) opens the correct camera.
-# - FIX: Handle "BeginAcquisition: Camera is already streaming" once, avoid spam.
-# - FIX: Advanced… toggle handler signature accepts clicked(bool), no crash.
-# - Keeps: process-lifetime PySpin System; distinct default assignment after Refresh.
-# - Keeps: logs under Desktop\LevitatingInsect-main\logs with end timestamp
-# - Keeps: preview toggles off by default, full-res recording only, FPS probe
-# - Keeps: stimulus start/end size, fullscreen/screen chooser, simulation mode
+# v1.36.1 (merged, fixed: clearer display choices, borderless fullscreen, reliable reopen)
 
-import os, sys, time, csv, atexit, threading, queue, logging, shutil
+import os, sys, time, csv, atexit, threading, queue, logging, shutil, importlib
 from collections import deque
 from datetime import datetime
 from typing import Optional, Tuple, List, Dict
-import importlib
+
 import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
 
-__version__ = "1.35.5"
+__version__ = "1.36.1"
 
 # -------------------- Logging --------------------
 LOG_DIR_DEFAULT = r"C:\Users\Murpheylab\Desktop\LevitatingInsect-main\logs"
@@ -88,6 +80,7 @@ except Exception as e:
 
 PSY_LOADED=None; visual=None; core=None
 def _ensure_psychopy_loaded()->bool:
+    """Prefer PsychoPy stimulus; fall back to OpenCV if unavailable."""
     global PSY_LOADED, visual, core
     if PSY_LOADED is True: return True
     if PSY_LOADED is False: return False
@@ -127,33 +120,33 @@ def default_preset_id()->str: return "avi_mjpg"
 # -------------------- Config --------------------
 class Config:
     def __init__(self):
+        # General
         self.simulation_mode=False
         self.sim_trigger_interval=5.0
         self.output_root="FlyPy_Output"
         self.prewarm_stim=False
 
+        # Video
         self.video_preset_id=default_preset_id()
         self.fourcc=PRESETS_BY_ID[self.video_preset_id]["fourcc"]
         self.record_duration_s=3.0
 
-
-        # Serial trigger (Arduino → FlyAPI)
-        # Arduino should print a single line token when the beam-break event occurs.
-        # Default token is "0". Legacy sketches may emit "T" (also accepted).
-        self.serial_trigger_token = "0"
-        self.serial_trigger_legacy_tokens = ("T",)
-        # Ignore high-rate debug/chatter lines from Arduino so triggers are not buried.
-        self.serial_ignore_prefixes = ("A:", "C:", "ACK", "ERR", "state:")
-        # Stimulus (growing black dot on white background)
+        # Stimulus
         self.stim_duration_s=1.5
         self.stim_r0_px=8
         self.stim_r1_px=240
-        self.stim_bg_grey=1.0
+        self.stim_bg_grey=1.0  # 1.0 = white, 0.0 = black
         self.lights_delay_s=0.0
         self.stim_delay_s=0.0
         self.stim_screen_index=0
         self.stim_fullscreen=False
         self.gui_screen_index=0
+
+        # NEW: stimulus kind + PNG config
+        self.stim_kind="circle"              # "circle" | "png"
+        self.stim_png_path=""                # filesystem path to .png
+        self.stim_png_keep_aspect=True       # keep PNG aspect when scaling
+        self.stim_keep_window_open=True      # keep stimulus window persistent during run
 
         # Cameras
         self.cam0_backend="PySpin"; self.cam1_backend="PySpin"
@@ -201,38 +194,17 @@ class HardwareBridge:
         except Exception as e:
             LOGGER.info("[HW] pyserial not available (%s) → simulation", e); self.simulated=True
     def check_trigger(self)->bool:
-        # Returns True once when a trigger token is seen on serial.
-        # Drains the buffer so high-rate debug output (e.g., "A:1023") doesn't hide triggers.
         if self.simulated:
             now=time.time()
             if now-self._last_sim>=self.cfg.sim_trigger_interval:
                 self._last_sim=now; LOGGER.info("[HW] (Sim) Trigger"); return True
             return False
-
         self._open_if_needed()
-        if not self.ser:
-            return False
-
-        token = getattr(self.cfg, "serial_trigger_token", "0")
-        legacy = set(getattr(self.cfg, "serial_trigger_legacy_tokens", ("T",)))
-        ignore_prefixes = tuple(getattr(self.cfg, "serial_ignore_prefixes", ()))
-
         try:
-            # Drain all currently available lines. Trigger if ANY match token/legacy.
-            while self.ser.in_waiting:
-                line = self.ser.readline().decode(errors="ignore").strip()
-                if not line:
-                    continue
-                if ignore_prefixes and line.startswith(ignore_prefixes):
-                    continue
-                if line == token or line in legacy:
-                    LOGGER.info("[HW] Trigger (%s)", line)
-                    return True
-                # Keep unexpected lines for debugging at DEBUG level (won't spam console by default)
-                LOGGER.debug("[HW] Serial: %s", line)
-        except Exception as e:
-            LOGGER.warning("[HW] Read error: %s", e)
-
+            if self.ser and self.ser.in_waiting:
+                line=self.ser.readline().decode(errors="ignore").strip()
+                if line=="T": return True
+        except Exception as e: LOGGER.warning("[HW] Read error: %s", e)
         return False
     def _send(self,text:str):
         self._open_if_needed()
@@ -258,6 +230,7 @@ class BaseCamera:
     def start_acquisition(self): pass
     def stop_acquisition(self): pass
 
+# ---- OpenCV camera ----
 class OpenCVCamera(BaseCamera):
     def __init__(self,index:int,target_fps:float):
         if not HAVE_OPENCV: raise RuntimeError("OpenCV is not installed")
@@ -297,9 +270,7 @@ class OpenCVCamera(BaseCamera):
 
 # -------- PySpin backend (Spinnaker) --------
 HAVE_PYSPIN=False; PySpin=None; _SPIN_SYS=None
-
 def _spin_system_get():
-    """Get (and keep) the singleton System for the process lifetime."""
     global PySpin, HAVE_PYSPIN, _SPIN_SYS
     if not HAVE_PYSPIN:
         try:
@@ -322,7 +293,6 @@ def _spin_system_release_final():
         _SPIN_SYS=None
 
 def spin_enumerate()->List[Dict[str,str]]:
-    """Return list of {'serial','model','display'}; safe wrt SWIG refs."""
     sys_inst=_spin_system_get()
     out=[]
     if sys_inst is None: return out
@@ -338,17 +308,18 @@ def spin_enumerate()->List[Dict[str,str]]:
                 try:
                     s_serial = PySpin.CStringPtr(dmap.GetNode("DeviceSerialNumber")).GetValue()
                 except Exception:
-                    try: s_serial = PySpin.CStringPtr(dmap.GetNode("DeviceID")).GetValue()
+                    try:
+                        s_serial = PySpin.CStringPtr(dmap.GetNode("DeviceID")).GetValue()
                     except Exception:
-                        try: s_serial = cam.GetUniqueID()
-                        except Exception: s_serial = f"idx={i}"
+                        try:
+                            s_serial = cam.GetUniqueID()
+                        except Exception:
+                            s_serial = f"idx={i}"
                 try:
                     s_model = PySpin.CStringPtr(dmap.GetNode("DeviceModelName")).GetValue()
                 except Exception:
                     s_model = "UnknownModel"
                 out.append({"serial":str(s_serial), "model":str(s_model), "display":f"PySpin {s_serial} — {s_model}"})
-            except Exception as e:
-                LOGGER.debug("[PySpin] enumerate cam %d failed: %s", i, e)
             finally:
                 try: dmap = None
                 except Exception: pass
@@ -371,7 +342,6 @@ def _safe_set_enum(nodemap, name, symbolic):
     except Exception as e:
         LOGGER.debug("[PySpin] Enum %s=%s failed: %s", name, symbolic, e)
         return False
-
 def _safe_set_float(nodemap, name, value):
     try:
         node = PySpin.CFloatPtr(nodemap.GetNode(name))
@@ -382,7 +352,6 @@ def _safe_set_float(nodemap, name, value):
     except Exception as e:
         LOGGER.debug("[PySpin] Float %s=%s failed: %s", name, value, e)
         return False
-
 def _safe_set_bool(nodemap, name, value:bool):
     try:
         node = PySpin.CBooleanPtr(nodemap.GetNode(name))
@@ -391,7 +360,6 @@ def _safe_set_bool(nodemap, name, value:bool):
     except Exception as e:
         LOGGER.debug("[PySpin] Bool %s=%s failed: %s", name, value, e)
         return False
-
 def _align_to_inc(val, inc, lo, hi):
     if inc <= 0: return int(max(lo, min(hi, val)))
     v = int(val // inc * inc)
@@ -426,9 +394,11 @@ class SpinnakerCamera(BaseCamera):
                         try:
                             sn = PySpin.CStringPtr(dmap.GetNode("DeviceSerialNumber")).GetValue()
                         except Exception:
-                            try: sn = PySpin.CStringPtr(dmap.GetNode("DeviceID")).GetValue()
+                            try:
+                                sn = PySpin.CStringPtr(dmap.GetNode("DeviceID")).GetValue()
                             except Exception:
-                                try: sn = cam_i.GetUniqueID()
+                                try:
+                                    sn = cam_i.GetUniqueID()
                                 except Exception: sn = None
                         if str(sn) == str(self.serial):
                             chosen_idx = i; break
@@ -516,7 +486,6 @@ class SpinnakerCamera(BaseCamera):
             except Exception as e:
                 msg = str(e).lower()
                 if "already streaming" in msg:
-                    # Treat as already started to avoid repeated warnings
                     self._acq=True
                 else:
                     LOGGER.warning("[PySpin] BeginAcquisition: %s", e)
@@ -556,6 +525,7 @@ class SpinnakerCamera(BaseCamera):
         finally:
             self.cam=None
 
+# -------------------- Camera Node --------------------
 class CameraNode:
     def __init__(self, name:str, backend:str, ident:str, target_fps:int, adv=None):
         self.name=name; self.backend=backend; self.ident=ident; self.target_fps=float(target_fps)
@@ -695,10 +665,28 @@ class CameraNode:
         except Exception: pass
         self.dev=None; self.synthetic=False
 
-# -------------------- Stimulus --------------------
+# -------------------- Stimulus (merged features + fixes) --------------------
 class LoomingStim:
+    """
+    - PsychoPy first (visual.Window/ImageStim/Circle), OpenCV fallback if PsychoPy not present.
+    - Supports "circle" OR "png" (scaled like circle diameter), with keep-aspect option.
+    - Can keep the stimulus window open persistently.
+    - FIXES: true borderless fullscreen; reliable re-open per trial when keep-open is OFF.
+    """
     def __init__(self,cfg:Config):
-        self.cfg=cfg; self._pp_win=None; self._pp_cfg=None; self._cv_window_name="Looming Stimulus"; self._cv_open=False; self._cv_size=(800,600)
+        self.cfg=cfg
+        self._pp_win=None
+        self._pp_cfg=None
+        self._pp_png=None  # PsychoPy ImageStim cache
+        self._pp_png_path=""
+
+        self._cv_window_name="Looming Stimulus"
+        self._cv_open=False
+        self._cv_size=(800,600)
+        self._cv_png=None
+        self._cv_png_path=""
+
+    # ---------- window helpers ----------
     def _pp_window(self,screen_idx:int,fullscreen:bool,bg_grey:float):
         need_new=False
         if self._pp_win is None: need_new=True
@@ -708,67 +696,224 @@ class LoomingStim:
             self._pp_win=None; need_new=True
         if need_new:
             try:
-                if fullscreen: self._pp_win=visual.Window(color=[bg_grey]*3,units='pix',fullscr=True,screen=screen_idx)
-                else: self._pp_win=visual.Window(size=self._cv_size,color=[bg_grey]*3,units='pix',fullscr=False,screen=screen_idx,allowGUI=True)
+                # PsychoPy fullscr=True is borderless on the chosen screen
+                if fullscreen:
+                    self._pp_win=visual.Window(color=[bg_grey]*3,units='pix',fullscr=True,screen=screen_idx,allowGUI=False)
+                else:
+                    self._pp_win=visual.Window(size=self._cv_size,color=[bg_grey]*3,units='pix',fullscr=False,screen=screen_idx,allowGUI=True)
                 self._pp_cfg=(screen_idx,fullscreen)
             except Exception as e: LOGGER.warning("[Stim] PsychoPy window error: %s", e); self._pp_win=None
         if self._pp_win is not None:
             try: self._pp_win.color=[bg_grey]*3
             except Exception: pass
-    def _cv_window(self,screen_idx:int,bg_grey:float):
+
+    def _cv_window(self,screen_idx:int,bg_grey:float,fullscreen:bool):
         try:
             if not HAVE_OPENCV: return
             if not self._cv_open:
-                cv2.namedWindow(self._cv_window_name,cv2.WINDOW_NORMAL); cv2.resizeWindow(self._cv_window_name,self._cv_size[0],self._cv_size[1]); self._cv_open=True
+                cv2.namedWindow(self._cv_window_name,cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(self._cv_window_name,self._cv_size[0],self._cv_size[1])
+                self._cv_open=True
             geoms=QtGui.QGuiApplication.screens()
             if 0<=screen_idx<len(geoms):
-                g=geoms[screen_idx].geometry(); cv2.moveWindow(self._cv_window_name,g.x()+50,g.y()+50)
+                g=geoms[screen_idx].geometry()
+                cv2.moveWindow(self._cv_window_name,g.x(),g.y())
+            # Borderless fullscreen toggle (OpenCV)
+            try:
+                cv2.setWindowProperty(
+                    self._cv_window_name,
+                    cv2.WND_PROP_FULLSCREEN,
+                    cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL
+                )
+            except Exception:
+                pass
             bg=int(max(0,min(255,int(bg_grey*255)))); frame=np.full((self._cv_size[1],self._cv_size[0],3),bg,dtype=np.uint8)
             cv2.imshow(self._cv_window_name,frame); cv2.waitKey(1)
         except Exception as e: LOGGER.warning("[Stim] OpenCV window error: %s", e); self._cv_open=False
+
     def open_persistent(self,screen_idx:int,fullscreen:bool,bg_grey:float):
+        """Ensure the stim window is created and cleared (honors 'keep window open')."""
         if _ensure_psychopy_loaded():
             self._pp_window(screen_idx,fullscreen,bg_grey)
             if self._pp_win is not None:
                 try: self._pp_win.flip()
                 except Exception: pass
-        else: self._cv_window(screen_idx,bg_grey)
-    def run(self,duration_s:float,r0:int,r1:int,bg_grey:float,screen_idx:int,fullscreen:bool):
-        LOGGER.info("[Stim] Looming start")
-        if _ensure_psychopy_loaded():
-            try:
-                self._pp_window(screen_idx,fullscreen,bg_grey)
-                if self._pp_win is not None:
-                    dot=visual.Circle(self._pp_win,radius=r0,fillColor='black',lineColor='black')
-                    t0=time.time()
-                    while True:
-                        t=time.time()-t0
-                        if t>=duration_s: break
-                        r=r0+(r1-r0)*(t/duration_s); dot.radius=r; dot.draw(); self._pp_win.flip()
-                    LOGGER.info("[Stim] Done (PsychoPy)"); return
-            except Exception as e: LOGGER.warning("[Stim] PsychoPy error: %s → OpenCV fallback", e)
-        try:
-            if not HAVE_OPENCV:
-                wait_s(duration_s); LOGGER.info("[Stim] Done (timing only)"); return
-            self._cv_window(screen_idx,bg_grey)
-            size=self._cv_size; bg=int(max(0,min(255,int(bg_grey*255)))); t0=time.time()
-            while True:
-                t=time.time()-t0
-                if t>=duration_s: break
-                r=int(r0+(r1-r0)*(t/duration_s)); frame=np.full((size[1],size[0],3),bg,dtype=np.uint8)
-                cv2.circle(frame,(size[0]//2,size[1]//2),r,(0,0,0),-1); cv2.imshow(self._cv_window_name,frame)
-                if cv2.waitKey(1) & 0xFF==27: break
-            LOGGER.info("[Stim] Done (OpenCV)")
-        except Exception as e: LOGGER.warning("[Stim] Fallback display unavailable: %s", e); wait_s(duration_s); LOGGER.info("[Stim] Done (timing only)")
+        else:
+            self._cv_window(screen_idx,bg_grey,fullscreen)
+
     def close(self):
         try:
             if self._pp_win is not None: self._pp_win.close()
         except Exception: pass
-        self._pp_win=None; self._pp_cfg=None
+        self._pp_win=None; self._pp_cfg=None; self._pp_png=None; self._pp_png_path=""
+
         if self._cv_open and HAVE_OPENCV:
             try: cv2.destroyWindow(self._cv_window_name)
             except Exception: pass
             self._cv_open=False
+        self._cv_png=None; self._cv_png_path=""
+
+    # ---------- PNG cache loaders ----------
+    def _pp_get_png(self, path:str):
+        if not path: return None
+        if path==self._pp_png_path and self._pp_png is not None:
+            return self._pp_png
+        try:
+            self._pp_png = visual.ImageStim(self._pp_win, image=path, units='pix', interpolate=True)
+            self._pp_png_path = path
+        except Exception as e:
+            LOGGER.warning("[Stim] PsychoPy PNG load failed: %s", e); self._pp_png=None; self._pp_png_path=""
+        return self._pp_png
+
+    def _cv_get_png(self, path:str):
+        if not HAVE_OPENCV or not path: return None
+        if path==self._cv_png_path and self._cv_png is not None:
+            return self._cv_png
+        try:
+            img = cv2.imread(path, cv2.IMREAD_UNCHANGED)  # keep alpha if present
+            if img is None: raise RuntimeError("cv2.imread returned None")
+            self._cv_png = img
+            self._cv_png_path = path
+        except Exception as e:
+            LOGGER.warning("[Stim] OpenCV PNG load failed: %s", e); self._cv_png=None; self._cv_png_path=""
+        return self._cv_png
+
+    # ---------- main run ----------
+    def run(self,duration_s:float,r0:int,r1:int,bg_grey:float,screen_idx:int,fullscreen:bool):
+        """
+        duration_s: total looming time
+        r(t): radius grows linearly from r0 -> r1 over duration
+        If cfg.stim_kind == "png": scale PNG so its longer side ~= 2*r(t)
+        """
+        LOGGER.info("[Stim] Looming start (%s)", self.cfg.stim_kind)
+        kind = (self.cfg.stim_kind or "circle").strip().lower()
+        use_png = (kind == "png")
+        png_path = (self.cfg.stim_png_path or "").strip()
+
+        # Window lifecycle:
+        # - If keep_open: ensure window exists (recreate if lost)
+        # - If NOT keep_open: force a fresh window each trial
+        if self.cfg.stim_keep_window_open:
+            self.open_persistent(screen_idx, fullscreen, bg_grey)
+        else:
+            self.close()
+
+        # PsychoPy path
+        if _ensure_psychopy_loaded():
+            try:
+                self._pp_window(screen_idx,fullscreen,bg_grey)
+                if self._pp_win is None:
+                    raise RuntimeError("PsychoPy window unavailable")
+
+                dot=None
+                if not use_png:
+                    dot=visual.Circle(self._pp_win,radius=r0,fillColor='black',lineColor='black')
+
+                imgStim=None
+                if use_png:
+                    imgStim = self._pp_get_png(png_path)
+                    if imgStim is None:
+                        LOGGER.warning("[Stim] PNG unavailable → fallback to circle")
+                        use_png=False
+                        dot=visual.Circle(self._pp_win,radius=r0,fillColor='black',lineColor='black')
+
+                t0=time.time()
+                while True:
+                    t=time.time()-t0
+                    if t>=duration_s: break
+                    r=int(r0+(r1-r0)*(t/max(1e-6,duration_s)))
+                    if use_png and imgStim is not None:
+                        # scale PNG: longer side ~ 2r
+                        iw, ih = imgStim.size
+                        if iw<=0 or ih<=0:  # safety
+                            use_png=False
+                        else:
+                            if self.cfg.stim_png_keep_aspect:
+                                if iw>=ih:
+                                    sw = 2*r; sh = int(max(1, 2*r*ih/iw))
+                                else:
+                                    sh = 2*r; sw = int(max(1, 2*r*iw/ih))
+                            else:
+                                sw = 2*r; sh = 2*r
+                            imgStim.size = (sw, sh)
+                            imgStim.pos = (0,0)
+                            imgStim.draw()
+                    else:
+                        dot.radius = r; dot.draw()
+
+                    self._pp_win.flip()
+
+                LOGGER.info("[Stim] Done (PsychoPy)")
+                if not self.cfg.stim_keep_window_open:
+                    self.close()
+                return
+            except Exception as e:
+                LOGGER.warning("[Stim] PsychoPy error: %s → OpenCV fallback", e)
+
+        # OpenCV fallback
+        try:
+            if not HAVE_OPENCV:
+                wait_s(duration_s); LOGGER.info("[Stim] Done (timing only)"); return
+
+            self._cv_window(screen_idx,bg_grey,fullscreen)
+            size=self._cv_size
+            bg=int(max(0,min(255,int(bg_grey*255)))); t0=time.time()
+
+            png=None
+            if use_png:
+                png = self._cv_get_png(png_path)
+                if png is None:
+                    LOGGER.warning("[Stim] PNG unavailable in OpenCV → fallback to circle"); use_png=False
+
+            while True:
+                t=time.time()-t0
+                if t>=duration_s: break
+                r=int(r0+(r1-r0)*(t/max(1e-6,duration_s)))
+                frame=np.full((size[1],size[0],3),bg,dtype=np.uint8)
+
+                if use_png and png is not None:
+                    ih, iw = png.shape[:2]
+                    if iw<=0 or ih<=0:
+                        use_png=False
+                    else:
+                        if self.cfg.stim_png_keep_aspect:
+                            if iw>=ih:
+                                sw = max(2, 2*r); sh = max(1, int(sw*ih/iw))
+                            else:
+                                sh = max(2, 2*r); sw = max(1, int(sh*iw/ih))
+                        else:
+                            sw = max(2, 2*r); sh = max(2, 2*r)
+                        try:
+                            scaled = cv2.resize(png, (sw, sh), interpolation=cv2.INTER_AREA)
+                            y0 = size[1]//2 - sh//2; x0 = size[0]//2 - sw//2
+                            # alpha blend if PNG has alpha
+                            if scaled.shape[2]==4:
+                                b,g,rch,a = cv2.split(scaled)
+                                rgb = cv2.merge((b,g,rch))
+                                alpha = a.astype(np.float32)/255.0
+                                roi = frame[max(0,y0):max(0,y0)+sh, max(0,x0):max(0,x0)+sw]
+                                H = min(roi.shape[0], sh); W = min(roi.shape[1], sw)
+                                roi = roi[:H,:W]
+                                rgb = rgb[:H,:W]
+                                alpha = alpha[:H,:W][...,None]
+                                frame[max(0,y0):max(0,y0)+H, max(0,x0):max(0,x0)+W] = (alpha*rgb + (1-alpha)*roi).astype(np.uint8)
+                            else:
+                                frame[y0:y0+sh, x0:x0+sw] = scaled
+                        except Exception:
+                            use_png=False
+
+                if not use_png:
+                    cv2.circle(frame,(size[0]//2,size[1]//2),max(1,r),(0,0,0),-1)
+
+                cv2.imshow(self._cv_window_name,frame)
+                if cv2.waitKey(1) & 0xFF==27: break
+
+            LOGGER.info("[Stim] Done (OpenCV)")
+            if not self.cfg.stim_keep_window_open:
+                self.close()
+        except Exception as e:
+            LOGGER.warning("[Stim] Fallback display unavailable: %s", e)
+            wait_s(duration_s); LOGGER.info("[Stim] Done (timing only)")
 
 # -------------------- Trial Runner --------------------
 class TrialRunner:
@@ -779,21 +924,26 @@ class TrialRunner:
         if new:
             self.csvw.writerow(["timestamp","trial_idx","cam0_path","cam1_path","record_duration_s",
                                 "lights_delay_s","stim_delay_s","stim_duration_s","stim_screen_index","stim_fullscreen",
+                                "stim_kind","stim_png_path","stim_png_keep_aspect","stim_keep_window_open",
                                 "cam0_backend","cam0_ident","cam0_target_fps","cam0_w","cam0_h","cam0_exp_us","cam0_hwtrig",
                                 "cam1_backend","cam1_ident","cam1_target_fps","cam1_w","cam1_h","cam1_exp_us","cam1_hwtrig",
                                 "video_preset_id","fourcc"])
         self.trial_idx=0
+
     def close(self):
         try: self.log.close()
         except Exception: pass
         try: self.stim.close()
         except Exception: pass
+
     def _ext_for_fourcc(self,fourcc:str)->str:
         if fourcc.lower() in ("mp4v","avc1","h264"): return "mp4"
         if fourcc.lower() in ("mjpg","xvid","divx"): return "avi"
         return "mp4"
+
     def _trial_folder(self)->str:
         base=day_folder(self.cfg.output_root); p=os.path.join(base,f"trial_{now_stamp()}"); ensure_dir(p); return p
+
     def _record_both(self,folder:str):
         fourcc=self.cfg.fourcc; ext=self._ext_for_fourcc(fourcc)
         out0=os.path.join(folder,f"cam0.{ext}"); out1=os.path.join(folder,f"cam1.{ext}")
@@ -804,15 +954,27 @@ class TrialRunner:
         t1=threading.Thread(target=rec, args=(self.cam1,out1,"c1"))
         t0.start(); t1.start(); t0.join(); t1.join()
         return res["c0"], res["c1"]
+
     def run_one(self):
         folder=self._trial_folder()
+
+        # If keep-open, pre-open before any delays; otherwise let stim.run handle fresh open
+        if self.cfg.stim_keep_window_open:
+            self.stim.open_persistent(self.cfg.stim_screen_index,self.cfg.stim_fullscreen,self.cfg.stim_bg_grey)
+
         self.hw.mark_start()
         LOGGER.info("[Trial] Recording…")
         c0,c1=self._record_both(folder)
-        if self.cfg.lights_delay_s>0: LOGGER.info("[Trial] Wait %.3fs → LIGHTS ON", self.cfg.lights_delay_s); wait_s(self.cfg.lights_delay_s)
+
+        if self.cfg.lights_delay_s>0:
+            LOGGER.info("[Trial] Wait %.3fs → LIGHTS ON", self.cfg.lights_delay_s); wait_s(self.cfg.lights_delay_s)
         self.hw.lights_on()
-        if self.cfg.stim_delay_s>0: LOGGER.info("[Trial] Wait %.3fs → STIM", self.cfg.stim_delay_s); wait_s(self.cfg.stim_delay_s)
+
+        if self.cfg.stim_delay_s>0:
+            LOGGER.info("[Trial] Wait %.3fs → STIM", self.cfg.stim_delay_s); wait_s(self.cfg.stim_delay_s)
+
         self.stim.run(self.cfg.stim_duration_s,self.cfg.stim_r0_px,self.cfg.stim_r1_px,self.cfg.stim_bg_grey,self.cfg.stim_screen_index,self.cfg.stim_fullscreen)
+
         self.hw.lights_off(); self.hw.mark_end()
         self.trial_idx+=1
         self.csvw.writerow([
@@ -821,6 +983,7 @@ class TrialRunner:
             float(self.cfg.record_duration_s),
             float(self.cfg.lights_delay_s), float(self.cfg.stim_delay_s), float(self.cfg.stim_duration_s),
             int(self.cfg.stim_screen_index), bool(self.cfg.stim_fullscreen),
+            str(self.cfg.stim_kind), str(self.cfg.stim_png_path), bool(self.cfg.stim_png_keep_aspect), bool(self.cfg.stim_keep_window_open),
             self.cam0.backend, self.cam0.ident, int(self.cam0.target_fps), self.cam0.adv.get("width",0), self.cam0.adv.get("height",0), self.cam0.adv.get("exposure_us",0), self.cam0.adv.get("hw_trigger",False),
             self.cam1.backend, self.cam1.ident, int(self.cam1.target_fps), self.cam1.adv.get("width",0), self.cam1.adv.get("height",0), self.cam1.adv.get("exposure_us",0), self.cam1.adv.get("hw_trigger",False),
             self.cfg.video_preset_id, self.cfg.fourcc
@@ -912,7 +1075,7 @@ class SettingsGUI(QtWidgets.QWidget):
         btn_browse.clicked.connect(self._browse)
 
         # Stimulus & Timing
-        stim=QtWidgets.QGroupBox("Stimulus & Timing (Falling object / growing dot)")
+        stim=QtWidgets.QGroupBox("Stimulus & Timing (Growing dot / PNG looming)")
         sl=QtWidgets.QFormLayout(stim)
         self.sb_stim_dur=QtWidgets.QDoubleSpinBox(); self.sb_stim_dur.setRange(0.05,60.0); self.sb_stim_dur.setDecimals(3); self.sb_stim_dur.setValue(self.cfg.stim_duration_s)
         self.sb_r0=QtWidgets.QSpinBox(); self.sb_r0.setRange(1,4000); self.sb_r0.setValue(self.cfg.stim_r0_px)
@@ -920,26 +1083,91 @@ class SettingsGUI(QtWidgets.QWidget):
         self.sb_bg=QtWidgets.QDoubleSpinBox(); self.sb_bg.setRange(0.0,1.0); self.sb_bg.setSingleStep(0.05); self.sb_bg.setValue(self.cfg.stim_bg_grey)
         self.sb_light_delay=QtWidgets.QDoubleSpinBox(); self.sb_light_delay.setRange(0.0,10.0); self.sb_light_delay.setDecimals(3); self.sb_light_delay.setValue(self.cfg.lights_delay_s)
         self.sb_stim_delay=QtWidgets.QDoubleSpinBox(); self.sb_stim_delay.setRange(0.0,10.0); self.sb_stim_delay.setDecimals(3); self.sb_stim_delay.setValue(self.cfg.stim_delay_s)
+
+        # NEW stimulus selectors
+        self.cb_stim_kind=QtWidgets.QComboBox()
+        self.cb_stim_kind.addItem("Circle", "circle")
+        self.cb_stim_kind.addItem("PNG (scaled)", "png")
+        self.cb_stim_kind.setCurrentIndex(0 if (self.cfg.stim_kind or "circle")!="png" else 1)
+
+        self.le_stim_png=QtWidgets.QLineEdit(self.cfg.stim_png_path or "")
+        self.le_stim_png.setPlaceholderText("Path to .png (used when Stimulus Type = PNG)")
+        self.bt_stim_png=QtWidgets.QPushButton("Browse…")
+        row_png=QtWidgets.QHBoxLayout(); row_png.addWidget(self.le_stim_png); row_png.addWidget(self.bt_stim_png)
+        png_wrap=QtWidgets.QWidget(); png_wrap.setLayout(row_png)
+
+        self.cb_png_aspect=QtWidgets.QCheckBox("PNG: keep aspect")
+        self.cb_png_aspect.setChecked(bool(self.cfg.stim_png_keep_aspect))
+
+        self.cb_keep_open=QtWidgets.QCheckBox("Keep stimulus window open while running")
+        self.cb_keep_open.setChecked(bool(self.cfg.stim_keep_window_open))
+
         sl.addRow("Stimulus total time (s):", self.sb_stim_dur)
         sl.addRow("Stimulus Start Size (radius px):", self.sb_r0)
         sl.addRow("Stimulus End Size (radius px):", self.sb_r1)
         sl.addRow("Background shade (0=black, 1=white):", self.sb_bg)
         sl.addRow("Delay: record → lights ON (s):", self.sb_light_delay)
         sl.addRow("Delay: record → stimulus ON (s):", self.sb_stim_delay)
+        sl.addRow("Stimulus Type:", self.cb_stim_kind)
+        sl.addRow("Stimulus PNG:", png_wrap)
+        sl.addRow(self.cb_png_aspect)
+        sl.addRow(self.cb_keep_open)
         grid.addWidget(stim, 1, 0, 1, 2)
 
-        # Display & Windows
+        def _browse_png():
+            p, _ = QtWidgets.QFileDialog.getOpenFileName(self,"Select stimulus PNG", self.le_stim_png.text() or os.getcwd(),"PNG Images (*.png)")
+            if p: self.le_stim_png.setText(p)
+        self.bt_stim_png.clicked.connect(_browse_png)
+
+        def _toggle_png_controls():
+            is_png = (self.cb_stim_kind.currentData()=="png")
+            self.le_stim_png.setEnabled(is_png)
+            self.bt_stim_png.setEnabled(is_png)
+            self.cb_png_aspect.setEnabled(is_png)
+        self.cb_stim_kind.currentIndexChanged.connect(_toggle_png_controls)
+        _toggle_png_controls()
+
+        # Display & Windows (clarified + refresh)
         disp=QtWidgets.QGroupBox("Display & Windows")
         dl=QtWidgets.QFormLayout(disp)
         self.cb_stim_screen=QtWidgets.QComboBox(); self.cb_gui_screen=QtWidgets.QComboBox()
-        for i,s in enumerate(QtGui.QGuiApplication.screens()):
-            g=s.geometry(); label=f"Screen {i} — {g.width()}×{g.height()} @({g.x()},{g.y()})"
-            self.cb_stim_screen.addItem(label); self.cb_gui_screen.addItem(label)
-        self.cb_stim_screen.setCurrentIndex(min(self.cfg.stim_screen_index, self.cb_stim_screen.count()-1))
-        self.cb_gui_screen.setCurrentIndex(min(self.cfg.gui_screen_index, self.cb_gui_screen.count()-1))
-        self.cb_full=QtWidgets.QCheckBox("Stimulus fullscreen"); self.cb_full.setChecked(self.cfg.stim_fullscreen)
+        self.bt_refresh_displays=QtWidgets.QPushButton("Refresh Displays")
+
+        def _populate_display_boxes():
+            self.cb_stim_screen.clear(); self.cb_gui_screen.clear()
+            screens = QtGui.QGuiApplication.screens()
+            primary  = QtGui.QGuiApplication.primaryScreen()
+            for i,s in enumerate(screens):
+                g=s.geometry()
+                try:
+                    name = s.name()
+                except Exception:
+                    name = f"Screen {i}"
+                try:
+                    dpi  = int(s.logicalDotsPerInch())
+                except Exception:
+                    dpi = 96
+                is_primary = (s is primary)
+                label = f"{i}: {name}{' (Primary)' if is_primary else ''} — {g.width()}×{g.height()} @({g.x()},{g.y()}) • {dpi} DPI"
+                self.cb_stim_screen.addItem(label)
+                self.cb_gui_screen.addItem(label)
+
+            # restore indices within bounds
+            self.cb_stim_screen.setCurrentIndex(min(self.cfg.stim_screen_index, max(0, self.cb_stim_screen.count()-1)))
+            self.cb_gui_screen.setCurrentIndex(min(self.cfg.gui_screen_index, max(0, self.cb_gui_screen.count()-1)))
+
+        _populate_display_boxes()
+        self.bt_refresh_displays.clicked.connect(_populate_display_boxes)
+
+        row_disp = QtWidgets.QHBoxLayout()
+        row_disp.addWidget(self.cb_stim_screen)
+        row_disp.addWidget(self.bt_refresh_displays)
+
+        self.cb_full=QtWidgets.QCheckBox("Borderless fullscreen (F11-style)")
+        self.cb_full.setChecked(self.cfg.stim_fullscreen)
         self.cb_prewarm=QtWidgets.QCheckBox("Pre-warm stimulus window at launch"); self.cb_prewarm.setChecked(self.cfg.prewarm_stim)
-        dl.addRow("Stimulus display screen:", self.cb_stim_screen)
+
+        dl.addRow("Stimulus display screen:", row_disp)
         dl.addRow("GUI display screen:", self.cb_gui_screen)
         dl.addRow(self.cb_full)
         dl.addRow(self.cb_prewarm)
@@ -981,9 +1209,9 @@ class SettingsGUI(QtWidgets.QWidget):
             adv_layout.addRow(cb_hwtrig)
             adv_frame.setVisible(False)
             btn_adv=QtWidgets.QPushButton("Advanced…")
-            def _toggle_adv(checked=False, f=adv_frame):
+            def _toggle_adv(checked=False, f=adv_frame, b=btn_adv):
                 f.setVisible(not f.isVisible())
-                btn_adv.setText("Hide Advanced" if f.isVisible() else "Advanced…")
+                b.setText("Hide Advanced" if f.isVisible() else "Advanced…")
             btn_adv.clicked.connect(_toggle_adv)
             glb.addWidget(btn_adv,4,1,1,2)
             glb.addWidget(adv_frame,5,1,2,2)
@@ -995,7 +1223,7 @@ class SettingsGUI(QtWidgets.QWidget):
             grid.addWidget(gb, 3+idx, 0, 1, 2)
 
         scroll.setWidget(pane); outer.addWidget(scroll)
-        self._update_footer=QtWidgets.QLabel("Tips: Use 'Refresh Cameras' after plugging devices. PySpin entries show serial + model. Previews are optional; recordings are always full-res.")
+        self._update_footer=QtWidgets.QLabel("Tips: PNG scaling follows the looming radius. If PsychoPy is missing, OpenCV fallback shows the same behavior.")
         outer.addWidget(self._update_footer)
 
     def _apply_selected_preset(self):
@@ -1077,7 +1305,7 @@ class MainApp(QtWidgets.QApplication):
         self.gui=SettingsGUI(self.cfg,self.cam0,self.cam1)
         self.gui.start_experiment.connect(self.start_loop)
         self.gui.stop_experiment.connect(self.stop_loop)
-        self.gui.apply_settings.connect(self.apply_from_gui)
+        self.gui.apply_settings.connect(self.apply_settings_from_gui)
         self.gui.manual_trigger.connect(self.trigger_once)
         self.gui.probe_requested.connect(self.start_probe)
         self.gui.refresh_devices_requested.connect(self.refresh_devices)
@@ -1089,7 +1317,8 @@ class MainApp(QtWidgets.QApplication):
 
         self.aboutToQuit.connect(self.cleanup)
 
-        if self.cfg.prewarm_stim:
+        # Prewarm OR keep-open: create window at launch if either is True
+        if self.cfg.prewarm_stim or self.cfg.stim_keep_window_open:
             QtCore.QTimer.singleShot(300, lambda: self.runner.stim.open_persistent(self.cfg.stim_screen_index,self.cfg.stim_fullscreen,self.cfg.stim_bg_grey))
 
         self._print_startup_summary()
@@ -1136,7 +1365,6 @@ class MainApp(QtWidgets.QApplication):
             ocv_list = enumerate_opencv(6) if HAVE_OPENCV else []
             spin_list = spin_enumerate()
 
-            # Build a flat ordered list of available devices: PySpin first, then OpenCV
             devs=[]
             for item in spin_list:
                 devs.append({"backend":"PySpin","ident":item["serial"],"label":item["display"]})
@@ -1145,7 +1373,6 @@ class MainApp(QtWidgets.QApplication):
                 except Exception: idxnum = 0
                 devs.append({"backend":"OpenCV","ident":str(idxnum),"label":s})
 
-            # Populate each camera's combobox
             for idx, box in enumerate(self.gui.cam_boxes):
                 cb = box["cb_device"]
                 cb.blockSignals(True)
@@ -1156,53 +1383,43 @@ class MainApp(QtWidgets.QApplication):
                     cb.addItem(d["label"], {"backend":d["backend"],"ident":d["ident"]})
                 cb.blockSignals(False)
 
-                # Make selecting a device update backend + ident fields
                 def on_change(i, box=box, cb=cb):
                     data = cb.itemData(i)
                     if isinstance(data, dict) and "backend" in data:
                         box["cb_backend"].setCurrentIndex(0 if data["backend"]=="OpenCV" else 1)
                         box["le_ident"].setText(str(data["ident"]))
-                # Avoid duplicating connections across refreshes:
                 try:
                     cb.currentIndexChanged.disconnect()
                 except Exception:
                     pass
                 cb.currentIndexChanged.connect(on_change)
 
-            # ---- Auto-assign DISTINCT defaults when nothing has been chosen or both are identical ----
-            # Current typed/selected idents:
+            # Auto distinct assignment
             id0 = self.gui.cam_boxes[0]["le_ident"].text().strip()
             id1 = self.gui.cam_boxes[1]["le_ident"].text().strip()
             be0 = "OpenCV" if self.gui.cam_boxes[0]["cb_backend"].currentIndex()==0 else "PySpin"
             be1 = "OpenCV" if self.gui.cam_boxes[1]["cb_backend"].currentIndex()==0 else "PySpin"
 
             changed=False
-            # Helper to set one box to a specific device
             def _set_box(box, backend, ident):
                 nonlocal changed
                 box["cb_backend"].setCurrentIndex(0 if backend=="OpenCV" else 1)
                 box["le_ident"].setText(str(ident))
-                # Try to select matching row in the device combobox (if present)
-                i=_find_item_index(box["cb_device"], backend, ident)
-                if i>=0: box["cb_device"].setCurrentIndex(i)
+                for i in range(box["cb_device"].count()):
+                    data = box["cb_device"].itemData(i)
+                    if isinstance(data, dict) and data.get("backend")==backend and str(data.get("ident"))==str(ident):
+                        box["cb_device"].setCurrentIndex(i); break
                 changed=True
 
-            # Case 1: we have at least two devices and panels are blank or duplicate → assign devs[0], devs[1]
             if len(devs) >= 2 and ((not id0 and not id1) or (be0==be1 and id0==id1)):
                 _set_box(self.gui.cam_boxes[0], devs[0]["backend"], devs[0]["ident"])
                 _set_box(self.gui.cam_boxes[1], devs[1]["backend"], devs[1]["ident"])
-
-            # Case 2: only one device is present and both panels are blank or identical → Cam0 = that device; Cam1 = different index
             elif len(devs) == 1 and ((not id0 and not id1) or (be0==be1 and id0==id1)):
                 d0 = devs[0]
                 _set_box(self.gui.cam_boxes[0], d0["backend"], d0["ident"])
-                # pick a different OpenCV index for cam1 to avoid mirroring (likely becomes synthetic until plugged)
                 fallback_ident = "1" if str(d0["ident"])!="1" else "0"
                 _set_box(self.gui.cam_boxes[1], "OpenCV", fallback_ident)
-
-            # Case 3: one panel empty → fill it with the first device that does NOT match the other panel
             elif len(devs) >= 1:
-                # Refresh latest values
                 id0 = self.gui.cam_boxes[0]["le_ident"].text().strip(); be0 = "OpenCV" if self.gui.cam_boxes[0]["cb_backend"].currentIndex()==0 else "PySpin"
                 id1 = self.gui.cam_boxes[1]["le_ident"].text().strip(); be1 = "OpenCV" if self.gui.cam_boxes[1]["cb_backend"].currentIndex()==0 else "PySpin"
                 if not id0:
@@ -1214,14 +1431,13 @@ class MainApp(QtWidgets.QApplication):
 
             LOGGER.info("[Devices] Refreshed: %d PySpin, %d OpenCV", len(spin_list), len(ocv_list))
 
-            # Apply immediately if we auto-changed anything so previews open the right feeds
             if changed:
-                self.apply_from_gui()
+                self.apply_settings_from_gui()
 
         except Exception as e:
             LOGGER.error("[Devices] Refresh error: %s", e)
 
-    def apply_from_gui(self):
+    def apply_settings_from_gui(self):
         try:
             prev_sim=self.cfg.simulation_mode
             self.cfg.simulation_mode=bool(self.gui.cb_sim.isChecked())
@@ -1233,12 +1449,19 @@ class MainApp(QtWidgets.QApplication):
             self.cfg.video_preset_id=preset_id; self.cfg.fourcc=PRESETS_BY_ID[preset_id]["fourcc"]
             self.cfg.record_duration_s=float(self.gui.sb_rec.value())
 
+            # Stimulus values
             self.cfg.stim_duration_s=float(self.gui.sb_stim_dur.value())
             self.cfg.stim_r0_px=int(self.gui.sb_r0.value())
             self.cfg.stim_r1_px=int(self.gui.sb_r1.value())
             self.cfg.stim_bg_grey=float(self.gui.sb_bg.value())
             self.cfg.lights_delay_s=float(self.gui.sb_light_delay.value())
             self.cfg.stim_delay_s=float(self.gui.sb_stim_delay.value())
+
+            # NEW stimulus selectors
+            self.cfg.stim_kind=str(self.gui.cb_stim_kind.currentData() or "circle")
+            self.cfg.stim_png_path=str(self.gui.le_stim_png.text() or "").strip()
+            self.cfg.stim_png_keep_aspect=bool(self.gui.cb_png_aspect.isChecked())
+            self.cfg.stim_keep_window_open=bool(self.gui.cb_keep_open.isChecked())
 
             self.cfg.stim_screen_index=int(self.gui.cb_stim_screen.currentIndex())
             self.cfg.gui_screen_index=int(self.gui.cb_gui_screen.currentIndex())
@@ -1275,13 +1498,14 @@ class MainApp(QtWidgets.QApplication):
             self.gui.lbl_status.setText("Status: Settings applied.")
             LOGGER.info("[Main] Settings applied")
 
-            if self.cfg.prewarm_stim:
+            # Respect both pre-warm and keep-open for window lifecycle
+            if self.cfg.prewarm_stim or self.cfg.stim_keep_window_open:
                 self.runner.stim.open_persistent(self.cfg.stim_screen_index,self.cfg.stim_fullscreen,self.cfg.stim_bg_grey)
             else:
                 try: self.runner.stim.close()
                 except Exception: pass
         except Exception as e:
-            LOGGER.error("[Main] apply_from_gui error: %s", e)
+            LOGGER.error("[Main] apply_settings_from_gui error: %s", e)
 
     def update_previews(self):
         try:
@@ -1346,8 +1570,8 @@ class MainApp(QtWidgets.QApplication):
         self.in_trial=False
 
     def start_probe(self):
-        try: self.apply_from_gui()
-        except Exception as e: LOGGER.error("[Probe] apply_from_gui failed: %s", e)
+        try: self.apply_settings_from_gui()
+        except Exception as e: LOGGER.error("[Probe] apply failed: %s", e)
         self.preview_timer.stop()
         self.gui.lbl_status.setText("Status: Probing max FPS…")
         def worker():
@@ -1390,7 +1614,8 @@ class MainApp(QtWidgets.QApplication):
         LOGGER.info("[Main] Cleanup done")
 
 def main():
-    app=MainApp(sys.argv); return app.exec_()
+    app = MainApp(sys.argv)
+    return app.exec_()  # or app.exec() on newer PyQt5
 
 if __name__=="__main__":
     sys.exit(main())
