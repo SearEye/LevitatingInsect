@@ -1,6 +1,16 @@
 # FlyAPI.py
 # FlyPy — Unified Trigger → Cameras + Lights + Looming Stimulus
-# v1.36.1 (merged, fixed: clearer display choices, borderless fullscreen, reliable reopen)
+# v1.36.2 (fixes: stimulus reset button; robust serial trigger; no auto-sim fallback)
+#
+# Changes in 1.36.2 (kept everything else the same):
+# - Display control: added "Open/Reset Stimulus Window" button (Display & Windows panel)
+#   to (re)open the stimulus on the selected screen, borderless/fullscreen as chosen.
+# - Serial trigger robustness: removed the implicit fallback-to-simulation when serial
+#   open fails; added input-buffer flush on open; strict token match ('T' line only);
+#   and debouncing (min interval) to prevent spurious triggers.
+#
+# NOTE: The rest of the program logic, GUI, cameras, stimulus options, and logging
+# remain unchanged from v1.36.1 unless directly required for the fixes above.
 
 import os, sys, time, csv, atexit, threading, queue, logging, shutil, importlib
 from collections import deque
@@ -10,15 +20,15 @@ from typing import Optional, Tuple, List, Dict
 import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
 
-__version__ = "1.36.1"
+__version__ = "1.36.2"
 
 # -------------------- Logging --------------------
-LOG_DIR_DEFAULT = r"C:\Users\Murpheylab\Desktop\LevitatingInsect-main\logs"
+LOG_DIR_DEFAULT = r"C:\\Users\\Murpheylab\\Desktop\\LevitatingInsect-main\\logs"
 def ensure_dir(p:str): os.makedirs(p, exist_ok=True)
 def now_stamp()->str: return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 def day_stamp()->str: return datetime.now().strftime("%Y%m%d")
 
-def init_logging()->tuple[logging.Logger, str]:
+def init_logging():
     log_dir = LOG_DIR_DEFAULT if os.name=="nt" else os.path.join(os.getcwd(),"logs")
     ensure_dir(log_dir)
     start_stamp = now_stamp()
@@ -158,65 +168,132 @@ class Config:
         self.cam0_hw_trigger=False; self.cam1_hw_trigger=False
         self.cam_async_writer=True
 
+        # Serial trigger debounce (to avoid spurious trials)
+        self.min_trigger_interval_s = 0.30  # 300 ms
+
 # -------------------- Hardware Bridge --------------------
 class HardwareBridge:
+    """
+    Serial trigger reader. Only starts trials on explicit 'T' line from Arduino.
+    No longer falls back to simulation if serial open fails.
+    """
     def __init__(self,cfg:Config,port:str=None,baud:int=115200):
-        self.cfg=cfg; self.simulated=cfg.simulation_mode; self.port=port; self.baud=baud
-        self._opened=False; self._last_sim=time.time(); self.ser=None
+        self.cfg=cfg
+        self.port=port
+        self.baud=baud
+        self.ser=None
+        self._opened=False
+        self._last_sim=time.time()
+        self._pyserial_ok=True
+        self._last_trigger_time=0.0
+
+        # Simulation controlled strictly by cfg.simulation_mode now
+        self.simulated = bool(cfg.simulation_mode)
+
+        try:
+            import serial  # noqa: F401
+        except Exception as e:
+            self._pyserial_ok=False
+            LOGGER.info("[HW] pyserial not available (%s); serial triggers disabled", e)
+
     def _autodetect_port(self)->Optional[str]:
+        if not self._pyserial_ok:
+            return None
         try:
             import serial.tools.list_ports
             for p in serial.tools.list_ports.comports():
                 vid=f"{p.vid:04X}" if p.vid is not None else None
                 pid=f"{p.pid:04X}" if p.pid is not None else None
-                if vid=="1A86" and pid=="7523": return p.device
+                if vid=="1A86" and pid=="7523": return p.device  # CH340
             for p in serial.tools.list_ports.comports():
                 d=(p.description or "").lower()
-                if "ch340" in d or "uno" in d or "elegoo" in d: return p.device
+                if "ch340" in d or "uno" in d or "elegoo" in d or "arduino" in d: return p.device
         except Exception as e:
             LOGGER.debug("Port autodetect failed: %s", e)
         return None
+
     def _open_if_needed(self):
-        if self.simulated or self._opened: return
-        self._opened=True
+        if self.simulated:  # sim mode won't use serial
+            return
+        if not self._pyserial_ok:
+            return
+        if self._opened and self.ser:
+            return
         try:
             import serial
-            if not self.port: self.port=self._autodetect_port()
-            if self.port:
-                try:
-                    self.ser=serial.Serial(self.port,self.baud,timeout=0.01)
-                    wait_s(1.2)
-                    LOGGER.info("[HW] Serial open: %s @ %d", self.port, self.baud)
-                except Exception as e:
-                    LOGGER.warning("[HW] Open failed: %s → simulation", e); self.simulated=True
-            else:
-                LOGGER.info("[HW] No CH340/UNO port found → simulation"); self.simulated=True
+        except Exception:
+            return
+        try:
+            if not self.port:
+                self.port=self._autodetect_port()
+            if not self.port:
+                return
+            self.ser=serial.Serial(self.port,self.baud,timeout=0.01)
+            # Flush any garbage to avoid stray 'T' at startup
+            try:
+                self.ser.reset_input_buffer()
+            except Exception:
+                pass
+            self._opened=True
+            LOGGER.info("[HW] Serial open: %s @ %d", self.port, self.baud)
         except Exception as e:
-            LOGGER.info("[HW] pyserial not available (%s) → simulation", e); self.simulated=True
+            self.ser=None
+            self._opened=False
+            LOGGER.warning("[HW] Could not open serial (%s). Will keep trying; no auto-sim.", e)
+
     def check_trigger(self)->bool:
+        # Simulation mode: periodic triggers
         if self.simulated:
             now=time.time()
             if now-self._last_sim>=self.cfg.sim_trigger_interval:
-                self._last_sim=now; LOGGER.info("[HW] (Sim) Trigger"); return True
+                if now - self._last_trigger_time >= self.cfg.min_trigger_interval_s:
+                    self._last_sim=now
+                    self._last_trigger_time=now
+                    LOGGER.info("[HW] (Sim) Trigger")
+                    return True
+            return False
+
+        # Serial mode: strict 'T' line; debounced
+        if not self._pyserial_ok:
             return False
         self._open_if_needed()
+        if not self.ser:
+            return False
+
         try:
-            if self.ser and self.ser.in_waiting:
-                line=self.ser.readline().decode(errors="ignore").strip()
-                if line=="T": return True
-        except Exception as e: LOGGER.warning("[HW] Read error: %s", e)
+            # Read all available complete lines; accept trigger only for exact 'T'
+            fired=False
+            while self.ser.in_waiting:
+                line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                if line == "T":
+                    fired=True
+                # ignore everything else
+            if fired:
+                now = time.time()
+                if now - self._last_trigger_time >= self.cfg.min_trigger_interval_s:
+                    self._last_trigger_time = now
+                    return True
+        except Exception as e:
+            LOGGER.warning("[HW] Read error: %s", e)
         return False
+
     def _send(self,text:str):
+        if self.simulated:
+            LOGGER.info("[HW] (Sim) SEND: %s", text); return
+        if not self._pyserial_ok:
+            return
         self._open_if_needed()
-        if self.simulated or not self.ser: LOGGER.info("[HW] (Sim) SEND: %s", text); return
+        if not self.ser:
+            return
         try: self.ser.write((text.strip()+"\n").encode("utf-8",errors="ignore"))
         except Exception as e: LOGGER.warning("[HW] Write error: %s", e)
+
     def mark_start(self): self._send("MARK START")
     def mark_end(self):   self._send("MARK END")
     def lights_on(self):  self._send("LIGHT ON")
     def lights_off(self): self._send("LIGHT OFF")
     def close(self):
-        if not self.simulated and self.ser:
+        if self.ser:
             try: self.ser.close()
             except Exception: pass
         self.ser=None; self._opened=False
@@ -258,7 +335,7 @@ class OpenCVCamera(BaseCamera):
         if frame.ndim==2:
             frame=cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         return frame
-    def frame_size(self): 
+    def frame_size(self):
         if self.cap: return (int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640), int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480))
         return (640,480)
     def stop_acquisition(self): pass
@@ -646,14 +723,14 @@ class CameraNode:
         self._open_if_needed()
         frames=0; drops=0
         t0=time.time()
-        try: 
+        try:
             if self.dev is not None: self.dev.start_acquisition()
         except Exception: pass
         while (time.time()-t0)<seconds:
             img=None if (self.synthetic or self.dev is None) else self.dev.get_frame()
             if img is None: drops+=1
             else: frames+=1
-        try: 
+        try:
             if self.dev is not None: self.dev.stop_acquisition()
         except Exception: pass
         elapsed=max(1e-6, time.time()-t0)
@@ -671,7 +748,7 @@ class LoomingStim:
     - PsychoPy first (visual.Window/ImageStim/Circle), OpenCV fallback if PsychoPy not present.
     - Supports "circle" OR "png" (scaled like circle diameter), with keep-aspect option.
     - Can keep the stimulus window open persistently.
-    - FIXES: true borderless fullscreen; reliable re-open per trial when keep-open is OFF.
+    - Borderless fullscreen support; reliable re-open through .close() + .open_persistent().
     """
     def __init__(self,cfg:Config):
         self.cfg=cfg
@@ -727,7 +804,8 @@ class LoomingStim:
                 )
             except Exception:
                 pass
-            bg=int(max(0,min(255,int(bg_grey*255)))); frame=np.full((self._cv_size[1],self._cv_size[0],3),bg,dtype=np.uint8)
+            bg=int(max(0,min(255,int(bg_grey*255))))
+            frame=np.full((self._cv_size[1],self._cv_size[0],3),bg,dtype=np.uint8)
             cv2.imshow(self._cv_window_name,frame); cv2.waitKey(1)
         except Exception as e: LOGGER.warning("[Stim] OpenCV window error: %s", e); self._cv_open=False
 
@@ -1014,6 +1092,7 @@ class SettingsGUI(QtWidgets.QWidget):
     start_experiment=QtCore.pyqtSignal(); stop_experiment=QtCore.pyqtSignal(); apply_settings=QtCore.pyqtSignal(); manual_trigger=QtCore.pyqtSignal()
     probe_requested=QtCore.pyqtSignal()
     refresh_devices_requested=QtCore.pyqtSignal()
+    reset_stimulus_requested=QtCore.pyqtSignal()  # NEW: reset/open stimulus button
 
     def __init__(self,cfg:Config,cam0:CameraNode,cam1:CameraNode):
         super().__init__()
@@ -1127,11 +1206,12 @@ class SettingsGUI(QtWidgets.QWidget):
         self.cb_stim_kind.currentIndexChanged.connect(_toggle_png_controls)
         _toggle_png_controls()
 
-        # Display & Windows (clarified + refresh)
+        # Display & Windows
         disp=QtWidgets.QGroupBox("Display & Windows")
         dl=QtWidgets.QFormLayout(disp)
         self.cb_stim_screen=QtWidgets.QComboBox(); self.cb_gui_screen=QtWidgets.QComboBox()
         self.bt_refresh_displays=QtWidgets.QPushButton("Refresh Displays")
+        self.bt_reset_stim=QtWidgets.QPushButton("Open/Reset Stimulus Window")  # NEW button
 
         def _populate_display_boxes():
             self.cb_stim_screen.clear(); self.cb_gui_screen.clear()
@@ -1158,10 +1238,12 @@ class SettingsGUI(QtWidgets.QWidget):
 
         _populate_display_boxes()
         self.bt_refresh_displays.clicked.connect(_populate_display_boxes)
+        self.bt_reset_stim.clicked.connect(self.reset_stimulus_requested.emit)  # signal out
 
         row_disp = QtWidgets.QHBoxLayout()
         row_disp.addWidget(self.cb_stim_screen)
         row_disp.addWidget(self.bt_refresh_displays)
+        row_disp.addWidget(self.bt_reset_stim)  # add button inline
 
         self.cb_full=QtWidgets.QCheckBox("Borderless fullscreen (F11-style)")
         self.cb_full.setChecked(self.cfg.stim_fullscreen)
@@ -1309,6 +1391,7 @@ class MainApp(QtWidgets.QApplication):
         self.gui.manual_trigger.connect(self.trigger_once)
         self.gui.probe_requested.connect(self.start_probe)
         self.gui.refresh_devices_requested.connect(self.refresh_devices)
+        self.gui.reset_stimulus_requested.connect(self.reset_stimulus_window)  # NEW: handle reset/open
 
         self.show_scaled_gui(self.cfg.gui_screen_index)
 
@@ -1490,9 +1573,8 @@ class MainApp(QtWidgets.QApplication):
                     self.cfg.cam1_width, self.cfg.cam1_height = adv["width"], adv["height"]
                     self.cfg.cam1_exposure_us, self.cfg.cam1_hw_trigger = adv["exposure_us"], adv["hw_trigger"]
 
-            if prev_sim!=self.cfg.simulation_mode:
-                if self.cfg.simulation_mode: self.hw.close(); self.hw.simulated=True
-                else: self.hw.simulated=False; self.hw._opened=False; self.hw.ser=None
+            # Update serial bridge behavior per sim flag (no auto-sim fallback on failure)
+            self.hw.simulated = bool(self.cfg.simulation_mode)
 
             ensure_dir(self.cfg.output_root)
             self.gui.lbl_status.setText("Status: Settings applied.")
@@ -1506,6 +1588,19 @@ class MainApp(QtWidgets.QApplication):
                 except Exception: pass
         except Exception as e:
             LOGGER.error("[Main] apply_settings_from_gui error: %s", e)
+
+    def reset_stimulus_window(self):
+        """Open/Reset stimulus window on the currently selected display and mode."""
+        try:
+            self.apply_settings_from_gui()
+        except Exception:
+            pass
+        try:
+            self.runner.stim.close()
+        except Exception:
+            pass
+        self.runner.stim.open_persistent(self.cfg.stim_screen_index, self.cfg.stim_fullscreen, self.cfg.stim_bg_grey)
+        self.gui.lbl_status.setText("Status: Stimulus window reset.")
 
     def update_previews(self):
         try:
