@@ -1,16 +1,17 @@
 # FlyAPI.py
 # FlyPy — Unified Trigger → Cameras + Lights + Looming Stimulus
-# v1.36.2 (fixes: stimulus reset button; robust serial trigger; no auto-sim fallback)
+# v1.36.3 (adds: Circle Stimulus Presets dropdown)
 #
-# Changes in 1.36.2 (kept everything else the same):
-# - Display control: added "Open/Reset Stimulus Window" button (Display & Windows panel)
-#   to (re)open the stimulus on the selected screen, borderless/fullscreen as chosen.
-# - Serial trigger robustness: removed the implicit fallback-to-simulation when serial
-#   open fails; added input-buffer flush on open; strict token match ('T' line only);
-#   and debouncing (min interval) to prevent spurious triggers.
+# 1.36.3:
+# - NEW: "Circle Preset" dropdown in Stimulus & Timing panel.
+#         Selecting a preset auto-fills duration, start radius, end radius, and background shade,
+#         and forces Stimulus Type = Circle. Nothing else changed.
 #
-# NOTE: The rest of the program logic, GUI, cameras, stimulus options, and logging
-# remain unchanged from v1.36.1 unless directly required for the fixes above.
+# 1.36.2 (previous):
+# - Display control: "Open/Reset Stimulus Window" button (Display & Windows panel).
+# - Serial trigger robustness: no auto-sim fallback; input buffer flush; strict 'T' token; debounce.
+#
+# NOTE: Everything outside the above additions remains as in v1.36.2.
 
 import os, sys, time, csv, atexit, threading, queue, logging, shutil, importlib
 from collections import deque
@@ -20,7 +21,7 @@ from typing import Optional, Tuple, List, Dict
 import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
 
-__version__ = "1.36.2"
+__version__ = "1.36.3"
 
 # -------------------- Logging --------------------
 LOG_DIR_DEFAULT = r"C:\\Users\\Murpheylab\\Desktop\\LevitatingInsect-main\\logs"
@@ -126,6 +127,17 @@ VIDEO_PRESETS=[
 ]
 PRESETS_BY_ID={p["id"]:p for p in VIDEO_PRESETS}
 def default_preset_id()->str: return "avi_mjpg"
+
+# -------------------- Circle Stimulus Presets (NEW) --------------------
+# Each preset sets: duration (s), start radius (px), end radius (px), background shade (0..1)
+CIRCLE_PRESETS = [
+    {"label": "Standard (0.50 s, r0=8 → r1=300, bg=0.0)", "dur": 0.50, "r0": 8,  "r1": 300, "bg": 0.0},
+    {"label": "Fast (0.25 s, r0=8 → r1=300, bg=0.0)",     "dur": 0.25, "r0": 8,  "r1": 300, "bg": 0.0},
+    {"label": "Slow (1.00 s, r0=8 → r1=300, bg=0.0)",     "dur": 1.00, "r0": 8,  "r1": 300, "bg": 0.0},
+    {"label": "Large Final (0.50 s, r0=8 → r1=400, bg=0.0)","dur": 0.50, "r0": 8,"r1": 400, "bg": 0.0},
+    {"label": "Small Start (0.50 s, r0=4 → r1=240, bg=0.0)","dur": 0.50, "r0": 4,"r1": 240, "bg": 0.0},
+    {"label": "Bright BG (0.50 s, r0=8 → r1=300, bg=1.0)","dur": 0.50, "r0": 8,  "r1": 300, "bg": 1.0},
+]
 
 # -------------------- Config --------------------
 class Config:
@@ -869,8 +881,8 @@ class LoomingStim:
         png_path = (self.cfg.stim_png_path or "").strip()
 
         # Window lifecycle:
-        # - If keep_open: ensure window exists (recreate if lost)
-        # - If NOT keep_open: force a fresh window each trial
+        # - If keep-open: ensure window exists (recreate if lost)
+        # - If NOT keep-open: force a fresh window each trial
         if self.cfg.stim_keep_window_open:
             self.open_persistent(screen_idx, fullscreen, bg_grey)
         else:
@@ -1181,6 +1193,12 @@ class SettingsGUI(QtWidgets.QWidget):
         self.cb_keep_open=QtWidgets.QCheckBox("Keep stimulus window open while running")
         self.cb_keep_open.setChecked(bool(self.cfg.stim_keep_window_open))
 
+        # NEW: Circle Presets dropdown
+        self.cb_circle_preset = QtWidgets.QComboBox()
+        for preset in CIRCLE_PRESETS:
+            self.cb_circle_preset.addItem(preset["label"], preset)
+
+        sl.addRow("Circle Preset:", self.cb_circle_preset)  # <— NEW row (non-destructive)
         sl.addRow("Stimulus total time (s):", self.sb_stim_dur)
         sl.addRow("Stimulus Start Size (radius px):", self.sb_r0)
         sl.addRow("Stimulus End Size (radius px):", self.sb_r1)
@@ -1205,6 +1223,17 @@ class SettingsGUI(QtWidgets.QWidget):
             self.cb_png_aspect.setEnabled(is_png)
         self.cb_stim_kind.currentIndexChanged.connect(_toggle_png_controls)
         _toggle_png_controls()
+
+        # Apply circle preset when selection changes (forces Stimulus Type = Circle)
+        def _apply_circle_preset():
+            data = self.cb_circle_preset.currentData()
+            if isinstance(data, dict):
+                self.cb_stim_kind.setCurrentIndex(0)  # Circle
+                self.sb_stim_dur.setValue(float(data.get("dur", self.sb_stim_dur.value())))
+                self.sb_r0.setValue(int(data.get("r0", self.sb_r0.value())))
+                self.sb_r1.setValue(int(data.get("r1", self.sb_r1.value())))
+                self.sb_bg.setValue(float(data.get("bg", self.sb_bg.value())))
+        self.cb_circle_preset.currentIndexChanged.connect(_apply_circle_preset)
 
         # Display & Windows
         disp=QtWidgets.QGroupBox("Display & Windows")
