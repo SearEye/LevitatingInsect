@@ -169,9 +169,9 @@ class Config:
         self.gui_screen_index=0
 
         # Stimulus type
-        self.stim_kind="circle"              # "circle" | "png"
-        self.stim_png_path=""                # filesystem path to .png
-        self.stim_png_keep_aspect=True       # keep PNG aspect when scaling
+        self.stim_kind="circle"              # "circle" | "png" (image)
+        self.stim_png_path=""                # filesystem path to image (png/jpg/jpeg/bmp/gif/tif/tiff/webp)
+        self.stim_png_keep_aspect=True       # keep image aspect when scaling
         self.stim_keep_window_open=True      # keep stimulus window persistent during run
 
         # Cameras
@@ -831,7 +831,7 @@ class CameraNode:
         except Exception: pass
         self.dev=None; self.synthetic=False
 
-# -------------------- Stimulus (unchanged since 1.36.3) --------------------
+# -------------------- Stimulus (unchanged since 1.36.3, with image-format support) --------------------
 class LoomingStim:
     def __init__(self,cfg:Config):
         self.cfg=cfg
@@ -910,6 +910,7 @@ class LoomingStim:
         self._cv_png=None; self._cv_png_path=""
 
     def _pp_get_png(self, path:str):
+        # NOTE: despite the function name, this accepts multiple formats (png/jpg/jpeg/bmp/gif/tif/tiff/webp)
         if not path: return None
         if path==self._pp_png_path and self._pp_png is not None:
             return self._pp_png
@@ -917,10 +918,11 @@ class LoomingStim:
             self._pp_png = visual.ImageStim(self._pp_win, image=path, units='pix', interpolate=True)
             self._pp_png_path = path
         except Exception as e:
-            LOGGER.warning("[Stim] PsychoPy PNG load failed: %s", e); self._pp_png=None; self._pp_png_path=""
+            LOGGER.warning("[Stim] PsychoPy image load failed: %s", e); self._pp_png=None; self._pp_png_path=""
         return self._pp_png
 
     def _cv_get_png(self, path:str):
+        # NOTE: despite the function name, this accepts multiple formats (png/jpg/jpeg/bmp/gif/tif/tiff/webp)
         if not HAVE_OPENCV or not path: return None
         if path==self._cv_png_path and self._cv_png is not None:
             return self._cv_png
@@ -930,13 +932,13 @@ class LoomingStim:
             self._cv_png = img
             self._cv_png_path = path
         except Exception as e:
-            LOGGER.warning("[Stim] OpenCV PNG load failed: %s", e); self._cv_png=None; self._cv_png_path=""
+            LOGGER.warning("[Stim] OpenCV image load failed: %s", e); self._cv_png=None; self._cv_png_path=""
         return self._cv_png
 
     def run(self,duration_s:float,r0:int,r1:int,bg_grey:float,screen_idx:int,fullscreen:bool):
         LOGGER.info("[Stim] Looming start (%s)", self.cfg.stim_kind)
         kind = (self.cfg.stim_kind or "circle").strip().lower()
-        use_png = (kind == "png")
+        use_png = (kind == "png")  # "png" kind means "image" (any supported type)
         png_path = (self.cfg.stim_png_path or "").strip()
 
         if self.cfg.stim_keep_window_open:
@@ -958,7 +960,7 @@ class LoomingStim:
                 if use_png:
                     imgStim = self._pp_get_png(png_path)
                     if imgStim is None:
-                        LOGGER.warning("[Stim] PNG unavailable → fallback to circle")
+                        LOGGER.warning("[Stim] Image unavailable → fallback to circle")
                         use_png=False
                         dot=visual.Circle(self._pp_win,radius=r0,fillColor='black',lineColor='black')
 
@@ -1005,7 +1007,7 @@ class LoomingStim:
             if use_png:
                 png = self._cv_get_png(png_path)
                 if png is None:
-                    LOGGER.warning("[Stim] PNG unavailable in OpenCV → fallback to circle"); use_png=False
+                    LOGGER.warning("[Stim] Image unavailable in OpenCV → fallback to circle"); use_png=False
 
             while True:
                 t=time.time()-t0
@@ -1149,7 +1151,7 @@ def enumerate_opencv(max_index:int=6)->List[str]:
             except Exception: pass
     return found
 
-# -------------------- GUI (unchanged except existing features) --------------------
+# -------------------- GUI (labels updated to “Image”, logic unchanged) --------------------
 class SettingsGUI(QtWidgets.QWidget):
     start_experiment=QtCore.pyqtSignal(); stop_experiment=QtCore.pyqtSignal(); apply_settings=QtCore.pyqtSignal(); manual_trigger=QtCore.pyqtSignal()
     probe_requested=QtCore.pyqtSignal()
@@ -1212,7 +1214,7 @@ class SettingsGUI(QtWidgets.QWidget):
         grid.addWidget(gen, 0, 0, 1, 2)
         btn_browse.clicked.connect(self._browse)
 
-        stim=QtWidgets.QGroupBox("Stimulus & Timing (Growing dot / PNG looming)")
+        stim=QtWidgets.QGroupBox("Stimulus & Timing (Growing dot / Image looming)")
         sl=QtWidgets.QFormLayout(stim)
         self.sb_stim_dur=QtWidgets.QDoubleSpinBox(); self.sb_stim_dur.setRange(0.05,60.0); self.sb_stim_dur.setDecimals(3); self.sb_stim_dur.setValue(self.cfg.stim_duration_s)
         self.sb_r0=QtWidgets.QSpinBox(); self.sb_r0.setRange(1,4000); self.sb_r0.setValue(self.cfg.stim_r0_px)
@@ -1223,16 +1225,16 @@ class SettingsGUI(QtWidgets.QWidget):
 
         self.cb_stim_kind=QtWidgets.QComboBox()
         self.cb_stim_kind.addItem("Circle", "circle")
-        self.cb_stim_kind.addItem("PNG (scaled)", "png")
+        self.cb_stim_kind.addItem("Image (scaled)", "png")
         self.cb_stim_kind.setCurrentIndex(0 if (self.cfg.stim_kind or "circle")!="png" else 1)
 
         self.le_stim_png=QtWidgets.QLineEdit(self.cfg.stim_png_path or "")
-        self.le_stim_png.setPlaceholderText("Path to .png (used when Stimulus Type = PNG)")
+        self.le_stim_png.setPlaceholderText("Path to image file (PNG/JPG/JPEG/BMP/GIF/TIF/TIFF/WEBP)")
         self.bt_stim_png=QtWidgets.QPushButton("Browse…")
         row_png=QtWidgets.QHBoxLayout(); row_png.addWidget(self.le_stim_png); row_png.addWidget(self.bt_stim_png)
         png_wrap=QtWidgets.QWidget(); png_wrap.setLayout(row_png)
 
-        self.cb_png_aspect=QtWidgets.QCheckBox("PNG: keep aspect")
+        self.cb_png_aspect=QtWidgets.QCheckBox("Image: keep aspect")
         self.cb_png_aspect.setChecked(bool(self.cfg.stim_png_keep_aspect))
 
         self.cb_keep_open=QtWidgets.QCheckBox("Keep stimulus window open while running")
@@ -1250,13 +1252,18 @@ class SettingsGUI(QtWidgets.QWidget):
         sl.addRow("Delay: record → lights ON (s):", self.sb_light_delay)
         sl.addRow("Delay: record → stimulus ON (s):", self.sb_stim_delay)
         sl.addRow("Stimulus Type:", self.cb_stim_kind)
-        sl.addRow("Stimulus PNG:", png_wrap)
+        sl.addRow("Stimulus Image:", png_wrap)
         sl.addRow(self.cb_png_aspect)
         sl.addRow(self.cb_keep_open)
         grid.addWidget(stim, 1, 0, 1, 2)
 
         def _browse_png():
-            p, _ = QtWidgets.QFileDialog.getOpenFileName(self,"Select stimulus PNG", self.le_stim_png.text() or os.getcwd(),"PNG Images (*.png)")
+            p, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Select stimulus image",
+                self.le_stim_png.text() or os.getcwd(),
+                "Image Files (*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp);;All Files (*)"
+            )
             if p: self.le_stim_png.setText(p)
         self.bt_stim_png.clicked.connect(_browse_png)
 
