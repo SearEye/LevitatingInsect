@@ -127,6 +127,113 @@ def default_preset_id()->str: return "avi_mjpg"
 # -------------------- Saved (User) Presets --------------------
 _USER_PRESETS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flypy_user_presets.json")
 
+# Built-in presets shipped with this script (always shown in the dropdown).
+# Notes:
+# - These are merged with user-saved presets from flypy_user_presets.json.
+# - Built-ins cannot be deleted from the UI (you can "Save As..." to customize).
+BUILTIN_USER_PRESETS: Dict[str, dict] = {
+    "Default — Looming Dot (fast start)": {
+        "simulation_mode": False,
+        "sim_trigger_interval": 5.0,
+        "output_root": "FlyPy_Output",
+        "prewarm_stim": True,
+        "video_preset_id": default_preset_id(),
+        "record_duration_s": 3.0,
+        "stim_type": "dot",
+        "stim_image_path": "",
+        "stim_duration_s": 1.5,
+        "stim_r0_px": 8,
+        "stim_r1_px": 240,
+        "stim_bg_grey": 1.0,
+        "lights_delay_s": 0.0,
+        "stim_delay_s": 0.0,
+        "stim_screen_index": 0,
+        "stim_fullscreen": False,
+        "gui_screen_index": 0,
+        "cam0_backend": "PySpin",
+        "cam0_id": "",
+        "cam0_target_fps": 522,
+        "cam0_width": 0,
+        "cam0_height": 0,
+        "cam0_exposure_us": 1500,
+        "cam0_hw_trigger": False,
+        "cam1_backend": "PySpin",
+        "cam1_id": "",
+        "cam1_target_fps": 522,
+        "cam1_width": 0,
+        "cam1_height": 0,
+        "cam1_exposure_us": 1500,
+        "cam1_hw_trigger": False,
+    },
+    "Default — Looming Image (needs file path)": {
+        "simulation_mode": False,
+        "sim_trigger_interval": 5.0,
+        "output_root": "FlyPy_Output",
+        "prewarm_stim": True,
+        "video_preset_id": default_preset_id(),
+        "record_duration_s": 3.0,
+        "stim_type": "image",
+        "stim_image_path": "",  # set this to your PNG/JPG path after loading
+        "stim_duration_s": 1.5,
+        "stim_r0_px": 40,
+        "stim_r1_px": 600,
+        "stim_bg_grey": 1.0,
+        "lights_delay_s": 0.0,
+        "stim_delay_s": 0.0,
+        "stim_screen_index": 0,
+        "stim_fullscreen": False,
+        "gui_screen_index": 0,
+        "cam0_backend": "PySpin",
+        "cam0_id": "",
+        "cam0_target_fps": 522,
+        "cam0_width": 0,
+        "cam0_height": 0,
+        "cam0_exposure_us": 1500,
+        "cam0_hw_trigger": False,
+        "cam1_backend": "PySpin",
+        "cam1_id": "",
+        "cam1_target_fps": 522,
+        "cam1_width": 0,
+        "cam1_height": 0,
+        "cam1_exposure_us": 1500,
+        "cam1_hw_trigger": False,
+    },
+    "Opto Example — Lights@0.25s, Loom@0.50s": {
+        "simulation_mode": False,
+        "sim_trigger_interval": 5.0,
+        "output_root": "FlyPy_Output",
+        "prewarm_stim": True,
+        "video_preset_id": default_preset_id(),
+        "record_duration_s": 3.0,
+        "stim_type": "dot",
+        "stim_image_path": "",
+        "stim_duration_s": 1.5,
+        "stim_r0_px": 8,
+        "stim_r1_px": 240,
+        "stim_bg_grey": 1.0,
+        "lights_delay_s": 0.25,
+        "stim_delay_s": 0.50,
+        "stim_screen_index": 0,
+        "stim_fullscreen": False,
+        "gui_screen_index": 0,
+        "cam0_backend": "PySpin",
+        "cam0_id": "",
+        "cam0_target_fps": 522,
+        "cam0_width": 0,
+        "cam0_height": 0,
+        "cam0_exposure_us": 1500,
+        "cam0_hw_trigger": False,
+        "cam1_backend": "PySpin",
+        "cam1_id": "",
+        "cam1_target_fps": 522,
+        "cam1_width": 0,
+        "cam1_height": 0,
+        "cam1_exposure_us": 1500,
+        "cam1_hw_trigger": False,
+    },
+}
+
+
 def _load_user_presets() -> Dict[str, dict]:
     """Return {name: preset_dict}. Never raises."""
     try:
@@ -792,6 +899,33 @@ class LoomingStim:
                 try: self._pp_win.flip()
                 except Exception: pass
         else: self._cv_window(screen_idx,bg_grey)
+    def reset_window(self):
+        """Force-close and forget the stimulus window so it will be recreated next time.
+
+        Use this if the stimulus window gets stuck / moved to the wrong screen / needs a relaunch.
+        """
+        # PsychoPy
+        try:
+            if self._pp_win is not None:
+                try:
+                    self._pp_win.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._pp_win = None
+        self._pp_cfg = None
+        # ImageStim depends on the active PsychoPy window
+        self._img_pp = None
+
+        # OpenCV
+        if self._cv_open and HAVE_OPENCV:
+            try:
+                cv2.destroyWindow(self._cv_window_name)
+            except Exception:
+                pass
+        self._cv_open = False
+
     def run(self,duration_s:float,r0:int,r1:int,bg_grey:float,screen_idx:int,fullscreen:bool):
         LOGGER.info("[Stim] Looming start")
         stim_type = (getattr(self.cfg, "stim_type", "dot") or "dot").strip().lower()
@@ -1001,6 +1135,7 @@ class SettingsGUI(QtWidgets.QWidget):
     start_experiment=QtCore.pyqtSignal(); stop_experiment=QtCore.pyqtSignal(); apply_settings=QtCore.pyqtSignal(); manual_trigger=QtCore.pyqtSignal()
     probe_requested=QtCore.pyqtSignal()
     refresh_devices_requested=QtCore.pyqtSignal()
+    stim_window_reset_requested = QtCore.pyqtSignal()
 
     preset_load_requested = QtCore.pyqtSignal(str)
     preset_save_requested = QtCore.pyqtSignal(str, object)  # name, dict
@@ -1131,6 +1266,10 @@ class SettingsGUI(QtWidgets.QWidget):
         dl.addRow("GUI display screen:", self.cb_gui_screen)
         dl.addRow(self.cb_full)
         dl.addRow(self.cb_prewarm)
+
+        self.bt_stim_reset = QtWidgets.QPushButton("Reset / Relaunch Stimulus Window")
+        dl.addRow(self.bt_stim_reset)
+        self.bt_stim_reset.clicked.connect(self.stim_window_reset_requested.emit)
         grid.addWidget(disp, 2, 0, 1, 2)
 
         # Camera panels
@@ -1402,9 +1541,12 @@ class MainApp(QtWidgets.QApplication):
         self.gui.manual_trigger.connect(self.trigger_once)
         self.gui.probe_requested.connect(self.start_probe)
         self.gui.refresh_devices_requested.connect(self.refresh_devices)
+        self.gui.stim_window_reset_requested.connect(self.reset_stimulus_window)
 
         # User presets (saved to flypy_user_presets.json next to this script)
-        self.user_presets: Dict[str, dict] = _load_user_presets()
+        self.user_presets: Dict[str, dict] = dict(BUILTIN_USER_PRESETS)
+        # User-saved presets override built-ins on name collision
+        self.user_presets.update(_load_user_presets())
         self.gui.set_user_preset_names(sorted(self.user_presets.keys(), key=lambda s: s.lower()))
         self.gui.preset_load_requested.connect(self._on_preset_load)
         self.gui.preset_save_requested.connect(self._on_preset_save)
@@ -1621,6 +1763,17 @@ class MainApp(QtWidgets.QApplication):
         except Exception as e:
             LOGGER.error("[Main] apply_from_gui error: %s", e)
 
+def reset_stimulus_window(self):
+    """Close + relaunch the stimulus window (useful if it got stuck/off-screen)."""
+    try:
+        self.runner.stim.reset_window()
+        if self.cfg.prewarm_stim:
+            self.runner.stim.open_persistent(self.cfg.stim_screen_index, self.cfg.stim_fullscreen, self.cfg.stim_bg_grey)
+        self.gui.lbl_status.setText("Status: Stimulus window reset.")
+        LOGGER.info("[Stim] Window reset requested from GUI")
+    except Exception as e:
+        LOGGER.warning("[Stim] Window reset failed: %s", e)
+
     def _on_preset_load(self, name: str):
         try:
             d = self.user_presets.get(name)
@@ -1651,6 +1804,9 @@ class MainApp(QtWidgets.QApplication):
         try:
             name = (name or "").strip()
             if not name:
+                return
+            if name in BUILTIN_USER_PRESETS:
+                self.gui.lbl_status.setText(f"Status: '{name}' is a built-in preset and cannot be deleted. Use Save As… to customize.")
                 return
             if name in self.user_presets:
                 self.user_presets.pop(name, None)
