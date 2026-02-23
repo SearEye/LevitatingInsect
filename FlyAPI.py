@@ -1,6 +1,6 @@
 # FlyAPI.py
 # FlyPy — Unified Trigger → Cameras + Lights + Looming Stimulus
-# v1.41
+# v1.35.4
 # - FIX: PySpin device selection now matches DeviceSerialNumber (not UniqueID),
 #        so each serial (e.g., 24102007 vs 24102017) opens the correct camera.
 # - FIX: Handle "BeginAcquisition: Camera is already streaming" once, avoid spam.
@@ -11,6 +11,7 @@
 # - Keeps: stimulus start/end size, fullscreen/screen chooser, simulation mode
 
 import os, sys, time, csv, atexit, threading, queue, logging, shutil
+import shutil
 from collections import deque
 from datetime import datetime
 from typing import Optional, Tuple, List, Dict
@@ -18,7 +19,88 @@ import importlib
 import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
 
-__version__ = "1.41"
+# -------------------- Built-in + User Presets --------------------
+# Built-in presets are always available in the GUI. User presets are saved to JSON next to this script.
+BUILTIN_USER_PRESETS: Dict[str, dict] = {
+    "Default": {
+        "stim_type": "dot",
+        "stim_image_path": "",
+        "stim_duration_s": 1.000,
+        "stim_r0_px": 10,
+        "stim_r1_px": 450,
+        "stim_delay_s": 0.000,
+        "lights_delay_s": 0.000,
+    },
+    "Opto + Looming (dot)": {
+        "stim_type": "dot",
+        "stim_image_path": "",
+        "stim_duration_s": 1.000,
+        "stim_r0_px": 10,
+        "stim_r1_px": 450,
+        "stim_delay_s": 0.150,
+        "lights_delay_s": 0.000,
+    },
+    "Looming Image (example)": {
+        "stim_type": "image",
+        "stim_image_path": "",
+        "stim_duration_s": 1.000,
+        "stim_r0_px": 25,
+        "stim_r1_px": 600,
+        "stim_delay_s": 0.150,
+        "lights_delay_s": 0.000,
+    },
+}
+
+_USER_PRESETS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flypy_user_presets.json")
+
+def _load_user_presets() -> Dict[str, dict]:
+    """Return {name: preset_dict}. Never raises."""
+    try:
+        import json
+        if not os.path.exists(_USER_PRESETS_PATH):
+            return {}
+        with open(_USER_PRESETS_PATH, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        if isinstance(obj, dict):
+            return {str(k): v for k, v in obj.items() if isinstance(v, dict)}
+    except Exception as e:
+        try: LOGGER.warning("[Presets] Could not load presets: %s", e)
+        except Exception: pass
+    return {}
+
+def _save_user_presets(presets: Dict[str, dict]) -> None:
+    try:
+        import json
+        tmp = _USER_PRESETS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(presets, f, indent=2, sort_keys=True)
+        shutil.move(tmp, _USER_PRESETS_PATH)
+    except Exception as e:
+        try: LOGGER.warning("[Presets] Could not save presets: %s", e)
+        except Exception: pass
+
+def _cfg_to_preset_dict(cfg: 'Config') -> Dict[str, object]:
+    out: Dict[str, object] = {}
+    for k, v in getattr(cfg, "__dict__", {}).items():
+        if isinstance(v, (str, int, float, bool)) or v is None:
+            out[k] = v
+        elif isinstance(v, (list, tuple)):
+            out[k] = list(v)
+        else:
+            # last-resort stringification (keeps JSON save robust)
+            out[k] = str(v)
+    return out
+
+def _apply_preset_to_cfg(cfg: 'Config', preset: Dict[str, object]) -> None:
+    for k, v in preset.items():
+        if hasattr(cfg, k):
+            try:
+                setattr(cfg, k, v)
+            except Exception:
+                pass
+
+
+__version__ = "1.35.4"
 
 # -------------------- Logging --------------------
 LOG_DIR_DEFAULT = r"C:\Users\Murpheylab\Desktop\LevitatingInsect-main\logs"
@@ -124,147 +206,6 @@ VIDEO_PRESETS=[
 PRESETS_BY_ID={p["id"]:p for p in VIDEO_PRESETS}
 def default_preset_id()->str: return "avi_mjpg"
 
-# -------------------- Saved (User) Presets --------------------
-_USER_PRESETS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flypy_user_presets.json")
-
-# Built-in presets shipped with this script (always shown in the dropdown).
-# Notes:
-# - These are merged with user-saved presets from flypy_user_presets.json.
-# - Built-ins cannot be deleted from the UI (you can "Save As..." to customize).
-BUILTIN_USER_PRESETS: Dict[str, dict] = {
-    "Default — Looming Dot (fast start)": {
-        "simulation_mode": False,
-        "sim_trigger_interval": 5.0,
-        "output_root": "FlyPy_Output",
-        "prewarm_stim": True,
-        "video_preset_id": default_preset_id(),
-        "record_duration_s": 3.0,
-        "stim_type": "dot",
-        "stim_image_path": "",
-        "stim_duration_s": 1.5,
-        "stim_r0_px": 8,
-        "stim_r1_px": 240,
-        "stim_bg_grey": 1.0,
-        "lights_delay_s": 0.0,
-        "stim_delay_s": 0.0,
-        "stim_screen_index": 0,
-        "stim_fullscreen": False,
-        "gui_screen_index": 0,
-        "cam0_backend": "PySpin",
-        "cam0_id": "",
-        "cam0_target_fps": 522,
-        "cam0_width": 0,
-        "cam0_height": 0,
-        "cam0_exposure_us": 1500,
-        "cam0_hw_trigger": False,
-        "cam1_backend": "PySpin",
-        "cam1_id": "",
-        "cam1_target_fps": 522,
-        "cam1_width": 0,
-        "cam1_height": 0,
-        "cam1_exposure_us": 1500,
-        "cam1_hw_trigger": False,
-    },
-    "Default — Looming Image (needs file path)": {
-        "simulation_mode": False,
-        "sim_trigger_interval": 5.0,
-        "output_root": "FlyPy_Output",
-        "prewarm_stim": True,
-        "video_preset_id": default_preset_id(),
-        "record_duration_s": 3.0,
-        "stim_type": "image",
-        "stim_image_path": "",  # set this to your PNG/JPG path after loading
-        "stim_duration_s": 1.5,
-        "stim_r0_px": 40,
-        "stim_r1_px": 600,
-        "stim_bg_grey": 1.0,
-        "lights_delay_s": 0.0,
-        "stim_delay_s": 0.0,
-        "stim_screen_index": 0,
-        "stim_fullscreen": False,
-        "gui_screen_index": 0,
-        "cam0_backend": "PySpin",
-        "cam0_id": "",
-        "cam0_target_fps": 522,
-        "cam0_width": 0,
-        "cam0_height": 0,
-        "cam0_exposure_us": 1500,
-        "cam0_hw_trigger": False,
-        "cam1_backend": "PySpin",
-        "cam1_id": "",
-        "cam1_target_fps": 522,
-        "cam1_width": 0,
-        "cam1_height": 0,
-        "cam1_exposure_us": 1500,
-        "cam1_hw_trigger": False,
-    },
-    "Opto Example — Lights@0.25s, Loom@0.50s": {
-        "simulation_mode": False,
-        "sim_trigger_interval": 5.0,
-        "output_root": "FlyPy_Output",
-        "prewarm_stim": True,
-        "video_preset_id": default_preset_id(),
-        "record_duration_s": 3.0,
-        "stim_type": "dot",
-        "stim_image_path": "",
-        "stim_duration_s": 1.5,
-        "stim_r0_px": 8,
-        "stim_r1_px": 240,
-        "stim_bg_grey": 1.0,
-        "lights_delay_s": 0.25,
-        "stim_delay_s": 0.50,
-        "stim_screen_index": 0,
-        "stim_fullscreen": False,
-        "gui_screen_index": 0,
-        "cam0_backend": "PySpin",
-        "cam0_id": "",
-        "cam0_target_fps": 522,
-        "cam0_width": 0,
-        "cam0_height": 0,
-        "cam0_exposure_us": 1500,
-        "cam0_hw_trigger": False,
-        "cam1_backend": "PySpin",
-        "cam1_id": "",
-        "cam1_target_fps": 522,
-        "cam1_width": 0,
-        "cam1_height": 0,
-        "cam1_exposure_us": 1500,
-        "cam1_hw_trigger": False,
-    },
-}
-
-
-def _load_user_presets() -> Dict[str, dict]:
-    """Return {name: preset_dict}. Never raises."""
-    try:
-        import json
-        if not os.path.exists(_USER_PRESETS_PATH):
-            return {}
-        with open(_USER_PRESETS_PATH, "r", encoding="utf-8") as f:
-            obj = json.load(f)
-        if isinstance(obj, dict):
-            # Back-compat: already {name: {...}}
-            return {str(k): v for k, v in obj.items() if isinstance(v, dict)}
-        if isinstance(obj, list):
-            out = {}
-            for item in obj:
-                if isinstance(item, dict) and "name" in item and "data" in item and isinstance(item["data"], dict):
-                    out[str(item["name"])] = item["data"]
-            return out
-    except Exception as e:
-        LOGGER.warning("[Presets] Could not load presets: %s", e)
-    return {}
-
-def _save_user_presets(presets: Dict[str, dict]) -> None:
-    try:
-        import json
-        tmp = _USER_PRESETS_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(presets, f, indent=2, sort_keys=True)
-        shutil.move(tmp, _USER_PRESETS_PATH)
-    except Exception as e:
-        LOGGER.warning("[Presets] Could not save presets: %s", e)
-
 # -------------------- Config --------------------
 class Config:
     def __init__(self):
@@ -277,19 +218,13 @@ class Config:
         self.fourcc=PRESETS_BY_ID[self.video_preset_id]["fourcc"]
         self.record_duration_s=3.0
 
-        # Stimulus
-        # - type: 'dot' (growing circle) OR 'image' (looming image)
-        # - for 'image', stim_image_path must point to a readable image file
-        self.stim_type:str = "dot"   # 'dot' | 'image'
-        self.stim_image_path:str = ""
-
-        # Dot / image size envelope (px).
-        #   - dot: r0/r1 are circle radii.
-        #   - image: r0/r1 are the target *max dimension* (max(width,height)) over time.
+        # Stimulus (growing black dot on white background)
         self.stim_duration_s=1.5
         self.stim_r0_px=8
         self.stim_r1_px=240
         self.stim_bg_grey=1.0
+        self.stim_type="dot"
+        self.stim_image_path=""
         self.lights_delay_s=0.0
         self.stim_delay_s=0.0
         self.stim_screen_index=0
@@ -818,53 +753,24 @@ class CameraNode:
 # -------------------- Stimulus --------------------
 class LoomingStim:
     def __init__(self,cfg:Config):
-        self.cfg=cfg
-        self._pp_win=None
-        self._pp_cfg=None
-        self._cv_window_name="Looming Stimulus"
-        self._cv_open=False
-        self._cv_size=(800,600)
+        self.cfg=cfg; self._pp_win=None; self._pp_cfg=None; self._cv_window_name="Looming Stimulus"; self._cv_open=False; self._cv_size=(800,600)
 
-        # Cached stimulus image (so the first trial doesn't hitch)
-        self._img_path_cached: str = ""
-        self._img_cv_bgr: Optional[np.ndarray] = None
-        self._img_pp = None  # PsychoPy ImageStim (created lazily per-window)
-
-    def _load_image_cv(self, path: str) -> Optional[np.ndarray]:
-        """Return BGR image (uint8) or None."""
-        if not HAVE_OPENCV:
-            return None
-        p = (path or "").strip()
-        if not p:
-            return None
+    def reset_window(self):
+        """Close stimulus windows so they can be recreated cleanly."""
         try:
-            img = cv2.imread(p, cv2.IMREAD_UNCHANGED)
-            if img is None:
-                return None
-            # Convert to BGR 3-channel
-            if img.ndim == 2:
-                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-            elif img.ndim == 3 and img.shape[2] == 4:
-                # BGRA -> BGR (keep alpha for compositing later if desired)
-                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-            return img
-        except Exception as e:
-            LOGGER.warning("[Stim] Could not load image (OpenCV): %s", e)
-            return None
-
-    def _ensure_cached_image(self):
-        """Cache image on path change; keeps both CV + PP caches in sync."""
-        p = (getattr(self.cfg, "stim_image_path", "") or "").strip()
-        if not p:
-            self._img_path_cached = ""
-            self._img_cv_bgr = None
-            self._img_pp = None
-            return
-        if p == self._img_path_cached:
-            return
-        self._img_path_cached = p
-        self._img_cv_bgr = self._load_image_cv(p)
-        self._img_pp = None  # PP stim depends on the active window
+            if self._pp_win is not None:
+                try: self._pp_win.close()
+                except Exception: pass
+            self._pp_win=None; self._pp_cfg=None
+        except Exception:
+            pass
+        try:
+            if HAVE_OPENCV and getattr(self, "_cv_open", False):
+                try: cv2.destroyWindow(self._cv_window_name)
+                except Exception: pass
+            self._cv_open=False
+        except Exception:
+            pass
     def _pp_window(self,screen_idx:int,fullscreen:bool,bg_grey:float):
         need_new=False
         if self._pp_win is None: need_new=True
@@ -899,95 +805,18 @@ class LoomingStim:
                 try: self._pp_win.flip()
                 except Exception: pass
         else: self._cv_window(screen_idx,bg_grey)
-    def reset_window(self):
-        """Force-close and forget the stimulus window so it will be recreated next time.
-
-        Use this if the stimulus window gets stuck / moved to the wrong screen / needs a relaunch.
-        """
-        # PsychoPy
-        try:
-            if self._pp_win is not None:
-                try:
-                    self._pp_win.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        self._pp_win = None
-        self._pp_cfg = None
-        # ImageStim depends on the active PsychoPy window
-        self._img_pp = None
-
-        # OpenCV
-        if self._cv_open and HAVE_OPENCV:
-            try:
-                cv2.destroyWindow(self._cv_window_name)
-            except Exception:
-                pass
-        self._cv_open = False
-
     def run(self,duration_s:float,r0:int,r1:int,bg_grey:float,screen_idx:int,fullscreen:bool):
         LOGGER.info("[Stim] Looming start")
-        stim_type = (getattr(self.cfg, "stim_type", "dot") or "dot").strip().lower()
-        if stim_type not in ("dot","image"):
-            stim_type = "dot"
-        if stim_type == "image":
-            self._ensure_cached_image()
-            if not (getattr(self.cfg, "stim_image_path", "") or "").strip():
-                LOGGER.warning("[Stim] stim_type=image but no image selected → falling back to dot")
-                stim_type = "dot"
-            elif self._img_cv_bgr is None and not _ensure_psychopy_loaded():
-                LOGGER.warning("[Stim] stim_type=image but OpenCV couldn't load it → falling back to dot")
-                stim_type = "dot"
-
         if _ensure_psychopy_loaded():
             try:
                 self._pp_window(screen_idx,fullscreen,bg_grey)
                 if self._pp_win is not None:
-                    if stim_type == "dot":
-                        dot=visual.Circle(self._pp_win,radius=r0,fillColor='black',lineColor='black')
-                    else:
-                        # PsychoPy will handle many image formats, but we still validate path.
-                        img_path = (getattr(self.cfg, "stim_image_path", "") or "").strip()
-                        if not img_path:
-                            dot=visual.Circle(self._pp_win,radius=r0,fillColor='black',lineColor='black')
-                            stim_type = "dot"
-                        else:
-                            try:
-                                self._img_pp = visual.ImageStim(self._pp_win, image=img_path, units='pix')
-                            except Exception as e:
-                                LOGGER.warning("[Stim] PsychoPy ImageStim failed (%s) → dot", e)
-                                self._img_pp = None
-                                dot=visual.Circle(self._pp_win,radius=r0,fillColor='black',lineColor='black')
-                                stim_type = "dot"
+                    dot=visual.Circle(self._pp_win,radius=r0,fillColor='black',lineColor='black')
                     t0=time.time()
                     while True:
                         t=time.time()-t0
                         if t>=duration_s: break
-                        frac = 0.0 if duration_s<=0 else (t/duration_s)
-                        frac = max(0.0, min(1.0, frac))
-                        v = float(r0) + (float(r1)-float(r0))*frac
-                        if stim_type == "dot":
-                            dot.radius = v
-                            dot.draw()
-                        else:
-                            # For images, r0/r1 mean target max-dimension (px)
-                            img = self._img_pp
-                            if img is None:
-                                dot.radius = v
-                                dot.draw()
-                            else:
-                                # ImageStim size=(w,h) in px. Use image's native size.
-                                try:
-                                    iw, ih = img.size  # may be (w,h)
-                                except Exception:
-                                    iw, ih = 256, 256
-                                base = max(float(iw), float(ih), 1.0)
-                                s = float(v)/base
-                                img.size = (float(iw)*s, float(ih)*s)
-                                img.pos = (0,0)
-                                img.draw()
-                        self._pp_win.flip()
+                        r=r0+(r1-r0)*(t/duration_s); dot.radius=r; dot.draw(); self._pp_win.flip()
                     LOGGER.info("[Stim] Done (PsychoPy)"); return
             except Exception as e: LOGGER.warning("[Stim] PsychoPy error: %s → OpenCV fallback", e)
         try:
@@ -995,51 +824,11 @@ class LoomingStim:
                 wait_s(duration_s); LOGGER.info("[Stim] Done (timing only)"); return
             self._cv_window(screen_idx,bg_grey)
             size=self._cv_size; bg=int(max(0,min(255,int(bg_grey*255)))); t0=time.time()
-            img_bgr = None
-            if stim_type == "image":
-                self._ensure_cached_image()
-                img_bgr = self._img_cv_bgr
             while True:
                 t=time.time()-t0
                 if t>=duration_s: break
-                frac = 0.0 if duration_s<=0 else (t/duration_s)
-                frac = max(0.0, min(1.0, frac))
-                v = float(r0) + (float(r1)-float(r0))*frac
-                frame=np.full((size[1],size[0],3),bg,dtype=np.uint8)
-                if stim_type == "dot" or img_bgr is None:
-                    r=int(v)
-                    cv2.circle(frame,(size[0]//2,size[1]//2),r,(0,0,0),-1)
-                else:
-                    # v is target max dimension in px
-                    ih, iw = img_bgr.shape[:2]
-                    base = max(iw, ih, 1)
-                    s = float(v)/float(base)
-                    tw = max(1, int(round(iw*s)))
-                    th = max(1, int(round(ih*s)))
-                    try:
-                        scaled = cv2.resize(img_bgr, (tw, th), interpolation=cv2.INTER_AREA if s<1 else cv2.INTER_LINEAR)
-                    except Exception:
-                        scaled = img_bgr
-                        th, tw = scaled.shape[:2]
-                    x0 = (size[0]-tw)//2
-                    y0 = (size[1]-th)//2
-                    x1 = x0+tw
-                    y1 = y0+th
-                    # Clip if needed
-                    sx0 = 0; sy0 = 0
-                    if x0 < 0:
-                        sx0 = -x0
-                        x0 = 0
-                    if y0 < 0:
-                        sy0 = -y0
-                        y0 = 0
-                    x1 = min(size[0], x1)
-                    y1 = min(size[1], y1)
-                    sw = max(0, x1-x0)
-                    sh = max(0, y1-y0)
-                    if sw>0 and sh>0:
-                        frame[y0:y1, x0:x1] = scaled[sy0:sy0+sh, sx0:sx0+sw]
-                cv2.imshow(self._cv_window_name,frame)
+                r=int(r0+(r1-r0)*(t/duration_s)); frame=np.full((size[1],size[0],3),bg,dtype=np.uint8)
+                cv2.circle(frame,(size[0]//2,size[1]//2),r,(0,0,0),-1); cv2.imshow(self._cv_window_name,frame)
                 if cv2.waitKey(1) & 0xFF==27: break
             LOGGER.info("[Stim] Done (OpenCV)")
         except Exception as e: LOGGER.warning("[Stim] Fallback display unavailable: %s", e); wait_s(duration_s); LOGGER.info("[Stim] Done (timing only)")
@@ -1061,7 +850,7 @@ class TrialRunner:
         self.log=open(log_path,"a",newline="",encoding="utf-8"); self.csvw=csv.writer(self.log)
         if new:
             self.csvw.writerow(["timestamp","trial_idx","cam0_path","cam1_path","record_duration_s",
-                                "lights_delay_s","stim_delay_s","stim_duration_s","stim_type","stim_image_path","stim_screen_index","stim_fullscreen",
+                                "lights_delay_s","stim_delay_s","stim_duration_s","stim_screen_index","stim_fullscreen",
                                 "cam0_backend","cam0_ident","cam0_target_fps","cam0_w","cam0_h","cam0_exp_us","cam0_hwtrig",
                                 "cam1_backend","cam1_ident","cam1_target_fps","cam1_w","cam1_h","cam1_exp_us","cam1_hwtrig",
                                 "video_preset_id","fourcc"])
@@ -1103,7 +892,6 @@ class TrialRunner:
             c0 or "", c1 or "",
             float(self.cfg.record_duration_s),
             float(self.cfg.lights_delay_s), float(self.cfg.stim_delay_s), float(self.cfg.stim_duration_s),
-            str(getattr(self.cfg, "stim_type", "dot")), str(getattr(self.cfg, "stim_image_path", "")),
             int(self.cfg.stim_screen_index), bool(self.cfg.stim_fullscreen),
             self.cam0.backend, self.cam0.ident, int(self.cam0.target_fps), self.cam0.adv.get("width",0), self.cam0.adv.get("height",0), self.cam0.adv.get("exposure_us",0), self.cam0.adv.get("hw_trigger",False),
             self.cam1.backend, self.cam1.ident, int(self.cam1.target_fps), self.cam1.adv.get("width",0), self.cam1.adv.get("height",0), self.cam1.adv.get("exposure_us",0), self.cam1.adv.get("hw_trigger",False),
@@ -1135,11 +923,11 @@ class SettingsGUI(QtWidgets.QWidget):
     start_experiment=QtCore.pyqtSignal(); stop_experiment=QtCore.pyqtSignal(); apply_settings=QtCore.pyqtSignal(); manual_trigger=QtCore.pyqtSignal()
     probe_requested=QtCore.pyqtSignal()
     refresh_devices_requested=QtCore.pyqtSignal()
-    stim_window_reset_requested = QtCore.pyqtSignal()
+    stim_window_reset_requested=QtCore.pyqtSignal()
+    preset_load_requested=QtCore.pyqtSignal(str)
+    preset_save_requested=QtCore.pyqtSignal(str)
+    preset_delete_requested=QtCore.pyqtSignal(str)
 
-    preset_load_requested = QtCore.pyqtSignal(str)
-    preset_save_requested = QtCore.pyqtSignal(str, object)  # name, dict
-    preset_delete_requested = QtCore.pyqtSignal(str)
 
     def __init__(self,cfg:Config,cam0:CameraNode,cam1:CameraNode):
         super().__init__()
@@ -1158,27 +946,32 @@ class SettingsGUI(QtWidgets.QWidget):
         self.cb_preset.addItem("Blackfly 300 fps (PySpin Mono8, ROI 720×540)")
         self.cb_preset.addItem("OpenCV baseline (laptop cam)")
         self.bt_apply_preset=QtWidgets.QPushButton("Apply Preset")
-        self.bt_probe=QtWidgets.QPushButton("Probe Max FPS")
-        self.bt_refresh=QtWidgets.QPushButton("Refresh Cameras")
-        row0.addWidget(self.cb_preset); row0.addWidget(self.bt_apply_preset); row0.addWidget(self.bt_probe); row0.addWidget(self.bt_refresh)
-        root.addLayout(row0)
-        self.bt_apply_preset.clicked.connect(self._apply_selected_preset)
-        self.bt_probe.clicked.connect(self._probe_clicked)
-        self.bt_refresh.clicked.connect(self._refresh_clicked)
 
         # User presets row (save / load / delete)
         rowp = QtWidgets.QHBoxLayout()
         rowp.addWidget(QtWidgets.QLabel("User Preset:"))
-        self.cb_user_preset = QtWidgets.QComboBox(); self.cb_user_preset.setMinimumWidth(320)
-        self.bt_user_load = QtWidgets.QPushButton("Load")
-        self.bt_user_save = QtWidgets.QPushButton("Save As…")
-        self.bt_user_delete = QtWidgets.QPushButton("Delete")
-        rowp.addWidget(self.cb_user_preset); rowp.addWidget(self.bt_user_load); rowp.addWidget(self.bt_user_save); rowp.addWidget(self.bt_user_delete)
-        root.addLayout(rowp)
+        self.cb_user_preset = QtWidgets.QComboBox()
+        self.bt_preset_load = QtWidgets.QPushButton("Load")
+        self.bt_preset_save = QtWidgets.QPushButton("Save As…")
+        self.bt_preset_delete = QtWidgets.QPushButton("Delete")
+        rowp.addWidget(self.cb_user_preset, 1)
+        rowp.addWidget(self.bt_preset_load)
+        rowp.addWidget(self.bt_preset_save)
+        rowp.addWidget(self.bt_preset_delete)
+        rowp_w = QtWidgets.QWidget(); rowp_w.setLayout(rowp)
 
-        self.bt_user_load.clicked.connect(self._user_preset_load_clicked)
-        self.bt_user_save.clicked.connect(self._user_preset_save_clicked)
-        self.bt_user_delete.clicked.connect(self._user_preset_delete_clicked)
+        self.bt_probe=QtWidgets.QPushButton("Probe Max FPS")
+        self.bt_refresh=QtWidgets.QPushButton("Refresh Cameras")
+        row0.addWidget(self.cb_preset); row0.addWidget(self.bt_apply_preset); row0.addWidget(self.bt_probe); row0.addWidget(self.bt_refresh)
+        root.addLayout(row0)
+        root.addWidget(rowp_w)
+        self.bt_apply_preset.clicked.connect(self._apply_selected_preset)
+        self.bt_probe.clicked.connect(self._probe_clicked)
+        self.bt_refresh.clicked.connect(self._refresh_clicked)
+
+        self.bt_preset_load.clicked.connect(lambda: self.preset_load_requested.emit(self.cb_user_preset.currentText()))
+        self.bt_preset_save.clicked.connect(self._preset_save_clicked)
+        self.bt_preset_delete.clicked.connect(lambda: self.preset_delete_requested.emit(self.cb_user_preset.currentText()))
 
         # Controls row
         row=QtWidgets.QHBoxLayout()
@@ -1215,37 +1008,24 @@ class SettingsGUI(QtWidgets.QWidget):
         btn_browse.clicked.connect(self._browse)
 
         # Stimulus & Timing
-        stim=QtWidgets.QGroupBox("Stimulus & Timing (looming dot / looming image)")
+        stim=QtWidgets.QGroupBox("Stimulus & Timing (Falling object / growing dot)")
         sl=QtWidgets.QFormLayout(stim)
-
-        # Stimulus type
-        self.cb_stim_type = QtWidgets.QComboBox()
-        self.cb_stim_type.addItem("Growing Dot (circle)", "dot")
-        self.cb_stim_type.addItem("Looming Image", "image")
-        try:
-            cur = (getattr(self.cfg, "stim_type", "dot") or "dot").strip().lower()
-        except Exception:
-            cur = "dot"
-        self.cb_stim_type.setCurrentIndex(1 if cur=="image" else 0)
-        sl.addRow("Stimulus type:", self.cb_stim_type)
-
-        # Image selector (only used for 'Looming Image')
-        self.le_stim_image = QtWidgets.QLineEdit(getattr(self.cfg, "stim_image_path", "") or "")
-        self.le_stim_image.setPlaceholderText("Select an image file (png/jpg/bmp/tif/…) for looming image stimulus")
-        self.bt_stim_image = QtWidgets.QPushButton("Browse…")
-        row_img = QtWidgets.QHBoxLayout(); row_img.addWidget(self.le_stim_image); row_img.addWidget(self.bt_stim_image)
-        sl.addRow("Stimulus image:", row_img)
-        self.bt_stim_image.clicked.connect(self._browse_stim_image)
-
         self.sb_stim_dur=QtWidgets.QDoubleSpinBox(); self.sb_stim_dur.setRange(0.05,60.0); self.sb_stim_dur.setDecimals(3); self.sb_stim_dur.setValue(self.cfg.stim_duration_s)
         self.sb_r0=QtWidgets.QSpinBox(); self.sb_r0.setRange(1,4000); self.sb_r0.setValue(self.cfg.stim_r0_px)
         self.sb_r1=QtWidgets.QSpinBox(); self.sb_r1.setRange(1,8000); self.sb_r1.setValue(self.cfg.stim_r1_px)
         self.sb_bg=QtWidgets.QDoubleSpinBox(); self.sb_bg.setRange(0.0,1.0); self.sb_bg.setSingleStep(0.05); self.sb_bg.setValue(self.cfg.stim_bg_grey)
+        self.cb_stim_type=QtWidgets.QComboBox(); self.cb_stim_type.addItem("Growing Dot (circle)","dot"); self.cb_stim_type.addItem("Looming Image","image");
+        # default selection
+        try:
+            if getattr(self.cfg,"stim_type","dot")=="image": self.cb_stim_type.setCurrentIndex(1)
+        except Exception: pass
+        self.le_stim_image=QtWidgets.QLineEdit(getattr(self.cfg,"stim_image_path","") or ""); self.bt_stim_browse=QtWidgets.QPushButton("Browse…");
+        self.bt_stim_browse.clicked.connect(lambda: self._browse(self.le_stim_image, "Select stimulus image"))
         self.sb_light_delay=QtWidgets.QDoubleSpinBox(); self.sb_light_delay.setRange(0.0,10.0); self.sb_light_delay.setDecimals(3); self.sb_light_delay.setValue(self.cfg.lights_delay_s)
         self.sb_stim_delay=QtWidgets.QDoubleSpinBox(); self.sb_stim_delay.setRange(0.0,10.0); self.sb_stim_delay.setDecimals(3); self.sb_stim_delay.setValue(self.cfg.stim_delay_s)
         sl.addRow("Stimulus total time (s):", self.sb_stim_dur)
-        sl.addRow("Stimulus Start Size (px):", self.sb_r0)
-        sl.addRow("Stimulus End Size (px):", self.sb_r1)
+        sl.addRow("Stimulus Start Size (radius px):", self.sb_r0)
+        sl.addRow("Stimulus End Size (radius px):", self.sb_r1)
         sl.addRow("Background shade (0=black, 1=white):", self.sb_bg)
         sl.addRow("Delay: record → lights ON (s):", self.sb_light_delay)
         sl.addRow("Delay: record → stimulus ON (s):", self.sb_stim_delay)
@@ -1262,14 +1042,13 @@ class SettingsGUI(QtWidgets.QWidget):
         self.cb_gui_screen.setCurrentIndex(min(self.cfg.gui_screen_index, self.cb_gui_screen.count()-1))
         self.cb_full=QtWidgets.QCheckBox("Stimulus fullscreen"); self.cb_full.setChecked(self.cfg.stim_fullscreen)
         self.cb_prewarm=QtWidgets.QCheckBox("Pre-warm stimulus window at launch"); self.cb_prewarm.setChecked(self.cfg.prewarm_stim)
+        self.bt_reset_stim=QtWidgets.QPushButton("Reset / Relaunch Stimulus Window")
+        self.bt_reset_stim.clicked.connect(lambda: self.stim_window_reset_requested.emit())
         dl.addRow("Stimulus display screen:", self.cb_stim_screen)
+        dl.addRow(self.bt_reset_stim)
         dl.addRow("GUI display screen:", self.cb_gui_screen)
         dl.addRow(self.cb_full)
         dl.addRow(self.cb_prewarm)
-
-        self.bt_stim_reset = QtWidgets.QPushButton("Reset / Relaunch Stimulus Window")
-        dl.addRow(self.bt_stim_reset)
-        self.bt_stim_reset.clicked.connect(self.stim_window_reset_requested.emit)
         grid.addWidget(disp, 2, 0, 1, 2)
 
         # Camera panels
@@ -1358,139 +1137,6 @@ class SettingsGUI(QtWidgets.QWidget):
         d=QtWidgets.QFileDialog.getExistingDirectory(self,"Select output folder", self.le_root.text() or os.getcwd())
         if d: self.le_root.setText(d)
 
-    def _browse_stim_image(self):
-        start_dir = os.path.dirname(self.le_stim_image.text().strip()) if self.le_stim_image.text().strip() else os.getcwd()
-        fn, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Select stimulus image",
-            start_dir,
-            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.gif);;All files (*)"
-        )
-        if fn:
-            self.le_stim_image.setText(fn)
-
-    def set_user_preset_names(self, names: List[str]):
-        cur = self.cb_user_preset.currentText().strip()
-        self.cb_user_preset.blockSignals(True)
-        self.cb_user_preset.clear()
-        for n in names:
-            self.cb_user_preset.addItem(n)
-        # restore selection if possible
-        if cur and cur in names:
-            self.cb_user_preset.setCurrentText(cur)
-        self.cb_user_preset.blockSignals(False)
-
-    def _user_preset_load_clicked(self):
-        name = self.cb_user_preset.currentText().strip()
-        if name:
-            self.preset_load_requested.emit(name)
-
-    def _user_preset_save_clicked(self):
-        name, ok = QtWidgets.QInputDialog.getText(self, "Save Preset", "Preset name:")
-        if not ok:
-            return
-        name = (name or "").strip()
-        if not name:
-            return
-        self.preset_save_requested.emit(name, self._serialize_gui_to_dict())
-
-    def _user_preset_delete_clicked(self):
-        name = self.cb_user_preset.currentText().strip()
-        if not name:
-            return
-        ret = QtWidgets.QMessageBox.question(self, "Delete Preset", f"Delete preset '{name}'?", QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
-        if ret == QtWidgets.QMessageBox.Yes:
-            self.preset_delete_requested.emit(name)
-
-    def _serialize_gui_to_dict(self) -> dict:
-        """Snapshot *GUI* values as a plain dict (safe to JSON)."""
-        d = {
-            "simulation_mode": bool(self.cb_sim.isChecked()),
-            "sim_trigger_interval": float(self.sb_sim.value()),
-            "output_root": str(self.le_root.text()).strip(),
-            "prewarm_stim": bool(self.cb_prewarm.isChecked()),
-            "video_preset_id": str(self.cb_fmt.currentData() or self._id_by_idx.get(self.cb_fmt.currentIndex(), default_preset_id())),
-            "record_duration_s": float(self.sb_rec.value()),
-
-            "stim_type": str(self.cb_stim_type.currentData() or "dot"),
-            "stim_image_path": str(self.le_stim_image.text() or "").strip(),
-            "stim_duration_s": float(self.sb_stim_dur.value()),
-            "stim_r0_px": int(self.sb_r0.value()),
-            "stim_r1_px": int(self.sb_r1.value()),
-            "stim_bg_grey": float(self.sb_bg.value()),
-            "lights_delay_s": float(self.sb_light_delay.value()),
-            "stim_delay_s": float(self.sb_stim_delay.value()),
-            "stim_screen_index": int(self.cb_stim_screen.currentIndex()),
-            "stim_fullscreen": bool(self.cb_full.isChecked()),
-            "gui_screen_index": int(self.cb_gui_screen.currentIndex()),
-        }
-        # Cameras
-        for cam_idx, box in enumerate(self.cam_boxes):
-            prefix = f"cam{cam_idx}_"
-            d[prefix+"backend"] = "OpenCV" if box["cb_backend"].currentIndex()==0 else "PySpin"
-            # If a device is selected, prefer that; otherwise use manual field
-            selected = str(box["cb_device"].currentData() or "").strip()
-            ident = selected if selected else str(box["le_ident"].text() or "").strip()
-            d[prefix+"id"] = ident
-            d[prefix+"target_fps"] = int(box["sb_fps"].value())
-            d[prefix+"width"] = int(box["sb_w"].value())
-            d[prefix+"height"] = int(box["sb_h"].value())
-            d[prefix+"exposure_us"] = int(box["sb_exp"].value())
-            d[prefix+"hw_trigger"] = bool(box["cb_hw"].isChecked())
-        return d
-
-    def apply_preset_dict_to_gui(self, d: dict):
-        """Apply a preset dict to GUI widgets (does not auto-click Apply Settings)."""
-        if not isinstance(d, dict):
-            return
-        try:
-            if "simulation_mode" in d: self.cb_sim.setChecked(bool(d["simulation_mode"]))
-            if "sim_trigger_interval" in d: self.sb_sim.setValue(float(d["sim_trigger_interval"]))
-            if "output_root" in d: self.le_root.setText(str(d["output_root"]))
-            if "prewarm_stim" in d: self.cb_prewarm.setChecked(bool(d["prewarm_stim"]))
-            if "video_preset_id" in d:
-                pid = str(d["video_preset_id"]).strip()
-                for i in range(self.cb_fmt.count()):
-                    if str(self.cb_fmt.itemData(i) or "") == pid:
-                        self.cb_fmt.setCurrentIndex(i)
-                        break
-            if "record_duration_s" in d: self.sb_rec.setValue(float(d["record_duration_s"]))
-
-            if "stim_type" in d:
-                st = str(d["stim_type"]).strip().lower()
-                self.cb_stim_type.setCurrentIndex(1 if st=="image" else 0)
-            if "stim_image_path" in d: self.le_stim_image.setText(str(d["stim_image_path"]))
-            if "stim_duration_s" in d: self.sb_stim_dur.setValue(float(d["stim_duration_s"]))
-            if "stim_r0_px" in d: self.sb_r0.setValue(int(d["stim_r0_px"]))
-            if "stim_r1_px" in d: self.sb_r1.setValue(int(d["stim_r1_px"]))
-            if "stim_bg_grey" in d: self.sb_bg.setValue(float(d["stim_bg_grey"]))
-            if "lights_delay_s" in d: self.sb_light_delay.setValue(float(d["lights_delay_s"]))
-            if "stim_delay_s" in d: self.sb_stim_delay.setValue(float(d["stim_delay_s"]))
-            if "stim_screen_index" in d:
-                self.cb_stim_screen.setCurrentIndex(max(0, min(int(d["stim_screen_index"]), self.cb_stim_screen.count()-1)))
-            if "stim_fullscreen" in d: self.cb_full.setChecked(bool(d["stim_fullscreen"]))
-            if "gui_screen_index" in d:
-                self.cb_gui_screen.setCurrentIndex(max(0, min(int(d["gui_screen_index"]), self.cb_gui_screen.count()-1)))
-
-            for cam_idx, box in enumerate(self.cam_boxes):
-                prefix = f"cam{cam_idx}_"
-                if prefix+"backend" in d:
-                    box["cb_backend"].setCurrentIndex(0 if str(d[prefix+"backend"]).lower()=="opencv" else 1)
-                if prefix+"id" in d:
-                    box["le_ident"].setText(str(d[prefix+"id"]))
-                if prefix+"target_fps" in d:
-                    box["sb_fps"].setValue(int(d[prefix+"target_fps"]))
-                if prefix+"width" in d:
-                    box["sb_w"].setValue(int(d[prefix+"width"]))
-                if prefix+"height" in d:
-                    box["sb_h"].setValue(int(d[prefix+"height"]))
-                if prefix+"exposure_us" in d:
-                    box["sb_exp"].setValue(int(d[prefix+"exposure_us"]))
-                if prefix+"hw_trigger" in d:
-                    box["cb_hw"].setChecked(bool(d[prefix+"hw_trigger"]))
-        except Exception as e:
-            LOGGER.warning("[Presets] Failed to apply preset to GUI: %s", e)
-
     def set_preview_image(self, cam_idx:int, img_bgr: Optional[np.ndarray]):
         if img_bgr is None:
             self.cam_boxes[cam_idx]["preview"].setText("Preview OFF")
@@ -1535,17 +1181,16 @@ class MainApp(QtWidgets.QApplication):
         self.runner=TrialRunner(self.cfg,self.hw,self.cam0,self.cam1,log_path)
 
         self.gui=SettingsGUI(self.cfg,self.cam0,self.cam1)
-        self.gui.start_experiment.connect(self.start_loop)
-        self.gui.stop_experiment.connect(self.stop_loop)
+        self.gui.start_experiment.connect(getattr(self, 'start_loop', self.start_loop_compat))
+        self.gui.stop_experiment.connect(getattr(self, 'stop_loop', self.stop_loop_compat))
         self.gui.apply_settings.connect(self.apply_from_gui)
         self.gui.manual_trigger.connect(self.trigger_once)
         self.gui.probe_requested.connect(self.start_probe)
         self.gui.refresh_devices_requested.connect(self.refresh_devices)
         self.gui.stim_window_reset_requested.connect(self.reset_stimulus_window)
 
-        # User presets (saved to flypy_user_presets.json next to this script)
+        # Built-in + user presets
         self.user_presets: Dict[str, dict] = dict(BUILTIN_USER_PRESETS)
-        # User-saved presets override built-ins on name collision
         self.user_presets.update(_load_user_presets())
         self.gui.set_user_preset_names(sorted(self.user_presets.keys(), key=lambda s: s.lower()))
         self.gui.preset_load_requested.connect(self._on_preset_load)
@@ -1691,6 +1336,93 @@ class MainApp(QtWidgets.QApplication):
         except Exception as e:
             LOGGER.error("[Devices] Refresh error: %s", e)
 
+    # --- Compatibility slots (prevents startup crash if wiring expects start_loop/stop_loop) ---
+    def start_loop_compat(self):
+        if getattr(self, "running", False):
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self.loop, daemon=True)
+        self.thread.start()
+        try: self.gui.lbl_status.setText("Status: Trigger loop running.")
+        except Exception: pass
+        LOGGER.info("[Main] Start (compat)")
+
+    def stop_loop_compat(self):
+        if not getattr(self, "running", False):
+            return
+        self.running = False
+        th = getattr(self, "thread", None)
+        if th:
+            try: th.join(timeout=2.0)
+            except Exception: pass
+        self.thread = None
+        try: self.gui.lbl_status.setText("Status: Stopped.")
+        except Exception: pass
+        LOGGER.info("[Main] Stop (compat)")
+
+    def reset_stimulus_window(self):
+        try:
+            self.runner.stim.reset_window()
+            self.gui.lbl_status.setText("Status: Stimulus window reset.")
+        except Exception as e:
+            LOGGER.error("[Main] reset_stimulus_window error: %s", e)
+
+    def _on_preset_load(self, name: str):
+        name = (name or "").strip()
+        if not name:
+            return
+        preset = self.user_presets.get(name)
+        if not isinstance(preset, dict):
+            return
+        _apply_preset_to_cfg(self.cfg, preset)
+        # push into GUI for the subset we control
+        try:
+            if hasattr(self.gui, "cb_stim_type"):
+                ix = 1 if getattr(self.cfg, "stim_type", "dot") == "image" else 0
+                self.gui.cb_stim_type.setCurrentIndex(ix)
+            if hasattr(self.gui, "le_stim_image"):
+                self.gui.le_stim_image.setText(getattr(self.cfg, "stim_image_path", "") or "")
+            self.gui.sb_stim_dur.setValue(float(self.cfg.stim_duration_s))
+            self.gui.sb_r0.setValue(int(self.cfg.stim_r0_px))
+            self.gui.sb_r1.setValue(int(self.cfg.stim_r1_px))
+            self.gui.sb_stim_delay.setValue(float(self.cfg.stim_delay_s))
+            self.gui.sb_light_delay.setValue(float(self.cfg.lights_delay_s))
+        except Exception as e:
+            LOGGER.warning("[Presets] GUI apply partial: %s", e)
+        self.apply_from_gui()
+        try: self.gui.lbl_status.setText(f"Status: Loaded preset '{name}'.")
+        except Exception: pass
+
+    def _on_preset_save(self, name: str):
+        name = (name or "").strip()
+        if not name:
+            return
+        # Capture current GUI->cfg first
+        try: self.apply_from_gui()
+        except Exception: pass
+        self.user_presets[name] = _cfg_to_preset_dict(self.cfg)
+        # Save only user-defined presets (exclude built-ins)
+        to_save = {k:v for k,v in self.user_presets.items() if k not in BUILTIN_USER_PRESETS}
+        _save_user_presets(to_save)
+        self.gui.set_user_preset_names(sorted(self.user_presets.keys(), key=lambda s: s.lower()))
+        try: self.gui.lbl_status.setText(f"Status: Saved preset '{name}'.")
+        except Exception: pass
+
+    def _on_preset_delete(self, name: str):
+        name = (name or "").strip()
+        if not name:
+            return
+        if name in BUILTIN_USER_PRESETS:
+            QtWidgets.QMessageBox.information(self.gui, "Cannot delete", "Built-in presets cannot be deleted. Use Save As… to create a custom copy.")
+            return
+        if name in self.user_presets:
+            del self.user_presets[name]
+            to_save = {k:v for k,v in self.user_presets.items() if k not in BUILTIN_USER_PRESETS}
+            _save_user_presets(to_save)
+            self.gui.set_user_preset_names(sorted(self.user_presets.keys(), key=lambda s: s.lower()))
+            try: self.gui.lbl_status.setText(f"Status: Deleted preset '{name}'.")
+            except Exception: pass
+
     def apply_from_gui(self):
         try:
             prev_sim=self.cfg.simulation_mode
@@ -1710,20 +1442,19 @@ class MainApp(QtWidgets.QApplication):
             self.cfg.lights_delay_s=float(self.gui.sb_light_delay.value())
             self.cfg.stim_delay_s=float(self.gui.sb_stim_delay.value())
 
-            # Stimulus type + image
-            try:
-                self.cfg.stim_type = str(self.gui.cb_stim_type.currentData() or "dot").strip().lower()
-            except Exception:
-                self.cfg.stim_type = "dot"
-            try:
-                self.cfg.stim_image_path = (self.gui.le_stim_image.text() or "").strip()
-            except Exception:
-                self.cfg.stim_image_path = ""
-
             self.cfg.stim_screen_index=int(self.gui.cb_stim_screen.currentIndex())
             self.cfg.gui_screen_index=int(self.gui.cb_gui_screen.currentIndex())
             self.cfg.stim_fullscreen=bool(self.gui.cb_full.isChecked())
             self.cfg.prewarm_stim=bool(self.gui.cb_prewarm.isChecked())
+            # stimulus type / image
+            try:
+                self.cfg.stim_type = str(self.gui.cb_stim_type.currentData() or 'dot')
+            except Exception:
+                self.cfg.stim_type = 'dot'
+            try:
+                self.cfg.stim_image_path = (self.gui.le_stim_image.text() or '').strip()
+            except Exception:
+                self.cfg.stim_image_path = ''
 
             for i,node in enumerate((self.cam0,self.cam1)):
                 box=self.gui.cam_boxes[i]
@@ -1762,59 +1493,6 @@ class MainApp(QtWidgets.QApplication):
                 except Exception: pass
         except Exception as e:
             LOGGER.error("[Main] apply_from_gui error: %s", e)
-
-def reset_stimulus_window(self):
-    """Close + relaunch the stimulus window (useful if it got stuck/off-screen)."""
-    try:
-        self.runner.stim.reset_window()
-        if self.cfg.prewarm_stim:
-            self.runner.stim.open_persistent(self.cfg.stim_screen_index, self.cfg.stim_fullscreen, self.cfg.stim_bg_grey)
-        self.gui.lbl_status.setText("Status: Stimulus window reset.")
-        LOGGER.info("[Stim] Window reset requested from GUI")
-    except Exception as e:
-        LOGGER.warning("[Stim] Window reset failed: %s", e)
-
-    def _on_preset_load(self, name: str):
-        try:
-            d = self.user_presets.get(name)
-            if not isinstance(d, dict):
-                return
-            self.gui.apply_preset_dict_to_gui(d)
-            self.gui.lbl_status.setText(f"Status: Loaded preset '{name}'. Click Apply Settings to activate.")
-        except Exception as e:
-            LOGGER.warning("[Presets] Load failed: %s", e)
-
-    def _on_preset_save(self, name: str, data_obj: object):
-        try:
-            if not isinstance(data_obj, dict):
-                return
-            # Normalize name
-            name = (name or "").strip()
-            if not name:
-                return
-            self.user_presets[name] = data_obj
-            _save_user_presets(self.user_presets)
-            self.gui.set_user_preset_names(sorted(self.user_presets.keys(), key=lambda s: s.lower()))
-            self.gui.cb_user_preset.setCurrentText(name)
-            self.gui.lbl_status.setText(f"Status: Saved preset '{name}'.")
-        except Exception as e:
-            LOGGER.warning("[Presets] Save failed: %s", e)
-
-    def _on_preset_delete(self, name: str):
-        try:
-            name = (name or "").strip()
-            if not name:
-                return
-            if name in BUILTIN_USER_PRESETS:
-                self.gui.lbl_status.setText(f"Status: '{name}' is a built-in preset and cannot be deleted. Use Save As… to customize.")
-                return
-            if name in self.user_presets:
-                self.user_presets.pop(name, None)
-                _save_user_presets(self.user_presets)
-                self.gui.set_user_preset_names(sorted(self.user_presets.keys(), key=lambda s: s.lower()))
-                self.gui.lbl_status.setText(f"Status: Deleted preset '{name}'.")
-        except Exception as e:
-            LOGGER.warning("[Presets] Delete failed: %s", e)
 
     def update_previews(self):
         try:
