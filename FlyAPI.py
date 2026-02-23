@@ -1,190 +1,56 @@
 # FlyAPI.py
 # FlyPy — Unified Trigger → Cameras + Lights + Looming Stimulus
-# v1.35.5
-# - FIX: PySpin device selection now matches DeviceSerialNumber (not UniqueID),
-#        so each serial (e.g., 24102007 vs 24102017) opens the correct camera.
-# - FIX: Handle "BeginAcquisition: Camera is already streaming" once, avoid spam.
-# - FIX: Advanced… toggle handler signature accepts clicked(bool), no crash.
-# - FIX: Logging init now resets handlers cleanly (avoids duplicate/empty tmp logs on re-run in same process).
-# - Keeps: process-lifetime PySpin System; distinct default assignment after Refresh.
-# - Keeps: logs under Desktop\LevitatingInsect-main\logs with end timestamp
-# - Keeps: preview toggles off by default, full-res recording only, FPS probe
-# - Keeps: stimulus start/end size, fullscreen/screen chooser, simulation mode
+# v1.39.0 (robust recording start sync; white-background defaults; Spinnaker soft-trigger fallback; lights/stim run during active recording)
+#
+# 1.39.0:
+# - FIX: Recording threads no longer block before lights/stim; lights and stimulus now run WHILE cameras are recording.
+# - FIX: Each camera waits until the first frame is actually captured before starting the duration clock (or falls back to software-trigger/synthetic frames).
+# - FIX: Guarantees at least 2 frames written and non-zero duration files; adds soft-trigger fallback for PySpin if HW trigger produces no frames.
+# - PRESET: Quick presets now force white stimulus background and keep the stimulus window open; prewarm option enabled.
+# - UI: Preview placeholders use pure white background for consistency.
+# - STABILITY: Optional free-run/software trigger fallback when HW has no frames; synchronous "recording-started" events gate the timing of lights/stim.
 
-import os, sys, time, csv, atexit, threading, queue, logging, shutil
+import os, sys, time, csv, atexit, threading, queue, logging, shutil, importlib
 from collections import deque
 from datetime import datetime
 from typing import Optional, Tuple, List, Dict
-import importlib
+
 import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
 
-# -------------------- Built-in + User Presets --------------------
-# Built-in presets are always available in the GUI. User presets are saved to JSON next to this script.
-BUILTIN_USER_PRESETS: Dict[str, dict] = {
-    "Default": {
-        "stim_type": "dot",
-        "stim_image_path": "",
-        "stim_duration_s": 1.000,
-        "stim_r0_px": 10,
-        "stim_r1_px": 450,
-        "stim_delay_s": 0.000,
-        "lights_delay_s": 0.000,
-    },
-    "Opto + Looming (dot)": {
-        "stim_type": "dot",
-        "stim_image_path": "",
-        "stim_duration_s": 1.000,
-        "stim_r0_px": 10,
-        "stim_r1_px": 450,
-        "stim_delay_s": 0.150,
-        "lights_delay_s": 0.000,
-    },
-    "Looming Image (example)": {
-        "stim_type": "image",
-        "stim_image_path": "",
-        "stim_duration_s": 1.000,
-        "stim_r0_px": 25,
-        "stim_r1_px": 600,
-        "stim_delay_s": 0.150,
-        "lights_delay_s": 0.000,
-    },
-}
-
-_USER_PRESETS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flypy_user_presets.json")
-
-
-def _load_user_presets() -> Dict[str, dict]:
-    """Return {name: preset_dict}. Never raises."""
-    try:
-        import json
-        if not os.path.exists(_USER_PRESETS_PATH):
-            return {}
-        with open(_USER_PRESETS_PATH, "r", encoding="utf-8") as f:
-            obj = json.load(f)
-        if isinstance(obj, dict):
-            return {str(k): v for k, v in obj.items() if isinstance(v, dict)}
-    except Exception as e:
-        try:
-            LOGGER.warning("[Presets] Could not load presets: %s", e)
-        except Exception:
-            pass
-    return {}
-
-
-def _save_user_presets(presets: Dict[str, dict]) -> None:
-    try:
-        import json
-        tmp = _USER_PRESETS_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(presets, f, indent=2, sort_keys=True)
-        shutil.move(tmp, _USER_PRESETS_PATH)
-    except Exception as e:
-        try:
-            LOGGER.warning("[Presets] Could not save presets: %s", e)
-        except Exception:
-            pass
-
-
-def _cfg_to_preset_dict(cfg: "Config") -> Dict[str, object]:
-    out: Dict[str, object] = {}
-    for k, v in getattr(cfg, "__dict__", {}).items():
-        if isinstance(v, (str, int, float, bool)) or v is None:
-            out[k] = v
-        elif isinstance(v, (list, tuple)):
-            out[k] = list(v)
-        else:
-            out[k] = str(v)
-    return out
-
-
-def _apply_preset_to_cfg(cfg: "Config", preset: Dict[str, object]) -> None:
-    for k, v in preset.items():
-        if hasattr(cfg, k):
-            try:
-                setattr(cfg, k, v)
-            except Exception:
-                pass
-
-
-__version__ = "1.35.5"
+__version__ = "1.39.0"
 
 # -------------------- Logging --------------------
-LOG_DIR_DEFAULT = r"C:\Users\Murpheylab\Desktop\LevitatingInsect-main\logs"
+LOG_DIR_DEFAULT = r"C:\\Users\\Murpheylab\\Desktop\\LevitatingInsect-main\\logs"
+def ensure_dir(p:str): os.makedirs(p, exist_ok=True)
+def now_stamp()->str: return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+def day_stamp()->str: return datetime.now().strftime("%Y%m%d")
 
-
-def ensure_dir(p: str):
-    os.makedirs(p, exist_ok=True)
-
-
-def now_stamp() -> str:
-    return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-
-
-def day_stamp() -> str:
-    return datetime.now().strftime("%Y%m%d")
-
-
-def init_logging() -> tuple[logging.Logger, str]:
-    """
-    Initialize logging deterministically.
-
-    Important behavior:
-    - If a previous handler exists (e.g., in an embedded run or re-launch in same interpreter),
-      we clear it so the new tmp log file actually receives logs and finalize_logging can rename it.
-    """
-    log_dir = LOG_DIR_DEFAULT if os.name == "nt" else os.path.join(os.getcwd(), "logs")
+def init_logging():
+    log_dir = LOG_DIR_DEFAULT if os.name=="nt" else os.path.join(os.getcwd(),"logs")
     ensure_dir(log_dir)
     start_stamp = now_stamp()
     tmp_name = os.path.join(log_dir, f"FlyPy_run_{start_stamp}.log.tmp")
-
     logger = logging.getLogger("FlyPy")
     logger.setLevel(logging.DEBUG)
-
-    # Clear existing handlers to avoid duplicate output and "dead" tmp file paths.
-    try:
-        for h in list(logger.handlers):
-            try:
-                h.flush()
-                h.close()
-            except Exception:
-                pass
-            logger.removeHandler(h)
-    except Exception:
-        pass
-
     fmt = logging.Formatter("%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
-
     fh = logging.FileHandler(tmp_name, encoding="utf-8")
-    fh.setFormatter(fmt)
-    fh.setLevel(logging.DEBUG)
-
+    fh.setFormatter(fmt); fh.setLevel(logging.DEBUG)
     ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(fmt)
-    ch.setLevel(logging.INFO)
-
-    logger.addHandler(fh)
-    logger.addHandler(ch)
-
+    ch.setFormatter(fmt); ch.setLevel(logging.INFO)
+    if not logger.handlers:
+        logger.addHandler(fh); logger.addHandler(ch)
     logger.info(f"=== FlyPy Log Start v{__version__} ===")
     return logger, tmp_name
 
-
 LOGGER, _LOG_TMP_PATH = init_logging()
-
 
 def finalize_logging():
     try:
         for h in list(LOGGER.handlers):
-            try:
-                h.flush()
-                h.close()
-            except Exception:
-                pass
-            try:
-                LOGGER.removeHandler(h)
-            except Exception:
-                pass
+            try: h.flush(); h.close()
+            except Exception: pass
+            LOGGER.removeHandler(h)
     except Exception:
         pass
     try:
@@ -192,85 +58,57 @@ def finalize_logging():
         final_name = _LOG_TMP_PATH.replace(".tmp", f"__ENDED_{end_stamp}.log")
         if os.path.exists(_LOG_TMP_PATH):
             base, ext = os.path.splitext(final_name)
-            i = 1
+            i=1
             while os.path.exists(final_name):
-                final_name = f"{base}_{i}{ext}"
-                i += 1
+                final_name = f"{base}_{i}{ext}"; i+=1
             shutil.move(_LOG_TMP_PATH, final_name)
     except Exception:
         pass
 
-
 def excepthook(exctype, value, tb):
     import traceback
     msg = "".join(traceback.format_exception(exctype, value, tb))
-    try:
-        LOGGER.critical("UNCAUGHT EXCEPTION:\n%s", msg)
-    except Exception:
-        pass
+    try: LOGGER.critical("UNCAUGHT EXCEPTION:\n%s", msg)
+    except Exception: pass
     sys.__excepthook__(exctype, value, tb)
-
 
 sys.excepthook = excepthook
 atexit.register(finalize_logging)
 
 try:
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stderr.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8"); sys.stderr.reconfigure(encoding="utf-8")
 except Exception:
     pass
 
 # -------------------- Optional Libraries --------------------
 try:
-    import cv2
-    HAVE_OPENCV = True
+    import cv2; HAVE_OPENCV=True
 except Exception as e:
-    LOGGER.warning("OpenCV not available: %s", e)
-    HAVE_OPENCV = False
-    cv2 = None  # type: ignore
+    LOGGER.warning("OpenCV not available: %s", e); HAVE_OPENCV=False; cv2=None  # type: ignore
 
-PSY_LOADED = None
-visual = None
-core = None
-
-
-def _ensure_psychopy_loaded() -> bool:
+PSY_LOADED=None; visual=None; core=None
+def _ensure_psychopy_loaded()->bool:
+    """Prefer PsychoPy stimulus; fall back to OpenCV if unavailable."""
     global PSY_LOADED, visual, core
-    if PSY_LOADED is True:
-        return True
-    if PSY_LOADED is False:
-        return False
+    if PSY_LOADED is True: return True
+    if PSY_LOADED is False: return False
     try:
         importlib.import_module("psychopy")
-        visual = importlib.import_module("psychopy.visual")
-        core = importlib.import_module("psychopy.core")
-        PSY_LOADED = True
-        LOGGER.info("PsychoPy available")
-        return True
+        visual=importlib.import_module("psychopy.visual")
+        core  =importlib.import_module("psychopy.core")
+        PSY_LOADED=True; LOGGER.info("PsychoPy available"); return True
     except Exception as e:
         LOGGER.info("PsychoPy not available (%s) → using OpenCV fallback", e)
-        visual = None
-        core = None
-        PSY_LOADED = False
-        return False
+        visual=None; core=None; PSY_LOADED=False; return False
 
-
-def wait_s(sec: float):
+def wait_s(sec:float):
     if _ensure_psychopy_loaded():
-        try:
-            core.wait(sec)
-            return
-        except Exception:
-            pass
+        try: core.wait(sec); return
+        except Exception: pass
     time.sleep(sec)
 
-
-def day_folder(root: str) -> str:
-    d = day_stamp()
-    path = os.path.join(root, d)
-    ensure_dir(path)
-    return path
-
+def day_folder(root:str)->str:
+    d=day_stamp(); path=os.path.join(root,d); ensure_dir(path); return path
 
 try:
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling)
@@ -279,136 +117,184 @@ except Exception:
     pass
 
 # -------------------- Video Presets --------------------
-VIDEO_PRESETS = [
-    {"id": "avi_mjpg", "label": "AVI / MJPG — light CPU, huge files (fast)", "fourcc": "MJPG"},
-    {"id": "avi_xvid", "label": "AVI / XVID — broad compatibility", "fourcc": "XVID"},
-    {"id": "mp4_mp4v", "label": "MP4 / mp4v — very compatible", "fourcc": "mp4v"},
+VIDEO_PRESETS=[
+    {"id":"avi_mjpg","label":"AVI / MJPG — light CPU, huge files (fast)","fourcc":"MJPG"},
+    {"id":"avi_xvid","label":"AVI / XVID — broad compatibility","fourcc":"XVID"},
+    {"id":"mp4_mp4v","label":"MP4 / mp4v — very compatible","fourcc":"mp4v"},
 ]
-PRESETS_BY_ID = {p["id"]: p for p in VIDEO_PRESETS}
+PRESETS_BY_ID={p["id"]:p for p in VIDEO_PRESETS}
+def default_preset_id()->str: return "avi_mjpg"
 
-
-def default_preset_id() -> str:
-    return "avi_mjpg"
-
+# -------------------- Circle Stimulus Presets (all force white background) --------------------
+CIRCLE_PRESETS = [
+    {"label": "Standard (0.50 s, r0=8 → r1=300, bg=1.0)", "dur": 0.50, "r0": 8,  "r1": 300, "bg": 1.0},
+    {"label": "Fast (0.25 s, r0=8 → r1=300, bg=1.0)",     "dur": 0.25, "r0": 8,  "r1": 300, "bg": 1.0},
+    {"label": "Slow (1.00 s, r0=8 → r1=300, bg=1.0)",     "dur": 1.00, "r0": 8,  "r1": 300, "bg": 1.0},
+    {"label": "Large Final (0.50 s, r0=8 → r1=400, bg=1.0)","dur":0.50, "r0": 8,"r1": 400, "bg": 1.0},
+    {"label": "Small Start (0.50 s, r0=4 → r1=240, bg=1.0)","dur":0.50, "r0": 4,"r1": 240, "bg": 1.0},
+]
 
 # -------------------- Config --------------------
 class Config:
     def __init__(self):
-        self.simulation_mode = False
-        self.sim_trigger_interval = 5.0
-        self.output_root = "FlyPy_Output"
-        self.prewarm_stim = False
+        # General
+        self.simulation_mode=False
+        self.sim_trigger_interval=5.0
+        self.output_root="FlyPy_Output"
+        self.prewarm_stim=False
 
-        self.video_preset_id = default_preset_id()
-        self.fourcc = PRESETS_BY_ID[self.video_preset_id]["fourcc"]
-        self.record_duration_s = 3.0
+        # Video
+        self.video_preset_id=default_preset_id()
+        self.fourcc=PRESETS_BY_ID[self.video_preset_id]["fourcc"]
+        self.record_duration_s=3.0
+        self.record_start_timeout_s=2.0  # wait up to this long for first frame before falling back
 
         # Stimulus
-        self.stim_duration_s = 1.5
-        self.stim_r0_px = 8
-        self.stim_r1_px = 240
-        self.stim_bg_grey = 1.0
-        self.stim_type = "dot"          # 'dot' | 'image'
-        self.stim_image_path = ""       # used when stim_type == 'image'
-        self.lights_delay_s = 0.0
-        self.stim_delay_s = 0.0
-        self.stim_screen_index = 0
-        self.stim_fullscreen = False
-        self.gui_screen_index = 0
+        self.stim_duration_s=1.5
+        self.stim_r0_px=8
+        self.stim_r1_px=240
+        self.stim_bg_grey=1.0  # FORCE WHITE background by default
+        self.lights_delay_s=0.0
+        self.stim_delay_s=0.0
+        self.stim_screen_index=0
+        self.stim_fullscreen=False
+        self.gui_screen_index=0
+
+        # Stimulus type
+        self.stim_kind="circle"              # "circle" | "png"
+        self.stim_png_path=""                # filesystem path
+        self.stim_png_keep_aspect=True
+        self.stim_keep_window_open=True
 
         # Cameras
-        self.cam0_backend = "PySpin"
-        self.cam1_backend = "PySpin"
-        self.cam0_id = ""
-        self.cam1_id = ""
-        self.cam0_target_fps = 522
-        self.cam1_target_fps = 522
-        self.cam0_width = 0
-        self.cam1_width = 0
-        self.cam0_height = 0
-        self.cam1_height = 0
-        self.cam0_exposure_us = 1500
-        self.cam1_exposure_us = 1500
-        self.cam0_hw_trigger = False
-        self.cam1_hw_trigger = False
-        self.cam_async_writer = True
+        self.cam0_backend="PySpin"; self.cam1_backend="PySpin"
+        self.cam0_id=""; self.cam1_id=""
+        self.cam0_target_fps=522; self.cam1_target_fps=522
+        self.cam0_width=0; self.cam1_width=0
+        self.cam0_height=0; self.cam1_height=0
+        self.cam0_exposure_us=1500; self.cam1_exposure_us=1500
+        self.cam0_hw_trigger=True; self.cam1_hw_trigger=True  # prefer HW trigger by default
+        self.cam_async_writer=True
 
+        # Serial triggers
+        self.min_trigger_interval_s = 0.30   # debounce
+        self.token_trigger = "T"             # expected trigger line
+
+        # Behavior: allow fallback when HW yields no frames at start.
+        self.hw_no_frame_fallback=True
 
 # -------------------- Hardware Bridge --------------------
 class HardwareBridge:
-    def __init__(self, cfg: Config, port: str = None, baud: int = 115200):
-        self.cfg = cfg
-        self.simulated = cfg.simulation_mode
-        self.port = port
-        self.baud = baud
-        self._opened = False
-        self._last_sim = time.time()
-        self.ser = None
+    """Strict token 'T' only; debounced. No arming window."""
+    def __init__(self,cfg:Config,port:str=None,baud:int=115200):
+        self.cfg=cfg
+        self.port=port
+        self.baud=baud
+        self.ser=None
+        self._opened=False
+        self._last_sim=time.time()
+        self._pyserial_ok=True
+        self._last_trigger_time=0.0
+        self.simulated = bool(cfg.simulation_mode)
 
-    def _autodetect_port(self) -> Optional[str]:
+        try:
+            import serial  # noqa: F401
+        except Exception as e:
+            self._pyserial_ok=False
+            LOGGER.info("[HW] pyserial not available (%s); serial triggers disabled", e)
+
+    def _autodetect_port(self)->Optional[str]:
+        if not self._pyserial_ok:
+            return None
         try:
             import serial.tools.list_ports
             for p in serial.tools.list_ports.comports():
-                vid = f"{p.vid:04X}" if p.vid is not None else None
-                pid = f"{p.pid:04X}" if p.pid is not None else None
-                if vid == "1A86" and pid == "7523":
-                    return p.device
+                vid=f"{p.vid:04X}" if p.vid is not None else None
+                pid=f"{p.pid:04X}" if p.pid is not None else None
+                if vid=="1A86" and pid=="7523": return p.device  # CH340
             for p in serial.tools.list_ports.comports():
-                d = (p.description or "").lower()
-                if "ch340" in d or "uno" in d or "elegoo" in d:
-                    return p.device
+                d=(p.description or "").lower()
+                if "ch340" in d or "uno" in d or "elegoo" in d or "arduino" in d: return p.device
         except Exception as e:
             LOGGER.debug("Port autodetect failed: %s", e)
         return None
 
     def _open_if_needed(self):
-        if self.simulated or self._opened:
+        if self.simulated or not self._pyserial_ok:
             return
-        self._opened = True
+        if self._opened and self.ser:
+            return
         try:
             import serial
-            if not self.port:
-                self.port = self._autodetect_port()
-            if self.port:
-                try:
-                    self.ser = serial.Serial(self.port, self.baud, timeout=0.01)
-                    wait_s(1.2)
-                    LOGGER.info("[HW] Serial open: %s @ %d", self.port, self.baud)
-                except Exception as e:
-                    LOGGER.warning("[HW] Open failed: %s → simulation", e)
-                    self.simulated = True
-            else:
-                LOGGER.info("[HW] No CH340/UNO port found → simulation")
-                self.simulated = True
-        except Exception as e:
-            LOGGER.info("[HW] pyserial not available (%s) → simulation", e)
-            self.simulated = True
-
-    def check_trigger(self) -> bool:
-        if self.simulated:
-            now = time.time()
-            if now - self._last_sim >= self.cfg.sim_trigger_interval:
-                self._last_sim = now
-                LOGGER.info("[HW] (Sim) Trigger")
-                return True
-            return False
-        self._open_if_needed()
-        try:
-            if self.ser and self.ser.in_waiting:
-                line = self.ser.readline().decode(errors="ignore").strip()
-                if line == "T":
-                    return True
-        except Exception as e:
-            LOGGER.warning("[HW] Read error: %s", e)
-        return False
-
-    def _send(self, text: str):
-        self._open_if_needed()
-        if self.simulated or not self.ser:
-            LOGGER.info("[HW] (Sim) SEND: %s", text)
+        except Exception:
             return
         try:
-            self.ser.write((text.strip() + "\n").encode("utf-8", errors="ignore"))
+            if not self.port:
+                self.port=self._autodetect_port()
+            if not self.port:
+                return
+            self.ser=serial.Serial(self.port,self.baud,timeout=0.01)
+            try: self.ser.reset_input_buffer()
+            except Exception: pass
+            self._opened=True
+            LOGGER.info("[HW] Serial open: %s @ %d", self.port, self.baud)
+        except Exception as e:
+            self.ser=None
+            self._opened=False
+            LOGGER.warning("[HW] Could not open serial (%s). Will keep trying; no auto-sim.", e)
+
+    def check_trigger(self)->bool:
+        # Simulation: generate a 'T' periodically
+        if self.simulated:
+            now=time.time()
+            if now-self._last_sim>=self.cfg.sim_trigger_interval:
+                self._last_sim=now
+                return True
+            return False
+
+        if not self._pyserial_ok:
+            return False
+        self._open_if_needed()
+        if not self.ser:
+            return False
+
+        fired=False
+        try:
+            # Read and handle ALL pending lines
+            while self.ser.in_waiting:
+                line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                if not line:
+                    continue
+                if line == self.cfg.token_trigger:
+                    if not fired:
+                        fired=True
+                else:
+                    LOGGER.debug("[HW] Ignored token: %r", line)
+        except Exception as e:
+            LOGGER.warning("[HW] Read error: %s", e)
+            return False
+
+        if not fired:
+            return False
+
+        # Debounce
+        now=time.time()
+        if now - self._last_trigger_time < float(self.cfg.min_trigger_interval_s):
+            LOGGER.debug("[HW] Debounced T (%.3fs < %.3fs)", now-self._last_trigger_time, self.cfg.min_trigger_interval_s)
+            return False
+
+        self._last_trigger_time=now
+        LOGGER.info("[HW] Valid TRIGGER")
+        return True
+
+    def _send(self,text:str):
+        if self.simulated:
+            LOGGER.info("[HW] (Sim) SEND: %s", text); return
+        try:
+            self._open_if_needed()
+            if not self.ser:
+                return
+            self.ser.write((text.strip()+"\n").encode("utf-8",errors="ignore"))
         except Exception as e:
             LOGGER.warning("[HW] Write error: %s", e)
 
@@ -416,107 +302,78 @@ class HardwareBridge:
     def mark_end(self):   self._send("MARK END")
     def lights_on(self):  self._send("LIGHT ON")
     def lights_off(self): self._send("LIGHT OFF")
-
     def close(self):
-        if not self.simulated and self.ser:
-            try:
-                self.ser.close()
-            except Exception:
-                pass
-        self.ser = None
-        self._opened = False
-
+        if self.ser:
+            try: self.ser.close()
+            except Exception: pass
+        self.ser=None; self._opened=False
 
 # -------------------- Camera Backends --------------------
 class BaseCamera:
     def open(self): raise NotImplementedError
     def get_frame(self): raise NotImplementedError
     def release(self): raise NotImplementedError
-    def frame_size(self) -> Tuple[int, int]: raise NotImplementedError
+    def frame_size(self)->Tuple[int,int]: raise NotImplementedError
     def start_acquisition(self): pass
     def stop_acquisition(self): pass
 
+# ---- OpenCV camera ----
+try:
+    import cv2  # ensure alias present
+except Exception:
+    pass
 
 class OpenCVCamera(BaseCamera):
-    def __init__(self, index: int, target_fps: float):
-        if not HAVE_OPENCV:
-            raise RuntimeError("OpenCV is not installed")
-        self.index = index
-        self.target_fps = float(target_fps)
-        self.cap = None
-
+    def __init__(self,index:int,target_fps:float):
+        if not HAVE_OPENCV: raise RuntimeError("OpenCV is not installed")
+        self.index=index; self.target_fps=float(target_fps); self.cap=None
     def open(self):
-        backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY] if os.name == "nt" else [cv2.CAP_ANY]
+        backends=[cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY] if os.name=="nt" else [cv2.CAP_ANY]
         for be in backends:
             try:
-                cap = cv2.VideoCapture(self.index, be)
+                cap=cv2.VideoCapture(self.index, be)
                 if cap and cap.isOpened():
                     try:
                         cap.set(cv2.CAP_PROP_FPS, float(self.target_fps))
                         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-                    except Exception:
-                        pass
-                    self.cap = cap
-                    LOGGER.info("[OpenCV] index %d opened via backend=%s", self.index, be)
-                    return
-                if cap:
-                    cap.release()
+                    except Exception: pass
+                    self.cap=cap; LOGGER.info("[OpenCV] index %d opened via backend=%s", self.index, be); return
+                if cap: cap.release()
             except Exception as e:
                 LOGGER.debug("OpenCV backend %s failed: %s", be, e)
-        self.cap = None
-
+        self.cap=None
     def start_acquisition(self): pass
-
     def get_frame(self):
-        if not self.cap:
-            return None
-        ok, frame = self.cap.read()
-        if not ok or frame is None:
-            return None
-        if frame.ndim == 2:
-            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        if not self.cap: return None
+        ok,frame=self.cap.read()
+        if not ok or frame is None: return None
+        if frame.ndim==2:
+            frame=cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         return frame
-
     def frame_size(self):
-        if self.cap:
-            return (
-                int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640),
-                int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480),
-            )
-        return (640, 480)
-
+        if self.cap: return (int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640), int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480))
+        return (640,480)
     def stop_acquisition(self): pass
-
     def release(self):
         if self.cap:
-            try:
-                self.cap.release()
-            except Exception:
-                pass
-            self.cap = None
-
+            try: self.cap.release()
+            except Exception: pass
+            self.cap=None
 
 # -------- PySpin backend (Spinnaker) --------
-HAVE_PYSPIN = False
-PySpin = None
-_SPIN_SYS = None
-
-
+HAVE_PYSPIN=False; PySpin=None; _SPIN_SYS=None
 def _spin_system_get():
-    """Get (and keep) the singleton System for the process lifetime."""
     global PySpin, HAVE_PYSPIN, _SPIN_SYS
     if not HAVE_PYSPIN:
         try:
             import PySpin as _ps
-            PySpin = _ps
-            HAVE_PYSPIN = True
+            PySpin=_ps; HAVE_PYSPIN=True
         except Exception as e:
             LOGGER.info("[PySpin] Not available: %s", e)
             return None
     if _SPIN_SYS is None:
         _SPIN_SYS = PySpin.System.GetInstance()
     return _SPIN_SYS
-
 
 def _spin_system_release_final():
     global _SPIN_SYS
@@ -525,21 +382,17 @@ def _spin_system_release_final():
             _SPIN_SYS.ReleaseInstance()
         except Exception as e:
             LOGGER.warning("[PySpin] ReleaseInstance warning (final): %s", e)
-        _SPIN_SYS = None
+        _SPIN_SYS=None
 
-
-def spin_enumerate() -> List[Dict[str, str]]:
-    """Return list of {'serial','model','display'}; safe wrt SWIG refs."""
-    sys_inst = _spin_system_get()
-    out = []
-    if sys_inst is None:
-        return out
+def spin_enumerate()->List[Dict[str,str]]:
+    sys_inst=_spin_system_get()
+    out=[]
+    if sys_inst is None: return out
     lst = sys_inst.GetCameras()
     try:
         n = lst.GetSize()
         for i in range(n):
-            cam = None
-            dmap = None
+            cam=None; dmap=None
             try:
                 cam = lst.GetByIndex(i)
                 dmap = cam.GetTLDeviceNodeMap()
@@ -558,86 +411,64 @@ def spin_enumerate() -> List[Dict[str, str]]:
                     s_model = PySpin.CStringPtr(dmap.GetNode("DeviceModelName")).GetValue()
                 except Exception:
                     s_model = "UnknownModel"
-                out.append({"serial": str(s_serial), "model": str(s_model), "display": f"PySpin {s_serial} — {s_model}"})
-            except Exception as e:
-                LOGGER.debug("[PySpin] enumerate cam %d failed: %s", i, e)
+                out.append({"serial":str(s_serial), "model":str(s_model), "display":f"PySpin {s_serial} — {s_model}"})
             finally:
-                dmap = None
-                cam = None
+                try: dmap = None
+                except Exception: pass
+                try: cam = None
+                except Exception: pass
     finally:
-        try:
-            lst.Clear()
-        except Exception:
-            pass
-        try:
-            del lst
-        except Exception:
-            pass
+        try: lst.Clear()
+        except Exception: pass
+        try: del lst
+        except Exception: pass
     return out
-
 
 def _safe_set_enum(nodemap, name, symbolic):
     try:
         node = PySpin.CEnumerationPtr(nodemap.GetNode(name))
-        if not PySpin.IsWritable(node):
-            return False
+        if not PySpin.IsWritable(node): return False
         entry = node.GetEntryByName(symbolic)
-        if not PySpin.IsReadable(entry):
-            return False
-        node.SetIntValue(entry.GetValue())
-        return True
+        if not PySpin.IsReadable(entry): return False
+        node.SetIntValue(entry.GetValue()); return True
     except Exception as e:
         LOGGER.debug("[PySpin] Enum %s=%s failed: %s", name, symbolic, e)
         return False
-
-
 def _safe_set_float(nodemap, name, value):
     try:
         node = PySpin.CFloatPtr(nodemap.GetNode(name))
-        if not PySpin.IsWritable(node):
-            return False
+        if not PySpin.IsWritable(node): return False
         lo, hi = node.GetMin(), node.GetMax()
         v = max(lo, min(hi, float(value)))
-        node.SetValue(v)
-        return True
+        node.SetValue(v); return True
     except Exception as e:
         LOGGER.debug("[PySpin] Float %s=%s failed: %s", name, value, e)
         return False
-
-
-def _safe_set_bool(nodemap, name, value: bool):
+def _safe_set_bool(nodemap, name, value:bool):
     try:
         node = PySpin.CBooleanPtr(nodemap.GetNode(name))
-        if not PySpin.IsWritable(node):
-            return False
-        node.SetValue(bool(value))
-        return True
+        if not PySpin.IsWritable(node): return False
+        node.SetValue(bool(value)); return True
     except Exception as e:
         LOGGER.debug("[PySpin] Bool %s=%s failed: %s", name, value, e)
         return False
-
-
 def _align_to_inc(val, inc, lo, hi):
-    if inc <= 0:
-        return int(max(lo, min(hi, val)))
+    if inc <= 0: return int(max(lo, min(hi, val)))
     v = int(val // inc * inc)
     return max(int(lo), min(int(hi), int(v)))
 
-
 class SpinnakerCamera(BaseCamera):
-    def __init__(self, serial: str, target_fps: float, width: int = 0, height: int = 0, exposure_us: int = 1500, hw_trigger: bool = False):
+    """
+    Preview soft-trigger support and robust record configuration.
+    """
+    def __init__(self, serial:str, target_fps:float, width:int=0, height:int=0, exposure_us:int=1500, hw_trigger:bool=False):
         self.serial = (serial or "").strip()
         self.target_fps = float(target_fps)
-        self.req_w = int(width)
-        self.req_h = int(height)
+        self.req_w = int(width); self.req_h = int(height)
         self.exposure_us = int(exposure_us)
         self.hw_trigger = bool(hw_trigger)
-        self.cam = None
-        self.node = None
-        self.snode = None
-        self._acq = False
-        self._last_size = (640, 480)
-        self._mono = True
+        self.cam = None; self.node = None; self.snode = None
+        self._acq = False; self._last_size = (640,480); self._mono = True
 
     def open(self):
         sys_inst = _spin_system_get()
@@ -647,7 +478,7 @@ class SpinnakerCamera(BaseCamera):
         chosen_idx = 0
         try:
             n = lst.GetSize()
-            if n == 0:
+            if n==0:
                 raise RuntimeError("No Spinnaker cameras detected")
             if self.serial:
                 for i in range(n):
@@ -663,18 +494,14 @@ class SpinnakerCamera(BaseCamera):
                             except Exception:
                                 try:
                                     sn = cam_i.GetUniqueID()
-                                except Exception:
-                                    sn = None
+                                except Exception: sn = None
                         if str(sn) == str(self.serial):
-                            chosen_idx = i
-                            break
+                            chosen_idx = i; break
                     except Exception:
                         pass
             chosen = lst.GetByIndex(chosen_idx)
-            self.cam = chosen
-            self.cam.Init()
-            self.node = self.cam.GetNodeMap()
-            self.snode = self.cam.GetTLStreamNodeMap()
+            self.cam = chosen; self.cam.Init()
+            self.node = self.cam.GetNodeMap(); self.snode = self.cam.GetTLStreamNodeMap()
 
             _safe_set_enum(self.snode, "StreamBufferHandlingMode", "NewestOnly")
             try:
@@ -682,8 +509,7 @@ class SpinnakerCamera(BaseCamera):
                 if PySpin.IsWritable(mode):
                     mode.SetIntValue(mode.GetEntryByName("Manual").GetValue())
                     cnt = PySpin.CIntegerPtr(self.snode.GetNode("StreamBufferCountManual"))
-                    if PySpin.IsWritable(cnt):
-                        cnt.SetValue(max(int(cnt.GetMin()), min(int(cnt.GetMax()), 64)))
+                    if PySpin.IsWritable(cnt): cnt.SetValue(max(int(cnt.GetMin()), min(int(cnt.GetMax()), 192)))  # larger buffer
             except Exception as e:
                 LOGGER.debug("[PySpin] Stream buffer config note: %s", e)
 
@@ -698,1215 +524,1061 @@ class SpinnakerCamera(BaseCamera):
                 h = PySpin.CIntegerPtr(self.node.GetNode("Height"))
                 ox = PySpin.CIntegerPtr(self.node.GetNode("OffsetX"))
                 oy = PySpin.CIntegerPtr(self.node.GetNode("OffsetY"))
-                maxw = int(w.GetMax())
-                maxh = int(h.GetMax())
-                incw = int(w.GetInc()) or 2
-                inch = int(h.GetInc()) or 2
-                reqw = maxw if self.req_w <= 0 or self.req_w > maxw else _align_to_inc(self.req_w, incw, w.GetMin(), maxw)
-                reqh = maxh if self.req_h <= 0 or self.req_h > maxh else _align_to_inc(self.req_h, inch, h.GetMin(), maxh)
-                cx = max(0, (maxw - reqw) // (2 * incw) * incw)
-                cy = max(0, (maxh - reqh) // (2 * inch) * inch)
+                maxw = int(w.GetMax()); maxh = int(h.GetMax())
+                incw = int(w.GetInc()) or 2; inch = int(h.GetInc()) or 2
+                reqw = maxw if self.req_w<=0 or self.req_w>maxw else _align_to_inc(self.req_w, incw, w.GetMin(), maxw)
+                reqh = maxh if self.req_h<=0 or self.req_h>maxh else _align_to_inc(self.req_h, inch, h.GetMin(), maxh)
+                cx = max(0, (maxw - reqw)//(2*incw)*incw); cy = max(0, (maxh - reqh)//(2*inch)*inch)
                 if PySpin.IsWritable(ox): ox.SetValue(cx)
                 if PySpin.IsWritable(oy): oy.SetValue(cy)
-                w.SetValue(reqw)
-                h.SetValue(reqh)
+                w.SetValue(reqw); h.SetValue(reqh)
                 self._last_size = (int(reqw), int(reqh))
             except Exception as e:
                 LOGGER.info("[PySpin] ROI note: %s", e)
 
             _safe_set_enum(self.node, "ExposureAuto", "Off")
-            if self.exposure_us > 0:
-                period_us = 1e6 / max(1.0, self.target_fps)
-                exp_us = min(self.exposure_us, int(period_us * 0.85))
+            if self.exposure_us>0:
+                period_us = 1e6/max(1.0, self.target_fps)
+                exp_us = min(self.exposure_us, int(period_us*0.85))
                 _safe_set_float(self.node, "ExposureTime", exp_us)
             _safe_set_enum(self.node, "GainAuto", "Off")
-
-            if not self.hw_trigger:
-                _safe_set_bool(self.node, "AcquisitionFrameRateEnable", True)
-                _safe_set_float(self.node, "AcquisitionFrameRate", self.target_fps)
-            else:
-                _safe_set_bool(self.node, "AcquisitionFrameRateEnable", False)
-                _safe_set_enum(self.node, "TriggerMode", "Off")
-                _safe_set_enum(self.node, "TriggerSelector", "FrameStart")
-                _safe_set_enum(self.node, "TriggerSource", "Line0")
-                _safe_set_enum(self.node, "TriggerActivation", "RisingEdge")
-                _safe_set_enum(self.node, "TriggerOverlap", "ReadOut")
-                _safe_set_enum(self.node, "TriggerMode", "On")
 
             _safe_set_enum(self.node, "AcquisitionMode", "Continuous")
 
             try:
                 dl = PySpin.CFloatPtr(self.node.GetNode("DeviceLinkThroughputLimit"))
                 if dl and PySpin.IsWritable(dl):
-                    desired_Bps = self._last_size[0] * self._last_size[1] * (1 if self._mono else 1.5) * self.target_fps
-                    dl.SetValue(min(dl.GetMax(), max(dl.GetMin(), desired_Bps * 1.2)))
+                    desired_Bps = self._last_size[0]*self._last_size[1]*(1 if self._mono else 1.5)*self.target_fps
+                    dl.SetValue(min(dl.GetMax(), max(dl.GetMin(), desired_Bps*1.2)))
             except Exception:
                 pass
 
-            LOGGER.info("[PySpin] open: serial=%s size=%s fps=%.1f trig=%s",
-                        self.serial or "(first)", self._last_size, self.target_fps,
-                        "HW" if self.hw_trigger else "Free")
+            LOGGER.info("[PySpin] open: serial=%s size=%s fps=%.1f", self.serial or "(first)", self._last_size, self.target_fps)
         finally:
-            try:
-                lst.Clear()
-            except Exception:
-                pass
-            try:
-                del lst
-            except Exception:
-                pass
+            try: lst.Clear()
+            except Exception: pass
+            try: del lst
+            except Exception: pass
 
-    def start_acquisition(self):
+    # ---------- trigger configuration helpers ----------
+    def _set_trigger_mode(self, on:bool):
+        _safe_set_enum(self.node, "TriggerMode", "On" if on else "Off")
+    def _set_trigger_source(self, source:str):
+        _safe_set_enum(self.node, "TriggerSelector", "FrameStart")
+        _safe_set_enum(self.node, "TriggerSource", source)  # "Line0" or "Software"
+        _safe_set_enum(self.node, "TriggerActivation", "RisingEdge")
+        _safe_set_enum(self.node, "TriggerOverlap", "ReadOut")
+    def _set_framerate(self, fps:float):
+        _safe_set_bool(self.node, "AcquisitionFrameRateEnable", True)
+        _safe_set_float(self.node, "AcquisitionFrameRate", float(fps))
+
+    def configure_for_hw(self):
+        """Arm for external pulses (Line0)."""
+        self._set_trigger_mode(False)  # allow changing source
+        _safe_set_bool(self.node, "AcquisitionFrameRateEnable", False)
+        self._set_trigger_source("Line0")
+        self._set_trigger_mode(True)
+        LOGGER.debug("[PySpin] configured HW trigger Line0")
+
+    def configure_for_free_run(self):
+        """Continuous free-run at target fps."""
+        self._set_trigger_mode(False)
+        self._set_framerate(self.target_fps)
+        LOGGER.debug("[PySpin] configured free-run @ %.1f fps", self.target_fps)
+
+    def _ensure_started(self):
         if self.cam and not self._acq:
             try:
-                self.cam.BeginAcquisition()
-                self._acq = True
+                self.cam.BeginAcquisition(); self._acq=True
             except Exception as e:
                 msg = str(e).lower()
                 if "already streaming" in msg:
-                    self._acq = True
+                    self._acq=True
                 else:
                     LOGGER.warning("[PySpin] BeginAcquisition: %s", e)
 
     def get_frame(self):
-        if not self.cam:
-            return None
-        if not self._acq:
-            self.start_acquisition()
+        """Generic grab (no mode switch)."""
+        if not self.cam: return None
+        self._ensure_started()
         try:
-            img = self.cam.GetNextImage(50)
+            img = self.cam.GetNextImage(100)  # slightly longer timeout
             if img.IsIncomplete():
-                img.Release()
-                return None
+                img.Release(); return None
             arr = img.GetNDArray()
-            w = img.GetWidth()
-            h = img.GetHeight()
+            w = img.GetWidth(); h = img.GetHeight()
             img.Release()
-            if arr.ndim == 2:
-                if HAVE_OPENCV:
-                    arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
-                else:
-                    arr = np.repeat(arr[..., None], 3, axis=2)
-            elif arr.ndim == 3 and arr.shape[2] == 1:
-                arr = np.repeat(arr, 3, axis=2)
-            self._last_size = (int(w), int(h))
+            if arr.ndim==2:
+                if HAVE_OPENCV: arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+                else: arr = np.repeat(arr[...,None],3,axis=2)
+            elif arr.ndim==3 and arr.shape[2]==1:
+                arr = np.repeat(arr,3,axis=2)
+            self._last_size=(int(w),int(h))
             return arr
         except Exception as e:
-            LOGGER.debug("[PySpin] Frame error: %s", e)
+            LOGGER.debug("[PySpin] Frame error: %s", e); return None
+
+    def preview_frame(self, hw_trigger:bool):
+        """
+        Preview-friendly grab:
+        - If hw_trigger=True, temporarily set TriggerSource=Software and issue TriggerSoftware,
+          so we get a frame without external pulses.
+        - If free-run, just grab.
+        """
+        if not self.cam: return None
+        self._ensure_started()
+        try:
+            if hw_trigger:
+                # Arm software trigger for one frame
+                self._set_trigger_mode(True)
+                self._set_trigger_source("Software")
+                try:
+                    cmd = PySpin.CCommandPtr(self.node.GetNode("TriggerSoftware"))
+                    if PySpin.IsWritable(cmd):
+                        cmd.Execute()
+                except Exception as e:
+                    LOGGER.debug("[PySpin] TriggerSoftware execute note: %s", e)
+            # Then read the frame
+            return self.get_frame()
+        except Exception as e:
+            LOGGER.debug("[PySpin] preview_frame error: %s", e)
             return None
 
-    def frame_size(self): return self._last_size
+    def grab_software_triggered_frame(self):
+        """Force a software trigger and grab a frame (used for fallback when HW has no frames)."""
+        if not self.cam: return None
+        self._ensure_started()
+        try:
+            self._set_trigger_mode(True)
+            self._set_trigger_source("Software")
+            try:
+                cmd = PySpin.CCommandPtr(self.node.GetNode("TriggerSoftware"))
+                if PySpin.IsWritable(cmd):
+                    cmd.Execute()
+            except Exception as e:
+                LOGGER.debug("[PySpin] TriggerSoftware note: %s", e)
+            return self.get_frame()
+        except Exception as e:
+            LOGGER.debug("[PySpin] grab_software_triggered_frame error: %s", e)
+            return None
 
+    def start_acquisition(self):
+        self._ensure_started()
+
+    def frame_size(self): return self._last_size
     def stop_acquisition(self):
         if self.cam and self._acq:
-            try:
-                self.cam.EndAcquisition()
-            except Exception:
-                pass
-            self._acq = False
-
+            try: self.cam.EndAcquisition()
+            except Exception: pass
+            self._acq=False
     def release(self):
         try:
             self.stop_acquisition()
             if self.cam:
-                try:
-                    self.cam.DeInit()
-                except Exception:
-                    pass
+                try: self.cam.DeInit()
+                except Exception: pass
         finally:
-            self.cam = None
+            self.cam=None
 
-
+# -------------------- Camera Node --------------------
 class CameraNode:
-    def __init__(self, name: str, backend: str, ident: str, target_fps: int, adv=None):
-        self.name = name
-        self.backend = backend
-        self.ident = ident
-        self.target_fps = float(target_fps)
-        self.dev: Optional[BaseCamera] = None
-        self.synthetic = False
-        self.preview_times = deque(maxlen=120)
-        self.adv = adv or {}
-
+    def __init__(self, name:str, backend:str, ident:str, target_fps:int, adv=None):
+        self.name=name; self.backend=backend; self.ident=ident; self.target_fps=float(target_fps)
+        self.dev:Optional[BaseCamera]=None; self.synthetic=False; self.preview_times=deque(maxlen=120); self.adv=adv or {}
     def _open_if_needed(self):
-        if self.dev is not None or self.synthetic:
-            return
+        if self.dev is not None or self.synthetic: return
         try:
-            if self.backend == "PySpin":
-                serial = self.ident
-                width = int(self.adv.get("width", 0) or 0)
-                height = int(self.adv.get("height", 0) or 0)
-                exposure_us = int(self.adv.get("exposure_us", 1500) or 1500)
-                hw_trig = bool(self.adv.get("hw_trigger", False))
-                self.dev = SpinnakerCamera(serial, self.target_fps, width, height, exposure_us, hw_trig)
-                self.dev.open()
-                LOGGER.info("[%s] PySpin open: serial=%s %s @ %.1ffps trig=%s",
-                            self.name, serial or "(first)", self.dev.frame_size(), self.target_fps,
-                            "HW" if hw_trig else "Free")
+            if self.backend=="PySpin":
+                serial=self.ident
+                width=int(self.adv.get("width",0) or 0); height=int(self.adv.get("height",0) or 0)
+                exposure_us=int(self.adv.get("exposure_us",1500) or 1500); hw_trig=bool(self.adv.get("hw_trigger",False))
+                self.dev=SpinnakerCamera(serial,self.target_fps,width,height,exposure_us,hw_trig); self.dev.open()
+                LOGGER.info("[%s] PySpin open: serial=%s %s @ %.1ffps", self.name, serial or "(first)", self.dev.frame_size(), self.target_fps)
             else:
-                if not HAVE_OPENCV:
-                    raise RuntimeError("OpenCV not installed")
-                idx = int(self.ident or "0")
-                dev = OpenCVCamera(idx, self.target_fps)
-                dev.open()
-                if getattr(dev, "cap", None) is None:
-                    self.synthetic = True
-                    self.dev = None
-                    LOGGER.info("[%s] OpenCV index %d not available → synthetic", self.name, idx)
-                else:
-                    self.dev = dev
-                    LOGGER.info("[%s] OpenCV open: index %d", self.name, idx)
+                if not HAVE_OPENCV: raise RuntimeError("OpenCV not installed")
+                idx=int(self.ident or "0"); dev=OpenCVCamera(idx,self.target_fps); dev.open()
+                if getattr(dev, "cap", None) is None: self.synthetic=True; self.dev=None; LOGGER.info("[%s] OpenCV index %d not available → synthetic", self.name, idx)
+                else: self.dev=dev; LOGGER.info("[%s] OpenCV open: index %d", self.name, idx)
         except Exception as e:
-            LOGGER.warning("[%s] Open error: %s → synthetic", self.name, e)
-            self.dev = None
-            self.synthetic = True
-
-    def set_backend_ident(self, backend: str, ident: str, adv=None):
-        self.release()
-        self.backend = backend
-        self.ident = ident
-        self.synthetic = False
-        if adv is not None:
-            self.adv = adv
+            LOGGER.warning("[%s] Open error: %s → synthetic", self.name, e); self.dev=None; self.synthetic=True
+    def set_backend_ident(self, backend:str, ident:str, adv=None):
+        self.release(); self.backend=backend; self.ident=ident; self.synthetic=False
+        if adv is not None: self.adv=adv
         LOGGER.info("[%s] set backend=%s ident=%s (lazy open)", self.name, backend, ident)
+    def set_target_fps(self,fps:int): self.target_fps=float(fps)
 
-    def set_target_fps(self, fps: int):
-        self.target_fps = float(fps)
+    def _configure_for_preview(self):
+        if isinstance(self.dev, SpinnakerCamera):
+            pass
 
-    def grab_preview(self, w: int, h: int):
+    def grab_preview(self,w:int,h:int):
         self._open_if_needed()
         if self.synthetic or self.dev is None:
-            frame = np.full((max(h, 1), max(w, 1), 3), 240, dtype=np.uint8)
-            if HAVE_OPENCV:
-                cv2.putText(frame, f"{self.name} (synthetic)", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
-            self.preview_times.append(time.time())
-            return frame
-        img = self.dev.get_frame()
-        if img is None:
-            frame = np.full((max(h, 1), max(w, 1), 3), 255, dtype=np.uint8)
-            if HAVE_OPENCV:
-                cv2.putText(frame, f"{self.name} [drop]", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
-            self.preview_times.append(time.time())
-            return frame
-        if HAVE_OPENCV and (img.shape[1] != w or img.shape[0] != h):
-            img = cv2.resize(img, (w, h))
-        self.preview_times.append(time.time())
-        return img
+            frame=np.full((max(h,1),max(w,1),3),255,dtype=np.uint8)  # pure white
+            if HAVE_OPENCV: cv2.putText(frame,f"{self.name} (synthetic)",(10,28),cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,0,0),2,cv2.LINE_AA)
+            self.preview_times.append(time.time()); return frame
 
-    def driver_fps(self) -> float:
-        if len(self.preview_times) < 2:
-            return 0.0
-        dt = self.preview_times[-1] - self.preview_times[0]
-        n = len(self.preview_times) - 1
-        return (n / dt) if dt > 0 else 0.0
-
-    def record_clip(self, out_path: str, duration_s: float, fourcc_str: str, async_writer: bool = True) -> str:
-        self._open_if_needed()
-        if self.synthetic or self.dev is None:
-            size = (640, 480)
+        self._configure_for_preview()
+        if isinstance(self.dev, SpinnakerCamera):
+            img = self.dev.preview_frame(hw_trigger=bool(self.adv.get("hw_trigger", False)))
         else:
-            size = self.dev.frame_size()
-        w, h = size
+            img = self.dev.get_frame()
+
+        if img is None:
+            frame=np.full((max(h,1),max(w,1),3),255,dtype=np.uint8)  # white fallback
+            if HAVE_OPENCV: cv2.putText(frame,f"{self.name} [drop]",(10,28),cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,0,0),2,cv2.LINE_AA)
+            self.preview_times.append(time.time()); return frame
+
+        if HAVE_OPENCV and (img.shape[1]!=w or img.shape[0]!=h):
+            img=cv2.resize(img,(w,h))
+        self.preview_times.append(time.time()); return img
+
+    def driver_fps(self)->float:
+        if len(self.preview_times)<2: return 0.0
+        dt=self.preview_times[-1]-self.preview_times[0]; n=len(self.preview_times)-1
+        return (n/dt) if dt>0 else 0.0
+
+    def record_clip(self, out_path:str, duration_s:float, fourcc_str:str, async_writer:bool=True, start_evt:Optional[threading.Event]=None)->str:
+        """
+        Start recording immediately, but only begin the duration clock once the FIRST frame is actually acquired.
+        If HW trigger yields no frames by cfg.record_start_timeout_s, attempt software-trigger fallback (PySpin),
+        and if that still fails, generate white synthetic frames so the file is always valid and non-zero length.
+        """
+        self._open_if_needed()
+        if self.synthetic or self.dev is None:
+            size=(640,480)
+        else:
+            size=self.dev.frame_size()
+        w,h = size
         ensure_dir(os.path.dirname(out_path) or ".")
         if not HAVE_OPENCV:
             with open(out_path + ".txt", "w", encoding="utf-8") as f:
                 f.write(f"{self.name} synthetic recording placeholder\n")
             LOGGER.warning("[%s] OpenCV missing; wrote placeholder text", self.name)
+            if start_evt: start_evt.set()
             return out_path + ".txt"
         fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
         _, ext = os.path.splitext(out_path)
         if not ext:
-            ext = ".avi" if fourcc_str.upper() in ("MJPG", "XVID", "DIVX") else ".mp4"
+            ext = ".avi" if fourcc_str.upper() in ("MJPG","XVID","DIVX") else ".mp4"
             out_path += ext
-        writer = cv2.VideoWriter(out_path, fourcc, max(1.0, float(self.target_fps)), (w, h), True)
+        writer = cv2.VideoWriter(out_path, fourcc, max(1.0, float(self.target_fps)), (w,h), True)
         if not writer or not writer.isOpened():
             LOGGER.warning("[%s] Writer open failed for %s fourcc=%s → fallback MJPG/AVI", self.name, out_path, fourcc_str)
             fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-            out_path = (out_path.rsplit(".", 1)[0] if "." in out_path else out_path) + ".avi"
-            writer = cv2.VideoWriter(out_path, fourcc, max(1.0, float(self.target_fps)), (w, h), True)
-        q = queue.Queue(maxsize=256)
-        stop_flag = {"stop": False}
+            out_path = (out_path.rsplit(".",1)[0] if "." in out_path else out_path)+".avi"
+            writer = cv2.VideoWriter(out_path, fourcc, max(1.0, float(self.target_fps)), (w,h), True)
 
+        # ---- ensure correct trigger mode for recording ----
+        if isinstance(self.dev, SpinnakerCamera):
+            hw = bool(self.adv.get("hw_trigger", False))
+            try:
+                if hw:
+                    self.dev.configure_for_hw()
+                else:
+                    self.dev.configure_for_free_run()
+                self.dev.start_acquisition()
+                time.sleep(0.02)
+            except Exception as e:
+                LOGGER.debug("[%s] record configure note: %s", self.name, e)
+
+        q = queue.Queue(maxsize=1024)
+        stop_flag = {"stop": False}
         def wr():
             while True:
-                if stop_flag["stop"] and q.empty():
-                    break
+                if stop_flag["stop"] and q.empty(): break
                 try:
                     frame = q.get(timeout=0.05)
                 except queue.Empty:
                     continue
-                try:
-                    writer.write(frame)
-                except Exception as e:
-                    LOGGER.warning("[%s] Writer error: %s", self.name, e)
-
+                try: writer.write(frame)
+                except Exception as e: LOGGER.warning("[%s] Writer error: %s", self.name, e)
         t_writer = None
         if async_writer:
-            t_writer = threading.Thread(target=wr, daemon=True)
-            t_writer.start()
-        t0 = time.time()
-        if self.dev is not None and not self.synthetic:
-            try:
-                self.dev.start_acquisition()
-            except Exception:
-                pass
-        frames = 0
-        drops = 0
-        while (time.time() - t0) < float(duration_s):
+            t_writer = threading.Thread(target=wr, daemon=True); t_writer.start()
+
+        # ---- Wait for first frame (gated), with fallback paths ----
+        frames=0; drops=0
+        t0=None
+        first_deadline = time.time() + float(getattr(sys.modules[__name__], "MainApp", None).cfg.record_start_timeout_s if hasattr(sys.modules[__name__], "MainApp") else 2.0)
+        # If we can't easily read that, fall back to 2s
+        if not isinstance(first_deadline, float) or first_deadline==0.0:
+            first_deadline = time.time() + 2.0
+
+        soft_pulse_mode = False
+        last_good = np.full((h,w,3), 255, np.uint8)
+
+        while t0 is None and time.time() < first_deadline:
             if self.synthetic or self.dev is None:
-                frame = np.full((h, w, 3), 255, np.uint8)
-                if HAVE_OPENCV:
-                    cv2.putText(frame, f"{self.name} synthetic", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 2, cv2.LINE_AA)
+                frame = np.full((h,w,3), 255, np.uint8)
             else:
-                frame = self.dev.get_frame()
-                if frame is None:
-                    drops += 1
-                    continue
-                if frame.shape[1] != w or frame.shape[0] != h:
-                    try:
-                        frame = cv2.resize(frame, (w, h))
-                    except Exception:
-                        frame = np.full((h, w, 3), 0, np.uint8)
-            frames += 1
+                if isinstance(self.dev, SpinnakerCamera):
+                    frame = self.dev.get_frame()
+                    if frame is None and bool(self.adv.get("hw_trigger", False)):
+                        # Try software-trigger fallback to guarantee recording
+                        frame = self.dev.grab_software_triggered_frame()
+                        if frame is not None:
+                            soft_pulse_mode = True
+                else:
+                    frame = self.dev.get_frame()
+            if frame is None:
+                continue
+            if frame.shape[1]!=w or frame.shape[0]!=h:
+                try: frame = cv2.resize(frame,(w,h))
+                except Exception: frame = np.full((h,w,3),255,np.uint8)
+            # Got first frame
+            t0 = time.time()
+            if start_evt: start_evt.set()
             if async_writer:
-                try:
-                    q.put_nowait(frame)
-                except queue.Full:
-                    drops += 1
+                try: q.put(frame, timeout=0.1)
+                except queue.Full: drops+=1
             else:
                 writer.write(frame)
-        stop_flag["stop"] = True
-        if t_writer:
-            t_writer.join(timeout=2.0)
-        try:
-            writer.release()
-        except Exception:
-            pass
-        if self.dev is not None and not self.synthetic:
-            try:
-                self.dev.stop_acquisition()
-            except Exception:
-                pass
+            frames += 1
+            last_good = frame
+
+        # If still no first frame, force synthetic to guarantee a valid file
+        if t0 is None:
+            LOGGER.warning("[%s] No first frame within timeout → recording synthetic white frames", self.name)
+            t0 = time.time()
+            if start_evt: start_evt.set()
+            target_count = max(2, int(round(self.target_fps * duration_s)))
+            for _ in range(target_count):
+                if async_writer:
+                    try: q.put(last_good, timeout=0.1)
+                    except queue.Full: pass
+                else:
+                    writer.write(last_good)
+                frames += 1
+                time.sleep(max(0.0, 1.0/max(1.0,self.target_fps)))
+        else:
+            # ---- Main capture loop, count from first captured frame ----
+            while (time.time()-t0) < float(duration_s):
+                if self.synthetic or self.dev is None:
+                    frame = np.full((h,w,3), 255, np.uint8)
+                else:
+                    if isinstance(self.dev, SpinnakerCamera) and soft_pulse_mode:
+                        frame = self.dev.grab_software_triggered_frame()
+                    else:
+                        frame = self.dev.get_frame()
+                if frame is None:
+                    # If camera starved, use last_good (white if none)
+                    frame = last_good
+                if frame.shape[1]!=w or frame.shape[0]!=h:
+                    try: frame = cv2.resize(frame,(w,h))
+                    except Exception: frame = last_good
+                if async_writer:
+                    try: q.put(frame, timeout=0.1)
+                    except queue.Full: drops+=1
+                else:
+                    writer.write(frame)
+                frames += 1
+                last_good = frame
+
+        # Ensure at least 2 frames exist (some containers show 00:00 with 0/1 frames)
+        if frames < 2:
+            for _ in range(2-frames):
+                if async_writer:
+                    try: q.put(last_good, timeout=0.1)
+                    except queue.Full: pass
+                else:
+                    writer.write(last_good)
+                frames += 1
+
+        stop_flag["stop"]=True
+        if t_writer: t_writer.join(timeout=2.0)
+        try: writer.release()
+        except Exception: pass
+        if isinstance(self.dev, SpinnakerCamera):
+            try: self.dev.stop_acquisition()
+            except Exception: pass
         LOGGER.info("[%s] Recorded %d frames (drops=%d) → %s", self.name, frames, drops, out_path)
         return out_path
 
-    def probe_max_fps(self, seconds: float = 3.0) -> Tuple[float, int, int]:
+    def probe_max_fps(self, seconds:float=3.0)->Tuple[float,int,int]:
         self._open_if_needed()
-        frames = 0
-        drops = 0
-        t0 = time.time()
+        frames=0; drops=0
+        t0=time.time()
         try:
-            if self.dev is not None:
-                self.dev.start_acquisition()
-        except Exception:
-            pass
-        while (time.time() - t0) < seconds:
-            img = None if (self.synthetic or self.dev is None) else self.dev.get_frame()
-            if img is None:
-                drops += 1
-            else:
-                frames += 1
+            if self.dev is not None: self.dev.start_acquisition()
+        except Exception: pass
+        while (time.time()-t0)<seconds:
+            img=None if (self.synthetic or self.dev is None) else self.dev.get_frame()
+            if img is None: drops+=1
+            else: frames+=1
         try:
-            if self.dev is not None:
-                self.dev.stop_acquisition()
-        except Exception:
-            pass
-        elapsed = max(1e-6, time.time() - t0)
-        return (frames / elapsed, frames, drops)
+            if self.dev is not None: self.dev.stop_acquisition()
+        except Exception: pass
+        elapsed=max(1e-6, time.time()-t0)
+        return (frames/elapsed, frames, drops)
 
     def release(self):
         try:
-            if self.dev:
-                self.dev.release()
-        except Exception:
-            pass
-        self.dev = None
-        self.synthetic = False
+            if self.dev: self.dev.release()
+        except Exception: pass
+        self.dev=None; self.synthetic=False
 
-
-# -------------------- Stimulus --------------------
+# -------------------- Stimulus (PsychoPy primary; OpenCV fallback) --------------------
 class LoomingStim:
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-        self._pp_win = None
-        self._pp_cfg = None
-        self._cv_window_name = "Looming Stimulus"
-        self._cv_open = False
-        self._cv_size = (800, 600)
+    def __init__(self,cfg:Config):
+        self.cfg=cfg
+        self._pp_win=None
+        self._pp_cfg=None
+        self._pp_png=None
+        self._pp_png_path=""
+        self._cv_window_name="Looming Stimulus"
+        self._cv_open=False
+        self._cv_size=(800,600)
+        self._cv_png=None
+        self._cv_png_path=""
 
-        # image caching (for stim_type == "image")
-        self._img_path_cached: str = ""
-        self._img_cv_bgr: Optional[np.ndarray] = None
-        self._img_pp = None  # PsychoPy ImageStim (created per-window)
-
-    def reset_window(self):
-        """Close stimulus windows so they can be recreated cleanly."""
-        try:
-            if self._pp_win is not None:
-                try:
-                    self._pp_win.close()
-                except Exception:
-                    pass
-            self._pp_win = None
-            self._pp_cfg = None
-            self._img_pp = None
-        except Exception:
-            pass
-        try:
-            if HAVE_OPENCV and getattr(self, "_cv_open", False):
-                try:
-                    cv2.destroyWindow(self._cv_window_name)
-                except Exception:
-                    pass
-            self._cv_open = False
-        except Exception:
-            pass
-
-    def _load_image_cv(self, path: str) -> Optional[np.ndarray]:
-        if not HAVE_OPENCV:
-            return None
-        p = (path or "").strip()
-        if not p:
-            return None
-        try:
-            img = cv2.imread(p, cv2.IMREAD_UNCHANGED)
-            if img is None:
-                return None
-            if img.ndim == 2:
-                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-            elif img.ndim == 3 and img.shape[2] == 4:
-                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-            return img
-        except Exception as e:
-            LOGGER.warning("[Stim] Could not load image (OpenCV): %s", e)
-            return None
-
-    def _ensure_cached_image(self):
-        p = (getattr(self.cfg, "stim_image_path", "") or "").strip()
-        if not p:
-            self._img_path_cached = ""
-            self._img_cv_bgr = None
-            self._img_pp = None
-            return
-        if p == self._img_path_cached:
-            return
-        self._img_path_cached = p
-        self._img_cv_bgr = self._load_image_cv(p)
-        self._img_pp = None
-
-    def _pp_window(self, screen_idx: int, fullscreen: bool, bg_grey: float):
-        need_new = False
-        if self._pp_win is None:
-            need_new = True
-        elif self._pp_cfg != (screen_idx, fullscreen):
-            try:
-                self._pp_win.close()
-            except Exception:
-                pass
-            self._pp_win = None
-            self._img_pp = None
-            need_new = True
+    def _pp_window(self,screen_idx:int,fullscreen:bool,bg_grey:float):
+        need_new=False
+        if self._pp_win is None: need_new=True
+        elif self._pp_cfg!=(screen_idx,fullscreen):
+            try: self._pp_win.close()
+            except Exception: pass
+            self._pp_win=None; need_new=True
         if need_new:
             try:
                 if fullscreen:
-                    self._pp_win = visual.Window(color=[bg_grey] * 3, units="pix", fullscr=True, screen=screen_idx)
+                    self._pp_win=visual.Window(color=[bg_grey]*3,units='pix',fullscr=True,screen=screen_idx,allowGUI=False)
                 else:
-                    self._pp_win = visual.Window(size=self._cv_size, color=[bg_grey] * 3, units="pix", fullscr=False, screen=screen_idx, allowGUI=True)
-                self._pp_cfg = (screen_idx, fullscreen)
-            except Exception as e:
-                LOGGER.warning("[Stim] PsychoPy window error: %s", e)
-                self._pp_win = None
+                    self._pp_win=visual.Window(size=self._cv_size,color=[bg_grey]*3,units='pix',fullscr=False,screen=screen_idx,allowGUI=True)
+                self._pp_cfg=(screen_idx,fullscreen)
+            except Exception as e: LOGGER.warning("[Stim] PsychoPy window error: %s", e); self._pp_win=None
         if self._pp_win is not None:
+            try: self._pp_win.color=[bg_grey]*3
+            except Exception: pass
+
+    def _cv_window(self,screen_idx:int,bg_grey:float,fullscreen:bool):
+        try:
+            if not HAVE_OPENCV: return
+            if not self._cv_open:
+                cv2.namedWindow(self._cv_window_name,cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(self._cv_window_name,self._cv_size[0],self._cv_size[1])
+                self._cv_open=True
+            geoms=QtGui.QGuiApplication.screens()
+            if 0<=screen_idx<len(geoms):
+                g=geoms[screen_idx].geometry()
+                cv2.moveWindow(self._cv_window_name,g.x(),g.y())
             try:
-                self._pp_win.color = [bg_grey] * 3
+                cv2.setWindowProperty(
+                    self._cv_window_name,
+                    cv2.WND_PROP_FULLSCREEN,
+                    cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL
+                )
             except Exception:
                 pass
+            bg=int(max(0,min(255,int(bg_grey*255))))
+            frame=np.full((self._cv_size[1],self._cv_size[0],3),bg,dtype=np.uint8)
+            cv2.imshow(self._cv_window_name,frame); cv2.waitKey(1)
+        except Exception as e: LOGGER.warning("[Stim] OpenCV window error: %s", e); self._cv_open=False
 
-    def _cv_window(self, screen_idx: int, bg_grey: float):
-        try:
-            if not HAVE_OPENCV:
-                return
-            if not self._cv_open:
-                cv2.namedWindow(self._cv_window_name, cv2.WINDOW_NORMAL)
-                cv2.resizeWindow(self._cv_window_name, self._cv_size[0], self._cv_size[1])
-                self._cv_open = True
-            geoms = QtGui.QGuiApplication.screens()
-            if 0 <= screen_idx < len(geoms):
-                g = geoms[screen_idx].geometry()
-                cv2.moveWindow(self._cv_window_name, g.x() + 50, g.y() + 50)
-            bg = int(max(0, min(255, int(bg_grey * 255))))
-            frame = np.full((self._cv_size[1], self._cv_size[0], 3), bg, dtype=np.uint8)
-            cv2.imshow(self._cv_window_name, frame)
-            cv2.waitKey(1)
-        except Exception as e:
-            LOGGER.warning("[Stim] OpenCV window error: %s", e)
-            self._cv_open = False
-
-    def open_persistent(self, screen_idx: int, fullscreen: bool, bg_grey: float):
+    def open_persistent(self,screen_idx:int,fullscreen:bool,bg_grey:float):
         if _ensure_psychopy_loaded():
-            self._pp_window(screen_idx, fullscreen, bg_grey)
+            self._pp_window(screen_idx,fullscreen,bg_grey)
             if self._pp_win is not None:
-                try:
-                    self._pp_win.flip()
-                except Exception:
-                    pass
+                try: self._pp_win.flip()
+                except Exception: pass
         else:
-            self._cv_window(screen_idx, bg_grey)
+            self._cv_window(screen_idx,bg_grey,fullscreen)
 
-    def run(self, duration_s: float, r0: int, r1: int, bg_grey: float, screen_idx: int, fullscreen: bool):
-        """
-        Draw a looming stimulus.
-        - stim_type == 'dot'   -> growing black circle
-        - stim_type == 'image' -> selected image scales from r0->r1 where r0/r1 are target max-dimension (px)
-        """
-        LOGGER.info("[Stim] Looming start")
+    def close(self):
+        try:
+            if self._pp_win is not None: self._pp_win.close()
+        except Exception: pass
+        self._pp_win=None; self._pp_cfg=None; self._pp_png=None; self._pp_png_path=""
 
-        stim_type = (getattr(self.cfg, "stim_type", "dot") or "dot").strip().lower()
-        if stim_type not in ("dot", "image"):
-            stim_type = "dot"
+        if self._cv_open and HAVE_OPENCV:
+            try: cv2.destroyWindow(self._cv_window_name)
+            except Exception: pass
+            self._cv_open=False
+        self._cv_png=None; self._cv_png_path=""
 
-        if stim_type == "image":
-            self._ensure_cached_image()
-            img_path = (getattr(self.cfg, "stim_image_path", "") or "").strip()
-            if not img_path:
-                LOGGER.warning("[Stim] stim_type=image but no image selected → falling back to dot")
-                stim_type = "dot"
+    def _pp_get_png(self, path:str):
+        if not path: return None
+        if path==self._pp_png_path and self._pp_png is not None:
+            return self._pp_png
+        try:
+            self._pp_png = visual.ImageStim(self._pp_win, image=path, units='pix', interpolate=True)
+            self._pp_png_path = path
+        except Exception as e:
+            LOGGER.warning("[Stim] PsychoPy PNG load failed: %s", e); self._pp_png=None; self._pp_png_path=""
+        return self._pp_png
 
-        # PsychoPy path
+    def _cv_get_png(self, path:str):
+        if not HAVE_OPENCV or not path: return None
+        if path==self._cv_png_path and self._cv_png is not None:
+            return self._cv_png
+        try:
+            img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+            if img is None: raise RuntimeError("cv2.imread returned None")
+            self._cv_png = img
+            self._cv_png_path = path
+        except Exception as e:
+            LOGGER.warning("[Stim] OpenCV PNG load failed: %s", e); self._cv_png=None; self._cv_png_path=""
+        return self._cv_png
+
+    def run(self,duration_s:float,r0:int,r1:int,bg_grey:float,screen_idx:int,fullscreen:bool):
+        LOGGER.info("[Stim] Looming start (%s)", self.cfg.stim_kind)
+        kind = (self.cfg.stim_kind or "circle").strip().lower()
+        use_png = (kind == "png")
+        png_path = (self.cfg.stim_png_path or "").strip()
+
+        if self.cfg.stim_keep_window_open:
+            self.open_persistent(screen_idx, fullscreen, bg_grey)
+        else:
+            self.close()
+
         if _ensure_psychopy_loaded():
             try:
-                self._pp_window(screen_idx, fullscreen, bg_grey)
-                if self._pp_win is not None:
-                    dot = None
-                    img = None
+                self._pp_window(screen_idx,fullscreen,bg_grey)
+                if self._pp_win is None:
+                    raise RuntimeError("PsychoPy window unavailable")
 
-                    if stim_type == "dot":
-                        dot = visual.Circle(self._pp_win, radius=r0, fillColor="black", lineColor="black")
-                    else:
-                        img_path = (getattr(self.cfg, "stim_image_path", "") or "").strip()
-                        try:
-                            self._img_pp = visual.ImageStim(self._pp_win, image=img_path, units="pix")
-                            img = self._img_pp
-                        except Exception as e:
-                            LOGGER.warning("[Stim] PsychoPy ImageStim failed (%s) → dot", e)
-                            stim_type = "dot"
-                            dot = visual.Circle(self._pp_win, radius=r0, fillColor="black", lineColor="black")
+                dot=None
+                if not use_png:
+                    dot=visual.Circle(self._pp_win,radius=r0,fillColor='black',lineColor='black')
 
-                    t0 = time.time()
-                    while True:
-                        t = time.time() - t0
-                        if t >= duration_s:
-                            break
-                        frac = 0.0 if duration_s <= 0 else (t / duration_s)
-                        frac = max(0.0, min(1.0, frac))
-                        v = float(r0) + (float(r1) - float(r0)) * frac
+                imgStim=None
+                if use_png:
+                    imgStim = self._pp_get_png(png_path)
+                    if imgStim is None:
+                        LOGGER.warning("[Stim] PNG unavailable → fallback to circle")
+                        use_png=False
+                        dot=visual.Circle(self._pp_win,radius=r0,fillColor='black',lineColor='black')
 
-                        if stim_type == "dot" and dot is not None:
-                            dot.radius = v
-                            dot.draw()
-                        elif stim_type == "image" and img is not None:
-                            try:
-                                iw, ih = img.size
-                            except Exception:
-                                iw, ih = 256, 256
-                            base = max(float(iw), float(ih), 1.0)
-                            s = float(v) / base
-                            img.size = (float(iw) * s, float(ih) * s)
-                            img.pos = (0, 0)
-                            img.draw()
+                t0=time.time()
+                while True:
+                    t=time.time()-t0
+                    if t>=duration_s: break
+                    r=int(r0+(r1-r0)*(t/max(1e-6,duration_s)))
+                    if use_png and imgStim is not None:
+                        iw, ih = imgStim.size
+                        if iw<=0 or ih<=0:
+                            use_png=False
                         else:
-                            if dot is not None:
-                                dot.radius = v
-                                dot.draw()
+                            if self.cfg.stim_png_keep_aspect:
+                                if iw>=ih:
+                                    sw = 2*r; sh = int(max(1, 2*r*ih/iw))
+                                else:
+                                    sh = 2*r; sw = int(max(1, 2*r*iw/ih))
+                            else:
+                                sw = 2*r; sh = 2*r
+                            imgStim.size = (sw, sh)
+                            imgStim.pos = (0,0)
+                            imgStim.draw()
+                    else:
+                        dot.radius = r; dot.draw()
 
-                        self._pp_win.flip()
+                    self._pp_win.flip()
 
-                    LOGGER.info("[Stim] Done (PsychoPy)")
-                    return
+                LOGGER.info("[Stim] Done (PsychoPy)")
+                if not self.cfg.stim_keep_window_open:
+                    self.close()
+                return
             except Exception as e:
                 LOGGER.warning("[Stim] PsychoPy error: %s → OpenCV fallback", e)
 
-        # OpenCV fallback path
         try:
             if not HAVE_OPENCV:
-                wait_s(duration_s)
-                LOGGER.info("[Stim] Done (timing only)")
-                return
+                wait_s(duration_s); LOGGER.info("[Stim] Done (timing only)"); return
+            self._cv_window(screen_idx,bg_grey,fullscreen)
+            size=self._cv_size
+            bg=int(max(0,min(255,int(bg_grey*255)))); t0=time.time()
 
-            self._cv_window(screen_idx, bg_grey)
-            size = self._cv_size
-            bg = int(max(0, min(255, int(bg_grey * 255))))
+            png=None
+            if use_png:
+                png = self._cv_get_png(png_path)
+                if png is None:
+                    LOGGER.warning("[Stim] PNG unavailable in OpenCV → fallback to circle"); use_png=False
 
-            img_bgr = None
-            if stim_type == "image":
-                self._ensure_cached_image()
-                img_bgr = self._img_cv_bgr
-                if img_bgr is None:
-                    LOGGER.warning("[Stim] OpenCV could not load image → falling back to dot")
-                    stim_type = "dot"
-
-            t0 = time.time()
             while True:
-                t = time.time() - t0
-                if t >= duration_s:
-                    break
-                frac = 0.0 if duration_s <= 0 else (t / duration_s)
-                frac = max(0.0, min(1.0, frac))
-                v = float(r0) + (float(r1) - float(r0)) * frac
+                t=time.time()-t0
+                if t>=duration_s: break
+                r=int(r0+(r1-r0)*(t/max(1e-6,duration_s)))
+                frame=np.full((size[1],size[0],3),bg,dtype=np.uint8)
 
-                frame = np.full((size[1], size[0], 3), bg, dtype=np.uint8)
+                if use_png and png is not None:
+                    ih, iw = png.shape[:2]
+                    if iw<=0 or ih<=0:
+                        use_png=False
+                    else:
+                        if self.cfg.stim_png_keep_aspect:
+                            if iw>=ih:
+                                sw = max(2, 2*r); sh = max(1, int(sw*ih/iw))
+                            else:
+                                sh = max(2, 2*r); sw = max(1, int(sh*iw/ih))
+                        else:
+                            sw = max(2, 2*r); sh = max(2, 2*r)
+                        try:
+                            scaled = cv2.resize(png, (sw, sh), interpolation=cv2.INTER_AREA)
+                            y0 = size[1]//2 - sh//2; x0 = size[0]//2 - sw//2
+                            if scaled.shape[2]==4:
+                                b,g,rch,a = cv2.split(scaled)
+                                rgb = cv2.merge((b,g,rch))
+                                alpha = a.astype(np.float32)/255.0
+                                roi = frame[max(0,y0):max(0,y0)+sh, max(0,x0):max(0,x0)+sw]
+                                H = min(roi.shape[0], sh); W = min(roi.shape[1], sw)
+                                roi = roi[:H,:W]
+                                rgb = rgb[:H,:W]
+                                alpha = alpha[:H,:W][...,None]
+                                frame[max(0,y0):max(0,y0)+H, max(0,x0):max(0,x0)+W] = (alpha*rgb + (1-alpha)*roi).astype(np.uint8)
+                            else:
+                                frame[y0:y0+sh, x0:x0+sw] = scaled
+                        except Exception:
+                            use_png=False
 
-                if stim_type == "dot" or img_bgr is None:
-                    r = int(v)
-                    cv2.circle(frame, (size[0] // 2, size[1] // 2), r, (0, 0, 0), -1)
-                else:
-                    ih, iw = img_bgr.shape[:2]
-                    base = max(iw, ih, 1)
-                    s = float(v) / float(base)
-                    tw = max(1, int(round(iw * s)))
-                    th = max(1, int(round(ih * s)))
+                if not use_png:
+                    cv2.circle(frame,(size[0]//2,size[1]//2),max(1,r),(0,0,0),-1)
 
-                    scaled = cv2.resize(
-                        img_bgr, (tw, th),
-                        interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR
-                    )
-
-                    x0 = (size[0] - tw) // 2
-                    y0 = (size[1] - th) // 2
-                    x1 = x0 + tw
-                    y1 = y0 + th
-
-                    # clip to frame
-                    sx0 = 0
-                    sy0 = 0
-                    if x0 < 0:
-                        sx0 = -x0
-                        x0 = 0
-                    if y0 < 0:
-                        sy0 = -y0
-                        y0 = 0
-                    x1 = min(size[0], x1)
-                    y1 = min(size[1], y1)
-                    sw = max(0, x1 - x0)
-                    sh = max(0, y1 - y0)
-
-                    if sw > 0 and sh > 0:
-                        frame[y0:y1, x0:x1] = scaled[sy0:sy0 + sh, sx0:sx0 + sw]
-
-                cv2.imshow(self._cv_window_name, frame)
-                if cv2.waitKey(1) & 0xFF == 27:
-                    break
+                cv2.imshow(self._cv_window_name,frame)
+                if cv2.waitKey(1) & 0xFF==27: break
 
             LOGGER.info("[Stim] Done (OpenCV)")
+            if not self.cfg.stim_keep_window_open:
+                self.close()
         except Exception as e:
             LOGGER.warning("[Stim] Fallback display unavailable: %s", e)
-            wait_s(duration_s)
-            LOGGER.info("[Stim] Done (timing only)")
-
-    def close(self):
-        try:
-            if self._pp_win is not None:
-                self._pp_win.close()
-        except Exception:
-            pass
-        self._pp_win = None
-        self._pp_cfg = None
-        self._img_pp = None
-        if self._cv_open and HAVE_OPENCV:
-            try:
-                cv2.destroyWindow(self._cv_window_name)
-            except Exception:
-                pass
-            self._cv_open = False
-
+            wait_s(duration_s); LOGGER.info("[Stim] Done (timing only)")
 
 # -------------------- Trial Runner --------------------
 class TrialRunner:
-    def __init__(self, cfg: Config, hw: HardwareBridge, cam0: "CameraNode", cam1: "CameraNode", log_path: str):
-        self.cfg = cfg
-        self.hw = hw
-        self.cam0 = cam0
-        self.cam1 = cam1
-        self.stim = LoomingStim(cfg)
-        ensure_dir(os.path.dirname(log_path) or ".")
-        new = not os.path.exists(log_path)
-        self.log = open(log_path, "a", newline="", encoding="utf-8")
-        self.csvw = csv.writer(self.log)
+    def __init__(self,cfg:Config,hw:HardwareBridge,cam0:'CameraNode',cam1:'CameraNode',log_path:str):
+        self.cfg=cfg; self.hw=hw; self.cam0=cam0; self.cam1=cam1; self.stim=LoomingStim(cfg)
+        ensure_dir(os.path.dirname(log_path) or "."); new=not os.path.exists(log_path)
+        self.log=open(log_path,"a",newline="",encoding="utf-8"); self.csvw=csv.writer(self.log)
         if new:
-            self.csvw.writerow([
-                "timestamp", "trial_idx", "cam0_path", "cam1_path", "record_duration_s",
-                "lights_delay_s", "stim_delay_s", "stim_duration_s", "stim_screen_index", "stim_fullscreen",
-                "cam0_backend", "cam0_ident", "cam0_target_fps", "cam0_w", "cam0_h", "cam0_exp_us", "cam0_hwtrig",
-                "cam1_backend", "cam1_ident", "cam1_target_fps", "cam1_w", "cam1_h", "cam1_exp_us", "cam1_hwtrig",
-                "video_preset_id", "fourcc",
-                "stim_type", "stim_image_path",
-            ])
-        self.trial_idx = 0
+            self.csvw.writerow(["timestamp","trial_idx","cam0_path","cam1_path","record_duration_s",
+                                "lights_delay_s","stim_delay_s","stim_duration_s","stim_screen_index","stim_fullscreen",
+                                "stim_kind","stim_png_path","stim_png_keep_aspect","stim_keep_window_open",
+                                "cam0_backend","cam0_ident","cam0_target_fps","cam0_w","cam0_h","cam0_exp_us","cam0_hwtrig",
+                                "cam1_backend","cam1_ident","cam1_target_fps","cam1_w","cam1_h","cam1_exp_us","cam1_hwtrig",
+                                "video_preset_id","fourcc"])
+        self.trial_idx=0
 
     def close(self):
-        try:
-            self.log.close()
-        except Exception:
-            pass
-        try:
-            self.stim.close()
-        except Exception:
-            pass
+        try: self.log.close()
+        except Exception: pass
+        try: self.stim.close()
+        except Exception: pass
 
-    def _ext_for_fourcc(self, fourcc: str) -> str:
-        if fourcc.lower() in ("mp4v", "avc1", "h264"):
-            return "mp4"
-        if fourcc.lower() in ("mjpg", "xvid", "divx"):
-            return "avi"
+    def _ext_for_fourcc(self,fourcc:str)->str:
+        if fourcc.lower() in ("mp4v","avc1","h264"): return "mp4"
+        if fourcc.lower() in ("mjpg","xvid","divx"): return "avi"
         return "mp4"
 
-    def _trial_folder(self) -> str:
-        base = day_folder(self.cfg.output_root)
-        p = os.path.join(base, f"trial_{now_stamp()}")
-        ensure_dir(p)
-        return p
+    def _trial_folder(self)->str:
+        base=day_folder(self.cfg.output_root); p=os.path.join(base,f"trial_{now_stamp()}"); ensure_dir(p); return p
 
-    def _record_both(self, folder: str):
-        fourcc = self.cfg.fourcc
-        ext = self._ext_for_fourcc(fourcc)
-        out0 = os.path.join(folder, f"cam0.{ext}")
-        out1 = os.path.join(folder, f"cam1.{ext}")
-        res = {"c0": None, "c1": None}
-
-        def rec(cam: CameraNode, pth: str, key: str):
-            res[key] = cam.record_clip(pth, float(self.cfg.record_duration_s), fourcc, async_writer=self.cfg.cam_async_writer)
-
-        t0 = threading.Thread(target=rec, args=(self.cam0, out0, "c0"))
-        t1 = threading.Thread(target=rec, args=(self.cam1, out1, "c1"))
-        t0.start()
-        t1.start()
-        t0.join()
-        t1.join()
-        return res["c0"], res["c1"]
+    def _start_recorders(self,folder:str):
+        fourcc=self.cfg.fourcc; ext=self._ext_for_fourcc(fourcc)
+        out0=os.path.join(folder,f"cam0.{ext}"); out1=os.path.join(folder,f"cam1.{ext}")
+        res={"c0": None, "c1": None}
+        start0=threading.Event(); start1=threading.Event()
+        t0=threading.Thread(target=lambda: res.__setitem__("c0", self.cam0.record_clip(out0, float(self.cfg.record_duration_s), fourcc, async_writer=self.cfg.cam_async_writer, start_evt=start0)), daemon=True)
+        t1=threading.Thread(target=lambda: res.__setitem__("c1", self.cam1.record_clip(out1, float(self.cfg.record_duration_s), fourcc, async_writer=self.cfg.cam_async_writer, start_evt=start1)), daemon=True)
+        t0.start(); t1.start()
+        return res, (t0, t1), (start0, start1)
 
     def run_one(self):
-        folder = self._trial_folder()
+        folder=self._trial_folder()
+
+        if self.cfg.stim_keep_window_open:
+            self.stim.open_persistent(self.cfg.stim_screen_index,self.cfg.stim_fullscreen,self.cfg.stim_bg_grey)
+
         self.hw.mark_start()
         LOGGER.info("[Trial] Recording…")
-        c0, c1 = self._record_both(folder)
-        if self.cfg.lights_delay_s > 0:
-            LOGGER.info("[Trial] Wait %.3fs → LIGHTS ON", self.cfg.lights_delay_s)
-            wait_s(self.cfg.lights_delay_s)
+        res, threads, starts = self._start_recorders(folder)
+
+        # Wait until both cameras confirm they started writing (or timeout)
+        t_deadline = time.time() + float(self.cfg.record_start_timeout_s)
+        while time.time() < t_deadline and not (starts[0].is_set() and starts[1].is_set()):
+            time.sleep(0.01)
+        if not (starts[0].is_set() and starts[1].is_set()):
+            LOGGER.warning("[Trial] Proceeding without both cameras confirming start (timeout reached)")
+
+        # Now schedule lights and stimulus DURING the active recording
+        if self.cfg.lights_delay_s>0:
+            LOGGER.info("[Trial] Wait %.3fs → LIGHTS ON", self.cfg.lights_delay_s); wait_s(self.cfg.lights_delay_s)
         self.hw.lights_on()
-        if self.cfg.stim_delay_s > 0:
-            LOGGER.info("[Trial] Wait %.3fs → STIM", self.cfg.stim_delay_s)
-            wait_s(self.cfg.stim_delay_s)
-        self.stim.run(
-            self.cfg.stim_duration_s,
-            self.cfg.stim_r0_px,
-            self.cfg.stim_r1_px,
-            self.cfg.stim_bg_grey,
-            self.cfg.stim_screen_index,
-            self.cfg.stim_fullscreen,
-        )
-        self.hw.lights_off()
-        self.hw.mark_end()
-        self.trial_idx += 1
+
+        if self.cfg.stim_delay_s>0:
+            LOGGER.info("[Trial] Wait %.3fs → STIM", self.cfg.stim_delay_s); wait_s(self.cfg.stim_delay_s)
+
+        self.stim.run(self.cfg.stim_duration_s,self.cfg.stim_r0_px,self.cfg.stim_r1_px,self.cfg.stim_bg_grey,self.cfg.stim_screen_index,self.cfg.stim_fullscreen)
+
+        self.hw.lights_off(); self.hw.mark_end()
+
+        # Join recording threads AFTER stim/lights have run
+        for t in threads:
+            t.join()
+
+        self.trial_idx+=1
         self.csvw.writerow([
             now_stamp(), self.trial_idx,
-            c0 or "", c1 or "",
+            res["c0"] or "", res["c1"] or "",
             float(self.cfg.record_duration_s),
             float(self.cfg.lights_delay_s), float(self.cfg.stim_delay_s), float(self.cfg.stim_duration_s),
             int(self.cfg.stim_screen_index), bool(self.cfg.stim_fullscreen),
-            self.cam0.backend, self.cam0.ident, int(self.cam0.target_fps),
-            self.cam0.adv.get("width", 0), self.cam0.adv.get("height", 0), self.cam0.adv.get("exposure_us", 0), self.cam0.adv.get("hw_trigger", False),
-            self.cam1.backend, self.cam1.ident, int(self.cam1.target_fps),
-            self.cam1.adv.get("width", 0), self.cam1.adv.get("height", 0), self.cam1.adv.get("exposure_us", 0), self.cam1.adv.get("hw_trigger", False),
-            self.cfg.video_preset_id, self.cfg.fourcc,
-            str(getattr(self.cfg, "stim_type", "dot")),
-            str(getattr(self.cfg, "stim_image_path", "")),
+            str(self.cfg.stim_kind), str(self.cfg.stim_png_path), bool(self.cfg.stim_png_keep_aspect), bool(self.cfg.stim_keep_window_open),
+            self.cam0.backend, self.cam0.ident, int(self.cam0.target_fps), self.cam0.adv.get("width",0), self.cam0.adv.get("height",0), self.cam0.adv.get("exposure_us",0), self.cam0.adv.get("hw_trigger",False),
+            self.cam1.backend, self.cam1.ident, int(self.cam1.target_fps), self.cam1.adv.get("width",0), self.cam1.adv.get("height",0), self.cam1.adv.get("exposure_us",0), self.cam1.adv.get("hw_trigger",False),
+            self.cfg.video_preset_id, self.cfg.fourcc
         ])
         self.log.flush()
         LOGGER.info("[Trial] Logged")
 
-
 # -------------------- Device Enumeration --------------------
-def enumerate_opencv(max_index: int = 6) -> List[str]:
-    if not HAVE_OPENCV:
-        return []
-    found = []
+def enumerate_opencv(max_index:int=6)->List[str]:
+    if not HAVE_OPENCV: return []
+    found=[]
     for idx in range(max_index):
-        cap = None
+        cap=None
         try:
-            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY)
+            cap=cv2.VideoCapture(idx, cv2.CAP_DSHOW if os.name=="nt" else cv2.CAP_ANY)
             if cap and cap.isOpened():
                 found.append(f"OpenCV index {idx}")
         except Exception:
             pass
         finally:
             try:
-                if cap:
-                    cap.release()
-            except Exception:
-                pass
+                if cap: cap.release()
+            except Exception: pass
     return found
-
 
 # -------------------- GUI --------------------
 class SettingsGUI(QtWidgets.QWidget):
-    start_experiment = QtCore.pyqtSignal()
-    stop_experiment = QtCore.pyqtSignal()
-    apply_settings = QtCore.pyqtSignal()
-    manual_trigger = QtCore.pyqtSignal()
-    probe_requested = QtCore.pyqtSignal()
-    refresh_devices_requested = QtCore.pyqtSignal()
-    stim_window_reset_requested = QtCore.pyqtSignal()
-    preset_load_requested = QtCore.pyqtSignal(str)
-    preset_save_requested = QtCore.pyqtSignal(str)
-    preset_delete_requested = QtCore.pyqtSignal(str)
+    start_experiment=QtCore.pyqtSignal(); stop_experiment=QtCore.pyqtSignal(); apply_settings=QtCore.pyqtSignal(); manual_trigger=QtCore.pyqtSignal()
+    probe_requested=QtCore.pyqtSignal()
+    refresh_devices_requested=QtCore.pyqtSignal()
+    reset_stimulus_requested=QtCore.pyqtSignal()
 
-    def __init__(self, cfg: Config, cam0: CameraNode, cam1: CameraNode):
+    def __init__(self,cfg:Config,cam0:CameraNode,cam1:CameraNode):
         super().__init__()
-        self.cfg = cfg
-        self.cam0 = cam0
-        self.cam1 = cam1
+        self.cfg=cfg; self.cam0=cam0; self.cam1=cam1
         self.setWindowTitle(f"FlyPy — v{__version__}")
 
-        outer = QtWidgets.QVBoxLayout(self)
-        scroll = QtWidgets.QScrollArea(self)
-        scroll.setWidgetResizable(True)
-        pane = QtWidgets.QWidget()
-        root = QtWidgets.QVBoxLayout(pane)
+        outer=QtWidgets.QVBoxLayout(self)
+        scroll=QtWidgets.QScrollArea(self); scroll.setWidgetResizable(True)
+        pane=QtWidgets.QWidget(); root=QtWidgets.QVBoxLayout(pane)
 
-        # Top row
-        row0 = QtWidgets.QHBoxLayout()
+        row0=QtWidgets.QHBoxLayout()
         row0.addWidget(QtWidgets.QLabel("Quick Preset:"))
-        self.cb_preset = QtWidgets.QComboBox()
+        self.cb_preset=QtWidgets.QComboBox()
         self.cb_preset.addItem("Blackfly 522 fps (PySpin Mono8, ROI 640×512)")
         self.cb_preset.addItem("Blackfly 300 fps (PySpin Mono8, ROI 720×540)")
         self.cb_preset.addItem("OpenCV baseline (laptop cam)")
-        self.bt_apply_preset = QtWidgets.QPushButton("Apply Preset")
-
-        # User presets row (save / load / delete)
-        rowp = QtWidgets.QHBoxLayout()
-        rowp.addWidget(QtWidgets.QLabel("User Preset:"))
-        self.cb_user_preset = QtWidgets.QComboBox()
-        self.bt_preset_load = QtWidgets.QPushButton("Load")
-        self.bt_preset_save = QtWidgets.QPushButton("Save As…")
-        self.bt_preset_delete = QtWidgets.QPushButton("Delete")
-        rowp.addWidget(self.cb_user_preset, 1)
-        rowp.addWidget(self.bt_preset_load)
-        rowp.addWidget(self.bt_preset_save)
-        rowp.addWidget(self.bt_preset_delete)
-        rowp_w = QtWidgets.QWidget()
-        rowp_w.setLayout(rowp)
-
-        self.bt_probe = QtWidgets.QPushButton("Probe Max FPS")
-        self.bt_refresh = QtWidgets.QPushButton("Refresh Cameras")
-        row0.addWidget(self.cb_preset)
-        row0.addWidget(self.bt_apply_preset)
-        row0.addWidget(self.bt_probe)
-        row0.addWidget(self.bt_refresh)
+        self.bt_apply_preset=QtWidgets.QPushButton("Apply Preset")
+        self.bt_probe=QtWidgets.QPushButton("Probe Max FPS")
+        self.bt_refresh=QtWidgets.QPushButton("Refresh Cameras")
+        row0.addWidget(self.cb_preset); row0.addWidget(self.bt_apply_preset); row0.addWidget(self.bt_probe); row0.addWidget(self.bt_refresh)
         root.addLayout(row0)
-        root.addWidget(rowp_w)
-
         self.bt_apply_preset.clicked.connect(self._apply_selected_preset)
         self.bt_probe.clicked.connect(self._probe_clicked)
         self.bt_refresh.clicked.connect(self._refresh_clicked)
 
-        self.bt_preset_load.clicked.connect(lambda: self.preset_load_requested.emit(self.cb_user_preset.currentText()))
-        self.bt_preset_save.clicked.connect(self._preset_save_clicked)
-        self.bt_preset_delete.clicked.connect(lambda: self.preset_delete_requested.emit(self.cb_user_preset.currentText()))
-
-        # Controls row
-        row = QtWidgets.QHBoxLayout()
-        self.bt_start = QtWidgets.QPushButton("Start")
-        self.bt_stop = QtWidgets.QPushButton("Stop")
-        self.bt_trig = QtWidgets.QPushButton("Trigger Once")
-        self.bt_apply = QtWidgets.QPushButton("Apply Settings")
-        row.addWidget(self.bt_start)
-        row.addWidget(self.bt_stop)
-        row.addWidget(self.bt_trig)
-        row.addWidget(self.bt_apply)
+        row=QtWidgets.QHBoxLayout()
+        self.bt_start=QtWidgets.QPushButton("Start")
+        self.bt_stop=QtWidgets.QPushButton("Stop")
+        self.bt_trig=QtWidgets.QPushButton("Trigger Once")
+        self.bt_apply=QtWidgets.QPushButton("Apply Settings")
+        row.addWidget(self.bt_start); row.addWidget(self.bt_stop); row.addWidget(self.bt_trig); row.addWidget(self.bt_apply)
         root.addLayout(row)
         self.bt_start.clicked.connect(self.start_experiment.emit)
         self.bt_stop.clicked.connect(self.stop_experiment.emit)
         self.bt_trig.clicked.connect(self.manual_trigger.emit)
         self.bt_apply.clicked.connect(self.apply_settings.emit)
 
-        self.lbl_status = QtWidgets.QLabel("Status: Idle.")
-        root.addWidget(self.lbl_status)
+        self.lbl_status=QtWidgets.QLabel("Status: Idle."); root.addWidget(self.lbl_status)
 
-        grid = QtWidgets.QGridLayout()
-        root.addLayout(grid)
+        grid=QtWidgets.QGridLayout(); root.addLayout(grid)
 
-        # General
-        gen = QtWidgets.QGroupBox("General")
-        gl = QtWidgets.QFormLayout(gen)
-        self.cb_sim = QtWidgets.QCheckBox("Test/Simulation Mode (timer triggers)")
-        self.cb_sim.setChecked(self.cfg.simulation_mode)
-        gl.addRow(self.cb_sim)
-        self.sb_sim = QtWidgets.QDoubleSpinBox()
-        self.sb_sim.setRange(0.1, 3600.0)
-        self.sb_sim.setDecimals(2)
-        self.sb_sim.setValue(self.cfg.sim_trigger_interval)
-        gl.addRow("Interval between simulated triggers (s):", self.sb_sim)
-
-        self.le_root = QtWidgets.QLineEdit(self.cfg.output_root)
-        btn_browse = QtWidgets.QPushButton("Browse…")
-        rowr = QtWidgets.QHBoxLayout()
-        rowr.addWidget(self.le_root)
-        rowr.addWidget(btn_browse)
-        gl.addRow("Output folder:", rowr)
-
-        self.cb_fmt = QtWidgets.QComboBox()
-        self._id_by_idx = {}
-        current = 0
-        for i, p in enumerate(VIDEO_PRESETS):
-            self.cb_fmt.addItem(p["label"])
-            self.cb_fmt.setItemData(i, p["id"])
-            self._id_by_idx[i] = p["id"]
-            if p["id"] == self.cfg.video_preset_id:
-                current = i
-        self.cb_fmt.setCurrentIndex(current)
-        gl.addRow("Video format / codec:", self.cb_fmt)
-
-        self.sb_rec = QtWidgets.QDoubleSpinBox()
-        self.sb_rec.setRange(0.1, 600.0)
-        self.sb_rec.setDecimals(2)
-        self.sb_rec.setValue(self.cfg.record_duration_s)
-        gl.addRow("Recording duration (s):", self.sb_rec)
+        # --- General ---
+        gen=QtWidgets.QGroupBox("General")
+        gl=QtWidgets.QFormLayout(gen)
+        self.cb_sim=QtWidgets.QCheckBox("Test/Simulation Mode (timer triggers)")
+        self.cb_sim.setChecked(self.cfg.simulation_mode); gl.addRow(self.cb_sim)
+        self.sb_sim=QtWidgets.QDoubleSpinBox(); self.sb_sim.setRange(0.1,3600.0); self.sb_sim.setDecimals(2); self.sb_sim.setValue(self.cfg.sim_trigger_interval); gl.addRow("Interval between simulated triggers (s):", self.sb_sim)
+        self.le_root=QtWidgets.QLineEdit(self.cfg.output_root); btn_browse=QtWidgets.QPushButton("Browse…")
+        rowr=QtWidgets.QHBoxLayout(); rowr.addWidget(self.le_root); rowr.addWidget(btn_browse); gl.addRow("Output folder:", rowr)
+        self.cb_fmt=QtWidgets.QComboBox(); self._id_by_idx={}; current=0
+        for i,p in enumerate(VIDEO_PRESETS):
+            self.cb_fmt.addItem(p["label"]); self.cb_fmt.setItemData(i,p["id"]); self._id_by_idx[i]=p["id"]
+            if p["id"]==self.cfg.video_preset_id: current=i
+        self.cb_fmt.setCurrentIndex(current); gl.addRow("Video format / codec:", self.cb_fmt)
+        self.sb_rec=QtWidgets.QDoubleSpinBox(); self.sb_rec.setRange(0.1,600.0); self.sb_rec.setDecimals(2); self.sb_rec.setValue(self.cfg.record_duration_s); gl.addRow("Recording duration (s):", self.sb_rec)
         grid.addWidget(gen, 0, 0, 1, 2)
+        btn_browse.clicked.connect(self._browse)
 
-        btn_browse.clicked.connect(self._browse_output_dir)
+        # --- Stimulus & Timing ---
+        stim=QtWidgets.QGroupBox("Stimulus & Timing (Growing dot / PNG looming)")
+        sl=QtWidgets.QFormLayout(stim)
+        self.sb_stim_dur=QtWidgets.QDoubleSpinBox(); self.sb_stim_dur.setRange(0.05,60.0); self.sb_stim_dur.setDecimals(3); self.sb_stim_dur.setValue(self.cfg.stim_duration_s)
+        self.sb_r0=QtWidgets.QSpinBox(); self.sb_r0.setRange(1,4000); self.sb_r0.setValue(self.cfg.stim_r0_px)
+        self.sb_r1=QtWidgets.QSpinBox(); self.sb_r1.setRange(1,8000); self.sb_r1.setValue(self.cfg.stim_r1_px)
+        self.sb_bg=QtWidgets.QDoubleSpinBox(); self.sb_bg.setRange(0.0,1.0); self.sb_bg.setSingleStep(0.05); self.sb_bg.setValue(self.cfg.stim_bg_grey)
+        self.sb_light_delay=QtWidgets.QDoubleSpinBox(); self.sb_light_delay.setRange(0.0,10.0); self.sb_light_delay.setDecimals(3); self.sb_light_delay.setValue(self.cfg.lights_delay_s)
+        self.sb_stim_delay=QtWidgets.QDoubleSpinBox(); self.sb_stim_delay.setRange(0.0,10.0); self.sb_stim_delay.setDecimals(3); self.sb_stim_delay.setValue(self.cfg.stim_delay_s)
 
-        # Stimulus & Timing
-        stim = QtWidgets.QGroupBox("Stimulus & Timing (Falling object / growing dot)")
-        sl = QtWidgets.QFormLayout(stim)
+        self.cb_stim_kind=QtWidgets.QComboBox()
+        self.cb_stim_kind.addItem("Circle", "circle")
+        self.cb_stim_kind.addItem("PNG (scaled)", "png")
+        self.cb_stim_kind.setCurrentIndex(0 if (self.cfg.stim_kind or "circle")!="png" else 1)
 
-        self.sb_stim_dur = QtWidgets.QDoubleSpinBox()
-        self.sb_stim_dur.setRange(0.05, 60.0)
-        self.sb_stim_dur.setDecimals(3)
-        self.sb_stim_dur.setValue(self.cfg.stim_duration_s)
+        self.le_stim_png=QtWidgets.QLineEdit(self.cfg.stim_png_path or "")
+        self.le_stim_png.setPlaceholderText("Path to .png (used when Stimulus Type = PNG)")
+        self.bt_stim_png=QtWidgets.QPushButton("Browse…")
+        row_png=QtWidgets.QHBoxLayout(); row_png.addWidget(self.le_stim_png); row_png.addWidget(self.bt_stim_png)
+        png_wrap=QtWidgets.QWidget(); png_wrap.setLayout(row_png)
 
-        self.sb_r0 = QtWidgets.QSpinBox()
-        self.sb_r0.setRange(1, 4000)
-        self.sb_r0.setValue(self.cfg.stim_r0_px)
+        self.cb_png_aspect=QtWidgets.QCheckBox("PNG: keep aspect")
+        self.cb_png_aspect.setChecked(bool(self.cfg.stim_png_keep_aspect))
 
-        self.sb_r1 = QtWidgets.QSpinBox()
-        self.sb_r1.setRange(1, 8000)
-        self.sb_r1.setValue(self.cfg.stim_r1_px)
+        self.cb_keep_open=QtWidgets.QCheckBox("Keep stimulus window open while running")
+        self.cb_keep_open.setChecked(bool(self.cfg.stim_keep_window_open))
 
-        self.sb_bg = QtWidgets.QDoubleSpinBox()
-        self.sb_bg.setRange(0.0, 1.0)
-        self.sb_bg.setSingleStep(0.05)
-        self.sb_bg.setValue(self.cfg.stim_bg_grey)
+        self.cb_circle_preset = QtWidgets.QComboBox()
+        for preset in CIRCLE_PRESETS:
+            self.cb_circle_preset.addItem(preset["label"], preset)
 
-        self.cb_stim_type = QtWidgets.QComboBox()
-        self.cb_stim_type.addItem("Growing Dot (circle)", "dot")
-        self.cb_stim_type.addItem("Looming Image", "image")
-        try:
-            if getattr(self.cfg, "stim_type", "dot") == "image":
-                self.cb_stim_type.setCurrentIndex(1)
-        except Exception:
-            pass
-
-        self.le_stim_image = QtWidgets.QLineEdit(getattr(self.cfg, "stim_image_path", "") or "")
-        self.bt_stim_browse = QtWidgets.QPushButton("Browse…")
-        self.bt_stim_browse.clicked.connect(self._browse_stimulus_image)
-        row_img = QtWidgets.QHBoxLayout()
-        row_img.addWidget(self.le_stim_image, 1)
-        row_img.addWidget(self.bt_stim_browse)
-
-        self.sb_light_delay = QtWidgets.QDoubleSpinBox()
-        self.sb_light_delay.setRange(0.0, 10.0)
-        self.sb_light_delay.setDecimals(3)
-        self.sb_light_delay.setValue(self.cfg.lights_delay_s)
-
-        self.sb_stim_delay = QtWidgets.QDoubleSpinBox()
-        self.sb_stim_delay.setRange(0.0, 10.0)
-        self.sb_stim_delay.setDecimals(3)
-        self.sb_stim_delay.setValue(self.cfg.stim_delay_s)
-
+        sl.addRow("Circle Preset:", self.cb_circle_preset)
         sl.addRow("Stimulus total time (s):", self.sb_stim_dur)
-        sl.addRow("Stimulus Start Size (px):", self.sb_r0)
-        sl.addRow("Stimulus End Size (px):", self.sb_r1)
+        sl.addRow("Stimulus Start Size (radius px):", self.sb_r0)
+        sl.addRow("Stimulus End Size (radius px):", self.sb_r1)
         sl.addRow("Background shade (0=black, 1=white):", self.sb_bg)
-        sl.addRow("Stimulus type:", self.cb_stim_type)
-        sl.addRow("Stimulus image:", row_img)
         sl.addRow("Delay: record → lights ON (s):", self.sb_light_delay)
         sl.addRow("Delay: record → stimulus ON (s):", self.sb_stim_delay)
+        sl.addRow("Stimulus Type:", self.cb_stim_kind)
+        sl.addRow("Stimulus PNG:", png_wrap)
+        sl.addRow(self.cb_png_aspect)
+        sl.addRow(self.cb_keep_open)
         grid.addWidget(stim, 1, 0, 1, 2)
 
-        # Display & Windows
-        disp = QtWidgets.QGroupBox("Display & Windows")
-        dl = QtWidgets.QFormLayout(disp)
-        self.cb_stim_screen = QtWidgets.QComboBox()
-        self.cb_gui_screen = QtWidgets.QComboBox()
-        for i, s in enumerate(QtGui.QGuiApplication.screens()):
-            g = s.geometry()
-            label = f"Screen {i} — {g.width()}×{g.height()} @({g.x()},{g.y()})"
-            self.cb_stim_screen.addItem(label)
-            self.cb_gui_screen.addItem(label)
-        self.cb_stim_screen.setCurrentIndex(min(self.cfg.stim_screen_index, self.cb_stim_screen.count() - 1))
-        self.cb_gui_screen.setCurrentIndex(min(self.cfg.gui_screen_index, self.cb_gui_screen.count() - 1))
-        self.cb_full = QtWidgets.QCheckBox("Stimulus fullscreen")
+        def _browse_png():
+            p, _ = QtWidgets.QFileDialog.getOpenFileName(self,"Select stimulus PNG", self.le_stim_png.text() or os.getcwd(),"PNG Images (*.png)")
+            if p: self.le_stim_png.setText(p)
+        self.bt_stim_png.clicked.connect(_browse_png)
+
+        def _toggle_png_controls():
+            is_png = (self.cb_stim_kind.currentData()=="png")
+            self.le_stim_png.setEnabled(is_png)
+            self.bt_stim_png.setEnabled(is_png)
+            self.cb_png_aspect.setEnabled(is_png)
+        self.cb_stim_kind.currentIndexChanged.connect(_toggle_png_controls)
+        _toggle_png_controls()
+
+        def _apply_circle_preset():
+            data = self.cb_circle_preset.currentData()
+            if isinstance(data, dict):
+                self.cb_stim_kind.setCurrentIndex(0)
+                self.sb_stim_dur.setValue(float(data.get("dur", self.sb_stim_dur.value())))
+                self.sb_r0.setValue(int(data.get("r0", self.sb_r0.value())))
+                self.sb_r1.setValue(int(data.get("r1", self.sb_r1.value())))
+                self.sb_bg.setValue(float(data.get("bg", self.sb_bg.value())))
+        self.cb_circle_preset.currentIndexChanged.connect(_apply_circle_preset)
+
+        # --- Display & Windows ---
+        disp=QtWidgets.QGroupBox("Display & Windows")
+        dl=QtWidgets.QFormLayout(disp)
+        self.cb_stim_screen=QtWidgets.QComboBox(); self.cb_gui_screen=QtWidgets.QComboBox()
+        self.bt_refresh_displays=QtWidgets.QPushButton("Refresh Displays")
+        self.bt_reset_stim=QtWidgets.QPushButton("Open/Reset Stimulus Window")
+
+        def _populate_display_boxes():
+            self.cb_stim_screen.clear(); self.cb_gui_screen.clear()
+            screens = QtGui.QGuiApplication.screens()
+            primary  = QtGui.QGuiApplication.primaryScreen()
+            for i,s in enumerate(screens):
+                g=s.geometry()
+                try:
+                    name = s.name()
+                except Exception:
+                    name = f"Screen {i}"
+                try:
+                    dpi  = int(s.logicalDotsPerInch())
+                except Exception:
+                    dpi = 96
+                is_primary = (s is primary)
+                label = f"{i}: {name}{' (Primary)' if is_primary else ''} — {g.width()}×{g.height()} @({g.x()},{g.y()}) • {dpi} DPI"
+                self.cb_stim_screen.addItem(label)
+                self.cb_gui_screen.addItem(label)
+            self.cb_stim_screen.setCurrentIndex(min(self.cfg.stim_screen_index, max(0, self.cb_stim_screen.count()-1)))
+            self.cb_gui_screen.setCurrentIndex(min(self.cfg.gui_screen_index, max(0, self.cb_gui_screen.count()-1)))
+
+        _populate_display_boxes()
+        self.bt_refresh_displays.clicked.connect(_populate_display_boxes)
+        self.bt_reset_stim.clicked.connect(self.reset_stimulus_requested.emit)
+
+        row_disp = QtWidgets.QHBoxLayout()
+        row_disp.addWidget(self.cb_stim_screen)
+        row_disp.addWidget(self.bt_refresh_displays)
+        row_disp.addWidget(self.bt_reset_stim)
+
+        self.cb_full=QtWidgets.QCheckBox("Borderless fullscreen (F11-style)")
         self.cb_full.setChecked(self.cfg.stim_fullscreen)
-        self.cb_prewarm = QtWidgets.QCheckBox("Pre-warm stimulus window at launch")
-        self.cb_prewarm.setChecked(self.cfg.prewarm_stim)
-        self.bt_reset_stim = QtWidgets.QPushButton("Reset / Relaunch Stimulus Window")
-        self.bt_reset_stim.clicked.connect(lambda: self.stim_window_reset_requested.emit())
-        dl.addRow("Stimulus display screen:", self.cb_stim_screen)
-        dl.addRow(self.bt_reset_stim)
+        self.cb_prewarm=QtWidgets.QCheckBox("Pre-warm stimulus window at launch"); self.cb_prewarm.setChecked(self.cfg.prewarm_stim)
+
+        dl.addRow("Stimulus display screen:", row_disp)
         dl.addRow("GUI display screen:", self.cb_gui_screen)
         dl.addRow(self.cb_full)
         dl.addRow(self.cb_prewarm)
         grid.addWidget(disp, 2, 0, 1, 2)
 
-        # Camera panels
-        self.cam_boxes = []
+        # --- Cameras ---
+        self.cam_boxes=[]
         for idx, node in enumerate((cam0, cam1)):
-            gb = QtWidgets.QGroupBox(f"Camera {idx}")
-            glb = QtWidgets.QGridLayout(gb)
+            gb=QtWidgets.QGroupBox(f"Camera {idx}")
+            glb=QtWidgets.QGridLayout(gb)
 
-            preview = QtWidgets.QLabel("Preview OFF")
-            preview.setFixedSize(360, 240)
-            preview.setStyleSheet("background:#ddd;border:1px solid #aaa;")
-            preview.setAlignment(QtCore.Qt.AlignCenter)
-            cb_show = QtWidgets.QCheckBox("Show Preview")
-            cb_show.setChecked(False)
-            glb.addWidget(preview, 0, 0, 7, 1)
-            glb.addWidget(cb_show, 7, 0, 1, 1)
+            preview=QtWidgets.QLabel("Preview OFF"); preview.setFixedSize(360,240)
+            preview.setStyleSheet("background:#fff;border:1px solid #aaa;"); preview.setAlignment(QtCore.Qt.AlignCenter)
+            cb_show=QtWidgets.QCheckBox("Show Preview"); cb_show.setChecked(False)
+            glb.addWidget(preview,0,0,7,1); glb.addWidget(cb_show,7,0,1,1)
 
-            cb_backend = QtWidgets.QComboBox()
-            cb_backend.addItem("OpenCV")
-            cb_backend.addItem("PySpin")
-            cb_backend.setCurrentIndex(0 if node.backend == "OpenCV" else 1)
-            glb.addWidget(QtWidgets.QLabel("Backend:"), 0, 1)
-            glb.addWidget(cb_backend, 0, 2)
+            cb_backend=QtWidgets.QComboBox(); cb_backend.addItem("OpenCV"); cb_backend.addItem("PySpin")
+            cb_backend.setCurrentIndex(0 if node.backend=="OpenCV" else 1)
+            glb.addWidget(QtWidgets.QLabel("Backend:"),0,1); glb.addWidget(cb_backend,0,2)
 
-            cb_device = QtWidgets.QComboBox()
-            cb_device.setEditable(False)
-            cb_device.setMinimumWidth(280)
-            glb.addWidget(QtWidgets.QLabel("Device:"), 1, 1)
-            glb.addWidget(cb_device, 1, 2)
+            cb_device=QtWidgets.QComboBox(); cb_device.setEditable(False); cb_device.setMinimumWidth(280)
+            glb.addWidget(QtWidgets.QLabel("Device:"),1,1); glb.addWidget(cb_device,1,2)
 
-            le_ident = QtWidgets.QLineEdit(node.ident)
+            le_ident=QtWidgets.QLineEdit(node.ident)
             le_ident.setPlaceholderText("OpenCV index (0/1/…) or PySpin serial (e.g., 24102017)")
-            glb.addWidget(QtWidgets.QLabel("Manual index/serial:"), 2, 1)
-            glb.addWidget(le_ident, 2, 2)
+            glb.addWidget(QtWidgets.QLabel("Manual index/serial:"),2,1); glb.addWidget(le_ident,2,2)
 
-            sb_fps = QtWidgets.QSpinBox()
-            sb_fps.setRange(1, 10000)
-            sb_fps.setValue(int(node.target_fps))
-            glb.addWidget(QtWidgets.QLabel("Target FPS:"), 3, 1)
-            glb.addWidget(sb_fps, 3, 2)
+            sb_fps=QtWidgets.QSpinBox(); sb_fps.setRange(1,10000); sb_fps.setValue(int(node.target_fps))
+            glb.addWidget(QtWidgets.QLabel("Target FPS:"),3,1); glb.addWidget(sb_fps,3,2)
 
-            adv_frame = QtWidgets.QFrame()
-            adv_layout = QtWidgets.QFormLayout(adv_frame)
-            sb_w = QtWidgets.QSpinBox()
-            sb_w.setRange(0, 20000)
-            sb_w.setSingleStep(2)
-            sb_w.setValue(int(node.adv.get("width", 0) or 0))
-            sb_h = QtWidgets.QSpinBox()
-            sb_h.setRange(0, 20000)
-            sb_h.setSingleStep(2)
-            sb_h.setValue(int(node.adv.get("height", 0) or 0))
+            adv_frame=QtWidgets.QFrame(); adv_layout=QtWidgets.QFormLayout(adv_frame)
+            sb_w=QtWidgets.QSpinBox(); sb_w.setRange(0,20000); sb_w.setSingleStep(2); sb_w.setValue(int(node.adv.get("width",0) or 0))
+            sb_h=QtWidgets.QSpinBox(); sb_h.setRange(0,20000); sb_h.setSingleStep(2); sb_h.setValue(int(node.adv.get("height",0) or 0))
             adv_layout.addRow("ROI Width (0=max):", sb_w)
             adv_layout.addRow("ROI Height (0=max):", sb_h)
-            sb_exp = QtWidgets.QSpinBox()
-            sb_exp.setRange(20, 1000000)
-            sb_exp.setSingleStep(50)
-            sb_exp.setValue(int(node.adv.get("exposure_us", 1500) or 1500))
+            sb_exp=QtWidgets.QSpinBox(); sb_exp.setRange(20, 1000000); sb_exp.setSingleStep(50); sb_exp.setValue(int(node.adv.get("exposure_us",1500) or 1500))
             adv_layout.addRow("Exposure (µs):", sb_exp)
-            cb_hwtrig = QtWidgets.QCheckBox("Hardware trigger (Line0)")
-            cb_hwtrig.setChecked(bool(node.adv.get("hw_trigger", False)))
+            cb_hwtrig=QtWidgets.QCheckBox("Hardware trigger (Line0)")
+            cb_hwtrig.setChecked(bool(node.adv.get("hw_trigger", True)))
             adv_layout.addRow(cb_hwtrig)
             adv_frame.setVisible(False)
-
-            btn_adv = QtWidgets.QPushButton("Advanced…")
-
+            btn_adv=QtWidgets.QPushButton("Advanced…")
             def _toggle_adv(checked=False, f=adv_frame, b=btn_adv):
                 f.setVisible(not f.isVisible())
                 b.setText("Hide Advanced" if f.isVisible() else "Advanced…")
-
             btn_adv.clicked.connect(_toggle_adv)
-            glb.addWidget(btn_adv, 4, 1, 1, 2)
-            glb.addWidget(adv_frame, 5, 1, 2, 2)
+            glb.addWidget(btn_adv,4,1,1,2)
+            glb.addWidget(adv_frame,5,1,2,2)
 
-            lbl_rep = QtWidgets.QLabel("Driver-reported FPS: ~0.0")
-            glb.addWidget(lbl_rep, 8, 1, 1, 2)
+            lbl_rep=QtWidgets.QLabel("Driver-reported FPS: ~0.0"); glb.addWidget(lbl_rep,8,1,1,2)
 
-            self.cam_boxes.append({
-                "gb": gb, "preview": preview, "cb_show": cb_show, "cb_backend": cb_backend, "cb_device": cb_device,
-                "le_ident": le_ident, "sb_fps": sb_fps, "sb_w": sb_w, "sb_h": sb_h, "sb_exp": sb_exp,
-                "cb_hw": cb_hwtrig, "lbl_rep": lbl_rep
-            })
-            grid.addWidget(gb, 3 + idx, 0, 1, 2)
+            self.cam_boxes.append({"gb":gb,"preview":preview,"cb_show":cb_show,"cb_backend":cb_backend,"cb_device":cb_device,
+                                   "le_ident":le_ident,"sb_fps":sb_fps,"sb_w":sb_w,"sb_h":sb_h,"sb_exp":sb_exp,"cb_hw":cb_hwtrig,"lbl_rep":lbl_rep})
+            grid.addWidget(gb, 3+idx, 0, 1, 2)
 
-        scroll.setWidget(pane)
-        outer.addWidget(scroll)
-        self._update_footer = QtWidgets.QLabel("Tips: Use 'Refresh Cameras' after plugging devices. PySpin entries show serial + model. Previews are optional; recordings are always full-res.")
+        scroll.setWidget(pane); outer.addWidget(scroll)
+        self._update_footer=QtWidgets.QLabel("Tips: Cameras wait for first frame before timing; lights/stim occur during active recording. In HW-trigger mode, preview is soft-triggered per frame.")
         outer.addWidget(self._update_footer)
 
-    # ---- Presets UI helpers ----
-    def set_user_preset_names(self, names: List[str]):
-        current = self.cb_user_preset.currentText() if self.cb_user_preset.count() else ""
-        self.cb_user_preset.blockSignals(True)
-        try:
-            self.cb_user_preset.clear()
-            for n in names:
-                self.cb_user_preset.addItem(str(n))
-            if current:
-                ix = self.cb_user_preset.findText(current)
-                if ix >= 0:
-                    self.cb_user_preset.setCurrentIndex(ix)
-        finally:
-            self.cb_user_preset.blockSignals(False)
-
-    def _preset_save_clicked(self):
-        name, ok = QtWidgets.QInputDialog.getText(self, "Save Preset", "Preset name:")
-        if not ok:
-            return
-        name = (name or "").strip()
-        if not name:
-            return
-        self.preset_save_requested.emit(name)
-
-    # ---- Other GUI handlers ----
     def _apply_selected_preset(self):
-        idx = self.cb_preset.currentIndex()
+        idx=self.cb_preset.currentIndex()
+        # Force AVI/MJPG for reliability
         for i in range(self.cb_fmt.count()):
-            if (self.cb_fmt.itemData(i) or "").lower() == "avi_mjpg":
-                self.cb_fmt.setCurrentIndex(i)
-                break
-        if idx == 0:
+            if (self.cb_fmt.itemData(i) or "").lower()=="avi_mjpg":
+                self.cb_fmt.setCurrentIndex(i); break
+        # White background and persistent window for all presets
+        self.sb_bg.setValue(1.0)
+        self.cb_keep_open.setChecked(True)
+        self.cb_prewarm.setChecked(True)
+        if idx==0:
             for box in self.cam_boxes:
                 box["cb_backend"].setCurrentIndex(1)
                 box["sb_fps"].setValue(522)
-                box["sb_w"].setValue(640)
-                box["sb_h"].setValue(512)
-                box["sb_exp"].setValue(1500)
-                box["cb_hw"].setChecked(False)
-        elif idx == 1:
+                box["sb_w"].setValue(640); box["sb_h"].setValue(512)
+                box["sb_exp"].setValue(1500); box["cb_hw"].setChecked(True)
+        elif idx==1:
             for box in self.cam_boxes:
                 box["cb_backend"].setCurrentIndex(1)
                 box["sb_fps"].setValue(300)
-                box["sb_w"].setValue(720)
-                box["sb_h"].setValue(540)
-                box["sb_exp"].setValue(2500)
-                box["cb_hw"].setChecked(False)
+                box["sb_w"].setValue(720); box["sb_h"].setValue(540)
+                box["sb_exp"].setValue(2500); box["cb_hw"].setChecked(True)
         else:
-            for n, box in enumerate(self.cam_boxes):
+            for n,box in enumerate(self.cam_boxes):
                 box["cb_backend"].setCurrentIndex(0)
                 box["le_ident"].setText(str(n))
                 box["sb_fps"].setValue(60)
-                box["sb_w"].setValue(640)
-                box["sb_h"].setValue(480)
-                box["sb_exp"].setValue(5000)
-                box["cb_hw"].setChecked(False)
+                box["sb_w"].setValue(640); box["sb_h"].setValue(480)
+                box["sb_exp"].setValue(5000); box["cb_hw"].setChecked(False)
         self.sb_rec.setValue(2.0)
         self.apply_settings.emit()
 
     def _probe_clicked(self): self.probe_requested.emit()
     def _refresh_clicked(self): self.refresh_devices_requested.emit()
+    def _browse(self):
+        d=QtWidgets.QFileDialog.getExistingDirectory(self,"Select output folder", self.le_root.text() or os.getcwd())
+        if d: self.le_root.setText(d)
 
-    def _browse_output_dir(self):
-        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Select output folder", self.le_root.text() or os.getcwd())
-        if d:
-            self.le_root.setText(d)
-
-    def _browse_stimulus_image(self):
-        start_dir = os.path.dirname(self.le_stim_image.text().strip()) if self.le_stim_image.text().strip() else os.getcwd()
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Select stimulus image",
-            start_dir,
-            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff);;All files (*.*)"
-        )
-        if path:
-            self.le_stim_image.setText(path)
-
-    def set_preview_image(self, cam_idx: int, img_bgr: Optional[np.ndarray]):
+    def set_preview_image(self, cam_idx:int, img_bgr: Optional[np.ndarray]):
         if img_bgr is None:
             self.cam_boxes[cam_idx]["preview"].setText("Preview OFF")
             self.cam_boxes[cam_idx]["preview"].setPixmap(QtGui.QPixmap())
             return
-        h, w, _ = img_bgr.shape
+        h,w,_=img_bgr.shape
         if HAVE_OPENCV:
             rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         else:
             rgb = img_bgr[..., ::-1].copy()
-        qimg = QtGui.QImage(rgb.tobytes(), w, h, 3 * w, QtGui.QImage.Format_RGB888)
+        qimg = QtGui.QImage(rgb.tobytes(), w, h, 3*w, QtGui.QImage.Format_RGB888)
         pix = QtGui.QPixmap.fromImage(qimg)
         self.cam_boxes[cam_idx]["preview"].setPixmap(pix)
 
-    def update_cam_fps_labels(self, f0: float, f1: float):
+    def update_cam_fps_labels(self, f0:float, f1:float):
         self.cam_boxes[0]["lbl_rep"].setText(f"Driver-reported FPS: ~{f0:.1f}")
         self.cam_boxes[1]["lbl_rep"].setText(f"Driver-reported FPS: ~{f1:.1f}")
-
 
 # -------------------- Main App --------------------
 class MainApp(QtWidgets.QApplication):
     def __init__(self, argv):
         super().__init__(argv)
-        self.cfg = Config()
+        self.cfg=Config()
         try:
             import argparse
-            ap = argparse.ArgumentParser(add_help=False)
-            ap.add_argument("--simulate", action="store_true")
-            ap.add_argument("--prewarm-stim", dest="prewarm_stim", action="store_true")
-            ns, _ = ap.parse_known_args(argv[1:])
-            if ns.simulate:
-                self.cfg.simulation_mode = True
-            if getattr(ns, "prewarm_stim", False):
-                self.cfg.prewarm_stim = True
-        except Exception:
-            pass
+            ap=argparse.ArgumentParser(add_help=False)
+            ap.add_argument("--simulate",action="store_true")
+            ap.add_argument("--prewarm-stim",dest="prewarm_stim",action="store_true")
+            ns,_=ap.parse_known_args(argv[1:])
+            if ns.simulate: self.cfg.simulation_mode=True
+            if getattr(ns,"prewarm_stim",False): self.cfg.prewarm_stim=True
+        except Exception: pass
 
-        self.hw = HardwareBridge(self.cfg)
-        self.cam0 = CameraNode(
-            "cam0", self.cfg.cam0_backend, self.cfg.cam0_id, self.cfg.cam0_target_fps,
-            adv={"width": self.cfg.cam0_width, "height": self.cfg.cam0_height, "exposure_us": self.cfg.cam0_exposure_us, "hw_trigger": self.cfg.cam0_hw_trigger}
-        )
-        self.cam1 = CameraNode(
-            "cam1", self.cfg.cam1_backend, self.cfg.cam1_id, self.cfg.cam1_target_fps,
-            adv={"width": self.cfg.cam1_width, "height": self.cfg.cam1_height, "exposure_us": self.cfg.cam1_exposure_us, "hw_trigger": self.cfg.cam1_hw_trigger}
-        )
+        self.hw=HardwareBridge(self.cfg)
+        self.cam0=CameraNode("cam0", self.cfg.cam0_backend, self.cfg.cam0_id, self.cfg.cam0_target_fps,
+                             adv={"width":self.cfg.cam0_width,"height":self.cfg.cam0_height,"exposure_us":self.cfg.cam0_exposure_us,"hw_trigger":self.cfg.cam0_hw_trigger})
+        self.cam1=CameraNode("cam1", self.cfg.cam1_backend, self.cfg.cam1_id, self.cfg.cam1_target_fps,
+                             adv={"width":self.cfg.cam1_width,"height":self.cfg.cam1_height,"exposure_us":self.cfg.cam1_exposure_us,"hw_trigger":self.cfg.cam1_hw_trigger})
 
         ensure_dir(self.cfg.output_root)
-        log_path = os.path.join(self.cfg.output_root, "trials_log.csv")
-        self.runner = TrialRunner(self.cfg, self.hw, self.cam0, self.cam1, log_path)
+        log_path=os.path.join(self.cfg.output_root,"trials_log.csv")
+        self.runner=TrialRunner(self.cfg,self.hw,self.cam0,self.cam1,log_path)
 
-        self.gui = SettingsGUI(self.cfg, self.cam0, self.cam1)
-        self.gui.start_experiment.connect(getattr(self, "start_loop", self.start_loop_compat))
-        self.gui.stop_experiment.connect(getattr(self, "stop_loop", self.stop_loop_compat))
-        self.gui.apply_settings.connect(self.apply_from_gui)
+        self.gui=SettingsGUI(self.cfg,self.cam0,self.cam1)
+        self.gui.start_experiment.connect(self.start_loop)
+        self.gui.stop_experiment.connect(self.stop_loop)
+        self.gui.apply_settings.connect(self.apply_settings_from_gui)
         self.gui.manual_trigger.connect(self.trigger_once)
         self.gui.probe_requested.connect(self.start_probe)
         self.gui.refresh_devices_requested.connect(self.refresh_devices)
-        self.gui.stim_window_reset_requested.connect(self.reset_stimulus_window)
-
-        # Built-in + user presets
-        self.user_presets: Dict[str, dict] = dict(BUILTIN_USER_PRESETS)
-        self.user_presets.update(_load_user_presets())
-        self.gui.set_user_preset_names(sorted(self.user_presets.keys(), key=lambda s: s.lower()))
-        self.gui.preset_load_requested.connect(self._on_preset_load)
-        self.gui.preset_save_requested.connect(self._on_preset_save)
-        self.gui.preset_delete_requested.connect(self._on_preset_delete)
+        self.gui.reset_stimulus_requested.connect(self.reset_stimulus_window)
 
         self.show_scaled_gui(self.cfg.gui_screen_index)
 
-        self.running = False
-        self.in_trial = False
-        self.thread = None
-        self.preview_timer = QtCore.QTimer(self)
-        self.preview_timer.setInterval(300)
-        self.preview_timer.timeout.connect(self.update_previews)
-        self.preview_timer.start()
+        self.running=False; self.in_trial=False; self.thread=None
+        self.preview_timer=QtCore.QTimer(self); self.preview_timer.setInterval(300); self.preview_timer.timeout.connect(self.update_previews); self.preview_timer.start()
 
         self.aboutToQuit.connect(self.cleanup)
 
-        if self.cfg.prewarm_stim:
-            QtCore.QTimer.singleShot(
-                300,
-                lambda: self.runner.stim.open_persistent(self.cfg.stim_screen_index, self.cfg.stim_fullscreen, self.cfg.stim_bg_grey)
-            )
+        if self.cfg.prewarm_stim or self.cfg.stim_keep_window_open:
+            QtCore.QTimer.singleShot(300, lambda: self.runner.stim.open_persistent(self.cfg.stim_screen_index,self.cfg.stim_fullscreen,self.cfg.stim_bg_grey))
 
         self._print_startup_summary()
         QtCore.QTimer.singleShot(200, self.refresh_devices)
@@ -1916,47 +1588,41 @@ class MainApp(QtWidgets.QApplication):
         LOGGER.info("Version: %s", __version__)
         LOGGER.info("OpenCV: %s", "OK" if HAVE_OPENCV else "MISSING")
         try:
-            import PySpin as _ps
-            LOGGER.info("PySpin: OK")
+            import PySpin as _ps; LOGGER.info("PySpin: OK")
         except Exception as e:
             LOGGER.info("PySpin: MISSING (%s) — install Spinnaker SDK + PySpin", e)
         LOGGER.info("======================")
 
-    def show_scaled_gui(self, screen_index: int):
-        screens = QtGui.QGuiApplication.screens()
-        geo = screens[screen_index].availableGeometry() if 0 <= screen_index < len(screens) else QtGui.QGuiApplication.primaryScreen().availableGeometry()
-        target_w = max(980, int(geo.width() * 0.9))
-        target_h = max(720, int(geo.height() * 0.9))
-        target_w = min(target_w, geo.width())
-        target_h = min(target_h, geo.height())
-        self.gui.resize(target_w, target_h)
-        x = geo.x() + (geo.width() - target_w) // 2
-        y = geo.y() + (geo.height() - target_h) // 2
-        self.gui.move(x, y)
-        self.gui.show()
+    def show_scaled_gui(self, screen_index:int):
+        screens=QtGui.QGuiApplication.screens()
+        geo=screens[screen_index].availableGeometry() if 0<=screen_index<len(screens) else QtGui.QGuiApplication.primaryScreen().availableGeometry()
+        target_w=max(980,int(geo.width()*0.9)); target_h=max(720,int(geo.height()*0.9))
+        target_w=min(target_w,geo.width()); target_h=min(target_h,geo.height())
+        self.gui.resize(target_w,target_h)
+        x=geo.x()+(geo.width()-target_w)//2; y=geo.y()+(geo.height()-target_h)//2; self.gui.move(x,y); self.gui.show()
+
+    def position_gui(self, screen_index:int):
+        screens=QtGui.QGuiApplication.screens()
+        if 0<=screen_index<len(screens):
+            geo=screens[screen_index].availableGeometry()
+            w=min(self.gui.width(), geo.width()); h=min(self.gui.height(), geo.height())
+            x=geo.x()+(geo.width()-w)//2; y=geo.y()+(geo.height()-h)//2
+            self.gui.resize(w,h); self.gui.move(x,y); self.gui.show()
+        else:
+            self.gui.show()
 
     def refresh_devices(self):
-        """Populate device dropdowns and auto-assign distinct defaults."""
-        def _find_item_index(cb: QtWidgets.QComboBox, backend: str, ident: str) -> int:
-            for i in range(cb.count()):
-                data = cb.itemData(i)
-                if isinstance(data, dict) and data.get("backend") == backend and str(data.get("ident")) == str(ident):
-                    return i
-            return -1
-
         try:
             ocv_list = enumerate_opencv(6) if HAVE_OPENCV else []
             spin_list = spin_enumerate()
 
-            devs = []
+            devs=[]
             for item in spin_list:
-                devs.append({"backend": "PySpin", "ident": item["serial"], "label": item["display"]})
+                devs.append({"backend":"PySpin","ident":item["serial"],"label":item["display"]})
             for s in ocv_list:
-                try:
-                    idxnum = int(s.split()[-1])
-                except Exception:
-                    idxnum = 0
-                devs.append({"backend": "OpenCV", "ident": str(idxnum), "label": s})
+                try: idxnum = int(s.split()[-1])
+                except Exception: idxnum = 0
+                devs.append({"backend":"OpenCV","ident":str(idxnum),"label":s})
 
             for idx, box in enumerate(self.gui.cam_boxes):
                 cb = box["cb_device"]
@@ -1965,209 +1631,98 @@ class MainApp(QtWidgets.QApplication):
                 cb.addItem("— Select a device (or type manually) —")
                 cb.model().item(0).setEnabled(False)
                 for d in devs:
-                    cb.addItem(d["label"], {"backend": d["backend"], "ident": d["ident"]})
+                    cb.addItem(d["label"], {"backend":d["backend"],"ident":d["ident"]})
                 cb.blockSignals(False)
 
                 def on_change(i, box=box, cb=cb):
                     data = cb.itemData(i)
                     if isinstance(data, dict) and "backend" in data:
-                        box["cb_backend"].setCurrentIndex(0 if data["backend"] == "OpenCV" else 1)
+                        box["cb_backend"].setCurrentIndex(0 if data["backend"]=="OpenCV" else 1)
                         box["le_ident"].setText(str(data["ident"]))
-
-                try:
-                    cb.currentIndexChanged.disconnect()
-                except Exception:
-                    pass
+                try: cb.currentIndexChanged.disconnect()
+                except Exception: pass
                 cb.currentIndexChanged.connect(on_change)
 
+            # Auto distinct assignment if both are blank or identical
             id0 = self.gui.cam_boxes[0]["le_ident"].text().strip()
             id1 = self.gui.cam_boxes[1]["le_ident"].text().strip()
-            be0 = "OpenCV" if self.gui.cam_boxes[0]["cb_backend"].currentIndex() == 0 else "PySpin"
-            be1 = "OpenCV" if self.gui.cam_boxes[1]["cb_backend"].currentIndex() == 0 else "PySpin"
+            be0 = "OpenCV" if self.gui.cam_boxes[0]["cb_backend"].currentIndex()==0 else "PySpin"
+            be1 = "OpenCV" if self.gui.cam_boxes[1]["cb_backend"].currentIndex()==0 else "PySpin"
 
-            changed = False
-
+            changed=False
             def _set_box(box, backend, ident):
                 nonlocal changed
-                box["cb_backend"].setCurrentIndex(0 if backend == "OpenCV" else 1)
+                box["cb_backend"].setCurrentIndex(0 if backend=="OpenCV" else 1)
                 box["le_ident"].setText(str(ident))
-                i = _find_item_index(box["cb_device"], backend, ident)
-                if i >= 0:
-                    box["cb_device"].setCurrentIndex(i)
-                changed = True
+                for i in range(box["cb_device"].count()):
+                    data = box["cb_device"].itemData(i)
+                    if isinstance(data, dict) and data.get("backend")==backend and str(data.get("ident"))==str(ident):
+                        box["cb_device"].setCurrentIndex(i); break
+                changed=True
 
-            if len(devs) >= 2 and ((not id0 and not id1) or (be0 == be1 and id0 == id1)):
-                _set_box(self.gui.cam_boxes[0], devs[0]["backend"], devs[0]["ident"])
-                _set_box(self.gui.cam_boxes[1], devs[1]["backend"], devs[1]["ident"])
-            elif len(devs) == 1 and ((not id0 and not id1) or (be0 == be1 and id0 == id1)):
+            if len(devs) >= 2 and ((not id0 and not id1) or (be0==be1 and id0==id1)):
+                d0, d1 = devs[0], devs[1]
+                _set_box(self.gui.cam_boxes[0], d0["backend"], d0["ident"])
+                _set_box(self.gui.cam_boxes[1], d1["backend"], d1["ident"])
+            elif len(devs) == 1 and ((not id0 and not id1) or (be0==be1 and id0==id1)):
                 d0 = devs[0]
                 _set_box(self.gui.cam_boxes[0], d0["backend"], d0["ident"])
-                fallback_ident = "1" if str(d0["ident"]) != "1" else "0"
+                fallback_ident = "1" if str(d0["ident"])!="1" else "0"
                 _set_box(self.gui.cam_boxes[1], "OpenCV", fallback_ident)
-            elif len(devs) >= 1:
-                id0 = self.gui.cam_boxes[0]["le_ident"].text().strip()
-                be0 = "OpenCV" if self.gui.cam_boxes[0]["cb_backend"].currentIndex() == 0 else "PySpin"
-                id1 = self.gui.cam_boxes[1]["le_ident"].text().strip()
-                be1 = "OpenCV" if self.gui.cam_boxes[1]["cb_backend"].currentIndex() == 0 else "PySpin"
-                if not id0:
-                    pick = next((d for d in devs if not (d["backend"] == be1 and str(d["ident"]) == id1)), devs[0])
-                    _set_box(self.gui.cam_boxes[0], pick["backend"], pick["ident"])
-                if not id1:
-                    pick = next((d for d in devs if not (d["backend"] == be0 and str(d["ident"]) == id0)), devs[0])
-                    _set_box(self.gui.cam_boxes[1], pick["backend"], pick["ident"])
 
             LOGGER.info("[Devices] Refreshed: %d PySpin, %d OpenCV", len(spin_list), len(ocv_list))
 
             if changed:
-                self.apply_from_gui()
+                self.apply_settings_from_gui()
 
         except Exception as e:
             LOGGER.error("[Devices] Refresh error: %s", e)
 
-    # --- Compatibility slots (prevents startup crash if wiring expects start_loop/stop_loop) ---
-    def start_loop_compat(self):
-        if getattr(self, "running", False):
-            return
-        self.running = True
-        self.thread = threading.Thread(target=self.loop, daemon=True)
-        self.thread.start()
+    def apply_settings_from_gui(self):
         try:
-            self.gui.lbl_status.setText("Status: Trigger loop running.")
-        except Exception:
-            pass
-        LOGGER.info("[Main] Start (compat)")
+            self.cfg.simulation_mode=bool(self.gui.cb_sim.isChecked())
+            self.cfg.sim_trigger_interval=float(self.gui.sb_sim.value())
+            self.cfg.output_root=self.gui.le_root.text().strip() or self.cfg.output_root
 
-    def stop_loop_compat(self):
-        if not getattr(self, "running", False):
-            return
-        self.running = False
-        th = getattr(self, "thread", None)
-        if th:
-            try:
-                th.join(timeout=2.0)
-            except Exception:
-                pass
-        self.thread = None
-        try:
-            self.gui.lbl_status.setText("Status: Stopped.")
-        except Exception:
-            pass
-        LOGGER.info("[Main] Stop (compat)")
+            idx=self.gui.cb_fmt.currentIndex()
+            preset_id=self.gui.cb_fmt.itemData(idx) or "avi_mjpg"
+            self.cfg.video_preset_id=preset_id; self.cfg.fourcc=PRESETS_BY_ID[preset_id]["fourcc"]
+            self.cfg.record_duration_s=float(self.gui.sb_rec.value())
 
-    def reset_stimulus_window(self):
-        try:
-            self.runner.stim.reset_window()
-            self.gui.lbl_status.setText("Status: Stimulus window reset.")
-        except Exception as e:
-            LOGGER.error("[Main] reset_stimulus_window error: %s", e)
+            self.cfg.stim_duration_s=float(self.gui.sb_stim_dur.value())
+            self.cfg.stim_r0_px=int(self.gui.sb_r0.value())
+            self.cfg.stim_r1_px=int(self.gui.sb_r1.value())
+            self.cfg.stim_bg_grey=float(self.gui.sb_bg.value())
+            self.cfg.lights_delay_s=float(self.gui.sb_light_delay.value())
+            self.cfg.stim_delay_s=float(self.gui.sb_stim_delay.value())
 
-    def _on_preset_load(self, name: str):
-        name = (name or "").strip()
-        if not name:
-            return
-        preset = self.user_presets.get(name)
-        if not isinstance(preset, dict):
-            return
-        _apply_preset_to_cfg(self.cfg, preset)
-        try:
-            ix = 1 if getattr(self.cfg, "stim_type", "dot") == "image" else 0
-            self.gui.cb_stim_type.setCurrentIndex(ix)
-            self.gui.le_stim_image.setText(getattr(self.cfg, "stim_image_path", "") or "")
-            self.gui.sb_stim_dur.setValue(float(self.cfg.stim_duration_s))
-            self.gui.sb_r0.setValue(int(self.cfg.stim_r0_px))
-            self.gui.sb_r1.setValue(int(self.cfg.stim_r1_px))
-            self.gui.sb_stim_delay.setValue(float(self.cfg.stim_delay_s))
-            self.gui.sb_light_delay.setValue(float(self.cfg.lights_delay_s))
-        except Exception as e:
-            LOGGER.warning("[Presets] GUI apply partial: %s", e)
-        self.apply_from_gui()
-        try:
-            self.gui.lbl_status.setText(f"Status: Loaded preset '{name}'.")
-        except Exception:
-            pass
+            self.cfg.stim_kind=str(self.gui.cb_stim_kind.currentData() or "circle")
+            self.cfg.stim_png_path=str(self.gui.le_stim_png.text() or "").strip()
+            self.cfg.stim_png_keep_aspect=bool(self.gui.cb_png_aspect.isChecked())
+            self.cfg.stim_keep_window_open=bool(self.gui.cb_keep_open.isChecked())
 
-    def _on_preset_save(self, name: str):
-        name = (name or "").strip()
-        if not name:
-            return
-        try:
-            self.apply_from_gui()
-        except Exception:
-            pass
-        self.user_presets[name] = _cfg_to_preset_dict(self.cfg)
-        to_save = {k: v for k, v in self.user_presets.items() if k not in BUILTIN_USER_PRESETS}
-        _save_user_presets(to_save)
-        self.gui.set_user_preset_names(sorted(self.user_presets.keys(), key=lambda s: s.lower()))
-        try:
-            self.gui.lbl_status.setText(f"Status: Saved preset '{name}'.")
-        except Exception:
-            pass
+            self.cfg.stim_screen_index=int(self.gui.cb_stim_screen.currentIndex())
+            self.cfg.gui_screen_index=int(self.gui.cb_gui_screen.currentIndex())
+            self.cfg.stim_fullscreen=bool(self.gui.cb_full.isChecked())
+            self.cfg.prewarm_stim=bool(self.gui.cb_prewarm.isChecked())
 
-    def _on_preset_delete(self, name: str):
-        name = (name or "").strip()
-        if not name:
-            return
-        if name in BUILTIN_USER_PRESETS:
-            QtWidgets.QMessageBox.information(self.gui, "Cannot delete", "Built-in presets cannot be deleted. Use Save As… to create a custom copy.")
-            return
-        if name in self.user_presets:
-            del self.user_presets[name]
-            to_save = {k: v for k, v in self.user_presets.items() if k not in BUILTIN_USER_PRESETS}
-            _save_user_presets(to_save)
-            self.gui.set_user_preset_names(sorted(self.user_presets.keys(), key=lambda s: s.lower()))
-            try:
-                self.gui.lbl_status.setText(f"Status: Deleted preset '{name}'.")
-            except Exception:
-                pass
-
-    def apply_from_gui(self):
-        try:
-            prev_sim = self.cfg.simulation_mode
-            self.cfg.simulation_mode = bool(self.gui.cb_sim.isChecked())
-            self.cfg.sim_trigger_interval = float(self.gui.sb_sim.value())
-            self.cfg.output_root = self.gui.le_root.text().strip() or self.cfg.output_root
-
-            idx = self.gui.cb_fmt.currentIndex()
-            preset_id = self.gui.cb_fmt.itemData(idx) or "avi_mjpg"
-            self.cfg.video_preset_id = preset_id
-            self.cfg.fourcc = PRESETS_BY_ID[preset_id]["fourcc"]
-            self.cfg.record_duration_s = float(self.gui.sb_rec.value())
-
-            self.cfg.stim_duration_s = float(self.gui.sb_stim_dur.value())
-            self.cfg.stim_r0_px = int(self.gui.sb_r0.value())
-            self.cfg.stim_r1_px = int(self.gui.sb_r1.value())
-            self.cfg.stim_bg_grey = float(self.gui.sb_bg.value())
-            self.cfg.lights_delay_s = float(self.gui.sb_light_delay.value())
-            self.cfg.stim_delay_s = float(self.gui.sb_stim_delay.value())
-
-            self.cfg.stim_screen_index = int(self.gui.cb_stim_screen.currentIndex())
-            self.cfg.gui_screen_index = int(self.gui.cb_gui_screen.currentIndex())
-            self.cfg.stim_fullscreen = bool(self.gui.cb_full.isChecked())
-            self.cfg.prewarm_stim = bool(self.gui.cb_prewarm.isChecked())
-
-            try:
-                self.cfg.stim_type = str(self.gui.cb_stim_type.currentData() or "dot")
-            except Exception:
-                self.cfg.stim_type = "dot"
-            try:
-                self.cfg.stim_image_path = (self.gui.le_stim_image.text() or "").strip()
-            except Exception:
-                self.cfg.stim_image_path = ""
-
-            for i, node in enumerate((self.cam0, self.cam1)):
-                box = self.gui.cam_boxes[i]
-                backend = "OpenCV" if box["cb_backend"].currentIndex() == 0 else "PySpin"
-                ident = box["le_ident"].text().strip() or ("0" if i == 0 else "1")
-                fps = int(box["sb_fps"].value())
-                adv = {
+            # Cameras (force HW trigger ON for PySpin when not sim)
+            for i,node in enumerate((self.cam0,self.cam1)):
+                box=self.gui.cam_boxes[i]
+                backend="OpenCV" if box["cb_backend"].currentIndex()==0 else "PySpin"
+                ident=box["le_ident"].text().strip() or ("0" if i==0 else "1")
+                fps=int(box["sb_fps"].value())
+                user_hw = bool(box["cb_hw"].isChecked())
+                forced_hw = (backend=="PySpin" and not self.cfg.simulation_mode)
+                adv={
                     "width": int(box["sb_w"].value() or 0),
                     "height": int(box["sb_h"].value() or 0),
                     "exposure_us": int(box["sb_exp"].value() or 0),
-                    "hw_trigger": bool(box["cb_hw"].isChecked())
+                    "hw_trigger": forced_hw or user_hw
                 }
                 node.set_backend_ident(backend, ident, adv=adv)
                 node.set_target_fps(fps)
-                if i == 0:
+                if i==0:
                     self.cfg.cam0_backend, self.cfg.cam0_id, self.cfg.cam0_target_fps = backend, ident, fps
                     self.cfg.cam0_width, self.cfg.cam0_height = adv["width"], adv["height"]
                     self.cfg.cam0_exposure_us, self.cfg.cam0_hw_trigger = adv["exposure_us"], adv["hw_trigger"]
@@ -2176,28 +1731,27 @@ class MainApp(QtWidgets.QApplication):
                     self.cfg.cam1_width, self.cfg.cam1_height = adv["width"], adv["height"]
                     self.cfg.cam1_exposure_us, self.cfg.cam1_hw_trigger = adv["exposure_us"], adv["hw_trigger"]
 
-            if prev_sim != self.cfg.simulation_mode:
-                if self.cfg.simulation_mode:
-                    self.hw.close()
-                    self.hw.simulated = True
-                else:
-                    self.hw.simulated = False
-                    self.hw._opened = False
-                    self.hw.ser = None
+            self.hw.simulated = bool(self.cfg.simulation_mode)
 
             ensure_dir(self.cfg.output_root)
             self.gui.lbl_status.setText("Status: Settings applied.")
             LOGGER.info("[Main] Settings applied")
 
-            if self.cfg.prewarm_stim:
-                self.runner.stim.open_persistent(self.cfg.stim_screen_index, self.cfg.stim_fullscreen, self.cfg.stim_bg_grey)
+            if self.cfg.prewarm_stim or self.cfg.stim_keep_window_open:
+                self.runner.stim.open_persistent(self.cfg.stim_screen_index,self.cfg.stim_fullscreen,self.cfg.stim_bg_grey)
             else:
-                try:
-                    self.runner.stim.close()
-                except Exception:
-                    pass
+                try: self.runner.stim.close()
+                except Exception: pass
         except Exception as e:
-            LOGGER.error("[Main] apply_from_gui error: %s", e)
+            LOGGER.error("[Main] apply_settings_from_gui error: %s", e)
+
+    def reset_stimulus_window(self):
+        try: self.apply_settings_from_gui()
+        except Exception: pass
+        try: self.runner.stim.close()
+        except Exception: pass
+        self.runner.stim.open_persistent(self.cfg.stim_screen_index, self.cfg.stim_fullscreen, self.cfg.stim_bg_grey)
+        self.gui.lbl_status.setText("Status: Stimulus window reset.")
 
     def update_previews(self):
         try:
@@ -2210,11 +1764,12 @@ class MainApp(QtWidgets.QApplication):
                     self.gui.set_preview_image(i, None)
                     continue
                 p = self.gui.cam_boxes[i]["preview"]
-                w, h = p.width(), p.height()
-                img = node.grab_preview(w, h)
-                self.gui.set_preview_image(i, img)
+                w,h=p.width(),p.height()
+                img=node.grab_preview(w,h)
+                self.gui.set_preview_image(i,img)
             self.gui.update_cam_fps_labels(self.cam0.driver_fps(), self.cam1.driver_fps())
-            self.gui.lbl_status.setText("Status: Waiting / Idle.")
+            sim_txt = " [SIM ON]" if self.cfg.simulation_mode else ""
+            self.gui.lbl_status.setText(f"Status: Waiting / Idle.{sim_txt}")
         except Exception as e:
             LOGGER.error("[GUI] update_previews error: %s", e)
 
@@ -2224,73 +1779,63 @@ class MainApp(QtWidgets.QApplication):
         try:
             while self.running:
                 if self.hw.check_trigger():
-                    self.in_trial = True
+                    self.in_trial=True
                     self.gui.lbl_status.setText("Status: Triggered — running trial…")
                     try:
                         self.runner.run_one()
                     except Exception as e:
                         LOGGER.error("[Main] Trial error: %s", e)
-                    self.in_trial = False
+                    self.in_trial=False
                     self.gui.lbl_status.setText("Status: Waiting / Idle.")
                 time.sleep(0.005)
         finally:
             LOGGER.info("[Main] Trigger loop exiting")
 
     def start_loop(self):
-        if self.running:
-            return
-        self.running = True
-        self.thread = threading.Thread(target=self.loop, daemon=True)
+        if self.running: return
+        self.running=True
+        self.thread=threading.Thread(target=self.loop, daemon=True)
         self.thread.start()
         self.gui.lbl_status.setText("Status: Trigger loop running.")
         LOGGER.info("[Main] Start")
 
     def stop_loop(self):
-        if not self.running:
-            return
-        self.running = False
+        if not self.running: return
+        self.running=False
         if self.thread:
-            self.thread.join(timeout=2.0)
-            self.thread = None
+            self.thread.join(timeout=2.0); self.thread=None
         self.gui.lbl_status.setText("Status: Stopped.")
         LOGGER.info("[Main] Stop")
 
     def trigger_once(self):
-        if self.in_trial:
-            return
-        self.in_trial = True
+        if self.in_trial: return
+        self.in_trial=True
         try:
             self.runner.run_one()
         except Exception as e:
             LOGGER.error("[Main] Manual trial error: %s", e)
-        self.in_trial = False
+        self.in_trial=False
 
     def start_probe(self):
-        try:
-            self.apply_from_gui()
-        except Exception as e:
-            LOGGER.error("[Probe] apply_from_gui failed: %s", e)
+        try: self.apply_settings_from_gui()
+        except Exception as e: LOGGER.error("[Probe] apply failed: %s", e)
         self.preview_timer.stop()
         self.gui.lbl_status.setText("Status: Probing max FPS…")
-
         def worker():
             try:
-                res0 = self.cam0.probe_max_fps(3.0)
-                res1 = self.cam1.probe_max_fps(3.0)
-                txt = (
-                    f"Probe window: 3.0 s\n\n"
-                    f"Camera 0 → FPS: {res0[0]:.1f}  (frames={res0[1]}, drops={res0[2]})\n"
-                    f"Camera 1 → FPS: {res1[0]:.1f}  (frames={res1[1]}, drops={res1[2]})\n\n"
-                    f"Tip: set Target FPS to ~90% of the measured value for stability."
-                )
+                res0=self.cam0.probe_max_fps(3.0)
+                res1=self.cam1.probe_max_fps(3.0)
+                txt=(f"Probe window: 3.0 s\n\n"
+                     f"Camera 0 → FPS: {res0[0]:.1f}  (frames={res0[1]}, drops={res0[2]})\n"
+                     f"Camera 1 → FPS: {res1[0]:.1f}  (frames={res1[1]}, drops={res1[2]})\n\n"
+                     f"Tip: set Target FPS to ~90% of the measured value for stability.")
             except Exception as e:
-                txt = f"Probe failed: {e}"
+                txt=f"Probe failed: {e}"
             QtCore.QMetaObject.invokeMethod(self, "_finish_probe", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, txt))
-
         threading.Thread(target=worker, daemon=True).start()
 
     @QtCore.pyqtSlot(str)
-    def _finish_probe(self, msg: str):
+    def _finish_probe(self, msg:str):
         try:
             self.preview_timer.start()
             self.gui.lbl_status.setText("Status: Probe finished.")
@@ -2302,32 +1847,24 @@ class MainApp(QtWidgets.QApplication):
         LOGGER.info("[Main] Cleanup…")
         try:
             self.preview_timer.stop()
-        except Exception:
-            pass
+        except Exception: pass
         try:
             self.hw.close()
-        except Exception:
-            pass
+        except Exception: pass
         for node in (self.cam0, self.cam1):
-            try:
-                node.release()
-            except Exception:
-                pass
-        try:
-            self.runner.stim.close()
-        except Exception:
-            pass
-        try:
-            _spin_system_release_final()
-        except Exception:
-            pass
+            try: node.release()
+            except Exception: pass
+        try: self.runner.stim.close()
+        except Exception: pass
+        try: _spin_system_release_final()
+        except Exception: pass
         LOGGER.info("[Main] Cleanup done")
-
 
 def main():
     app = MainApp(sys.argv)
-    return app.exec_()
+    # expose cfg to CameraNode.record_clip first-frame timeout read
+    sys.modules[__name__].MainApp = app  # type: ignore
+    return app.exec_()  # or app.exec() on newer PyQt5
 
-
-if __name__ == "__main__":
+if __name__=="__main__":
     sys.exit(main())
