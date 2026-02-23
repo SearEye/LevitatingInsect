@@ -1,10 +1,11 @@
 # FlyAPI.py
 # FlyPy — Unified Trigger → Cameras + Lights + Looming Stimulus
-# v1.35.4
+# v1.35.5
 # - FIX: PySpin device selection now matches DeviceSerialNumber (not UniqueID),
 #        so each serial (e.g., 24102007 vs 24102017) opens the correct camera.
 # - FIX: Handle "BeginAcquisition: Camera is already streaming" once, avoid spam.
 # - FIX: Advanced… toggle handler signature accepts clicked(bool), no crash.
+# - FIX: Logging init now resets handlers cleanly (avoids duplicate/empty tmp logs on re-run in same process).
 # - Keeps: process-lifetime PySpin System; distinct default assignment after Refresh.
 # - Keeps: logs under Desktop\LevitatingInsect-main\logs with end timestamp
 # - Keeps: preview toggles off by default, full-res recording only, FPS probe
@@ -106,7 +107,7 @@ def _apply_preset_to_cfg(cfg: "Config", preset: Dict[str, object]) -> None:
                 pass
 
 
-__version__ = "1.35.4"
+__version__ = "1.35.5"
 
 # -------------------- Logging --------------------
 LOG_DIR_DEFAULT = r"C:\Users\Murpheylab\Desktop\LevitatingInsect-main\logs"
@@ -125,22 +126,46 @@ def day_stamp() -> str:
 
 
 def init_logging() -> tuple[logging.Logger, str]:
+    """
+    Initialize logging deterministically.
+
+    Important behavior:
+    - If a previous handler exists (e.g., in an embedded run or re-launch in same interpreter),
+      we clear it so the new tmp log file actually receives logs and finalize_logging can rename it.
+    """
     log_dir = LOG_DIR_DEFAULT if os.name == "nt" else os.path.join(os.getcwd(), "logs")
     ensure_dir(log_dir)
     start_stamp = now_stamp()
     tmp_name = os.path.join(log_dir, f"FlyPy_run_{start_stamp}.log.tmp")
+
     logger = logging.getLogger("FlyPy")
     logger.setLevel(logging.DEBUG)
+
+    # Clear existing handlers to avoid duplicate output and "dead" tmp file paths.
+    try:
+        for h in list(logger.handlers):
+            try:
+                h.flush()
+                h.close()
+            except Exception:
+                pass
+            logger.removeHandler(h)
+    except Exception:
+        pass
+
     fmt = logging.Formatter("%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+
     fh = logging.FileHandler(tmp_name, encoding="utf-8")
     fh.setFormatter(fmt)
     fh.setLevel(logging.DEBUG)
+
     ch = logging.StreamHandler(sys.stdout)
     ch.setFormatter(fmt)
     ch.setLevel(logging.INFO)
-    if not logger.handlers:
-        logger.addHandler(fh)
-        logger.addHandler(ch)
+
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+
     logger.info(f"=== FlyPy Log Start v{__version__} ===")
     return logger, tmp_name
 
@@ -156,7 +181,10 @@ def finalize_logging():
                 h.close()
             except Exception:
                 pass
-            LOGGER.removeHandler(h)
+            try:
+                LOGGER.removeHandler(h)
+            except Exception:
+                pass
     except Exception:
         pass
     try:
@@ -1187,7 +1215,6 @@ class LoomingStim:
                             img.pos = (0, 0)
                             img.draw()
                         else:
-                            # fallback
                             if dot is not None:
                                 dot.radius = v
                                 dot.draw()
