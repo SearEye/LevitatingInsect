@@ -1,5 +1,32 @@
-PyQt5>=5.15
-numpy>=1.23
-opencv-python>=4.5
-psychopy>=2023.2
+# ============================================
+# FlyPy Requirements — v1.44.1
+# ============================================
+
+# Core runtime
+numpy>=1.26
+opencv-python>=4.8
+PyQt5>=5.15.9
 pyserial>=3.5
+
+# PsychoPy for looming stimulus (Python < 3.11 recommended)
+psychopy>=2023.2.3; python_version < "3.11"
+
+# Optional (recommended for image stimulus)
+pillow>=10.0
+
+# Optional logging/data handling
+pandas>=2.2
+pyarrow>=16.0
+
+# Optional monitor detection
+screeninfo>=0.8
+
+# ============================================
+# NOT INSTALLABLE VIA PIP
+# ============================================
+
+# FLIR / Teledyne Spinnaker SDK (required for PySpin backend)
+# Install from vendor site:
+# https://www.teledynevisionsolutions.com/products/spinnaker-sdk/
+
+# System ffmpeg (optional, advanced video workflows)
