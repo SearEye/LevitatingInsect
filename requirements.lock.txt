@@ -4,5 +4,8 @@ PyQt5==5.15.11
 PyQt5-Qt5==5.15.2
 PyQt5_sip==12.17.0
 pyserial==3.5
+pillow==10.4.0
+pandas==2.2.2
+pyarrow==16.1.0
 setuptools==80.9.0
 wheel==0.45.1
