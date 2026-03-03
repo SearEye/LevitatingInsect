@@ -21,6 +21,11 @@
 #   producing a time-accurate stimulus .AVI/.MP4 without AVI corruption from concurrent load.
 #
 # Keeps all prior v1.43.2 fixes and image scaling behavior.
+#
+# PRESET DEFAULT CHANGE (v1.44.1):
+# - Default camera ROI set to 640x512 (was 0=max).
+# - Default camera exposure set to 800 µs (was 1500 µs).
+#
 
 import os, sys, time, csv, json, atexit, threading, queue, logging, shutil, importlib
 from collections import deque
@@ -204,12 +209,12 @@ class Config:
         self.cam1_id = ""
         self.cam0_target_fps = 522
         self.cam1_target_fps = 522
-        self.cam0_width = 0
-        self.cam1_width = 0
-        self.cam0_height = 0
-        self.cam1_height = 0
-        self.cam0_exposure_us = 1500
-        self.cam1_exposure_us = 1500
+        self.cam0_width = 640
+        self.cam1_width = 640
+        self.cam0_height = 512
+        self.cam1_height = 512
+        self.cam0_exposure_us = 800
+        self.cam1_exposure_us = 800
         self.cam0_hw_trigger = True
         self.cam1_hw_trigger = True
 
@@ -425,7 +430,7 @@ def _b(nm, val: bool):
         return False
 
 class SpinnakerCamera(BaseCamera):
-    def __init__(self, serial: str, fps: float, width: int = 0, height: int = 0, exp_us: int = 1500, hw_trigger: bool = False):
+    def __init__(self, serial: str, fps: float, width: int = 0, height: int = 0, exp_us: int = 800, hw_trigger: bool = False):
         self.serial = serial.strip(); self.fps = float(fps)
         self.req_w = int(width); self.req_h = int(height); self.exp = int(exp_us)
         self.hw_trigger = bool(hw_trigger)
@@ -584,7 +589,7 @@ class CameraNode:
                     self.ident, self.fps,
                     width=int(self.adv.get("width", 0) or 0),
                     height=int(self.adv.get("height", 0) or 0),
-                    exp_us=int(self.adv.get("exposure_us", 1500) or 1500),
+                    exp_us=int(self.adv.get("exposure_us", 800) or 800),
                     hw_trigger=bool(self.adv.get("hw_trigger", False)),
                 )
                 d.open(); self.dev = d
@@ -1840,7 +1845,7 @@ class SettingsGUI(QtWidgets.QWidget):
             adv_frame = QtWidgets.QFrame(); adv_layout = QtWidgets.QFormLayout(adv_frame)
             sb_w = QtWidgets.QSpinBox(); sb_w.setRange(0, 20000); sb_w.setSingleStep(2); sb_w.setValue(int(node.adv.get("width", 0) or 0))
             sb_h = QtWidgets.QSpinBox(); sb_h.setRange(0, 20000); sb_h.setSingleStep(2); sb_h.setValue(int(node.adv.get("height", 0) or 0))
-            sb_exp = QtWidgets.QSpinBox(); sb_exp.setRange(20, 1000000); sb_exp.setSingleStep(50); sb_exp.setValue(int(node.adv.get("exposure_us", 1500) or 1500))
+            sb_exp = QtWidgets.QSpinBox(); sb_exp.setRange(20, 1000000); sb_exp.setSingleStep(50); sb_exp.setValue(int(node.adv.get("exposure_us", 800) or 800))
             cb_hwtrig = QtWidgets.QCheckBox("Hardware trigger (Line0)"); cb_hwtrig.setChecked(bool(node.adv.get("hw_trigger", True)))
             adv_layout.addRow("ROI Width (0=max):", sb_w); adv_layout.addRow("ROI Height (0=max):", sb_h)
             adv_layout.addRow("Exposure (µs):", sb_exp); adv_layout.addRow(cb_hwtrig)
@@ -1871,7 +1876,7 @@ class SettingsGUI(QtWidgets.QWidget):
         if idx in (0, 1):
             fps = 522 if idx == 0 else 300
             w, h = (640, 512) if idx == 0 else (720, 540)
-            exp = 1500 if idx == 0 else 2500
+            exp = 800 if idx == 0 else 2500
             for box in self.cam_boxes:
                 box["cb_backend"].setCurrentIndex(1)
                 box["sb_fps"].setValue(fps)
