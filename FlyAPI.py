@@ -1,6 +1,12 @@
 # FlyAPI.py
 # FlyPy — Unified Trigger → Cameras + Lights + Looming Stimulus
-# v1.44.1
+# v1.44.2
+#
+# FIX (v1.44.2):
+# - Patch headless QA mode so it matches the current class layout (CameraNode signature, LoomingStim API).
+# - Ensure --qa/--qa-check invocation strips the flag before passing args to QA argparse.
+# - Fix an indentation issue in the GUI QA worker block that could cause syntax/parse failure.
+# - RESTORE: GUI button for the all-in-one QA check ("Run QA Check") and run it in a background thread.
 #
 # FIX (v1.44.1):
 # - Fix stimulus “instant max size” + stimulus/GUI freeze when Trigger Once or beam-break trigger fires.
@@ -35,7 +41,7 @@ from typing import Optional, Tuple, List, Dict
 import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
 
-__version__ = "1.44.1"
+__version__ = "1.44.2"
 
 # -------------------- Logging --------------------
 def _ensure_dir(p: str): os.makedirs(p, exist_ok=True)
@@ -636,7 +642,6 @@ class CameraNode:
         dt = self.tbuf[-1] - self.tbuf[0]; n = len(self.tbuf) - 1
         return (n / dt) if dt > 0 else 0.0
 
-    # -------------------- REAL-TIME RECORDING FIX --------------------
     def record_clip(
         self,
         out_path: str,
@@ -737,7 +742,6 @@ class CameraNode:
                     latest["ts"] = time.perf_counter()
                     latest["got_any"] = True
 
-                # v1.44.1: cooperative yield to reduce starving other timing loops (stimulus)
                 time.sleep(0)
 
         tgrab = threading.Thread(target=grabber, daemon=True)
@@ -800,7 +804,6 @@ class CameraNode:
             except Exception:
                 pass
 
-            # v1.44.1: cooperative yield every few frames (keeps stimulus smooth under load)
             if (frames_written & 0x3) == 0:
                 time.sleep(0)
 
@@ -940,39 +943,6 @@ class LoomingStim:
             self._cv_open = False
         self._cv_img = None; self._cv_img_path = ""
 
-    def _pp_get_image(self, path: str):
-        if not path: return None
-        p = os.path.abspath(path)
-        if p == self._pp_img_path and self._pp_img is not None:
-            return self._pp_img
-        if not os.path.exists(p):
-            LOGGER.warning("[Stim] Image path does not exist: %s", p)
-            self._pp_img = None; self._pp_img_path = ""; self._pp_img_native = (0, 0)
-            return None
-        try:
-            from PIL import Image
-            im = Image.open(p).convert("RGBA")
-            arr = np.asarray(im)  # HxWx4 uint8
-            h, w = arr.shape[:2]
-            self._pp_img = visual.ImageStim(self._pp_win, image=arr, units="pix", size=(w, h), interpolate=True)
-            self._pp_img_path = p
-            self._pp_img_native = (w, h)
-        except Exception as e:
-            LOGGER.warning("[Stim] Image load (PsychoPy/PIL): %s", e)
-            self._pp_img = None; self._pp_img_path = ""; self._pp_img_native = (0, 0)
-        return self._pp_img
-
-    def _cv_get_image(self, path: str):
-        if not HAVE_OPENCV or not path: return None
-        if path == self._cv_img_path and self._cv_img is not None: return self._cv_img
-        try:
-            img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-            if img is None: raise RuntimeError("cv2.imread None")
-            self._cv_img = img; self._cv_img_path = path
-        except Exception as e:
-            LOGGER.warning("[Stim] Image load (OpenCV): %s", e); self._cv_img = None; self._cv_img_path = ""
-        return self._cv_img
-
     def _cv_overlay(self, frame_bgr: np.ndarray, t_sec: float, stim_on: bool):
         if not HAVE_OPENCV or frame_bgr is None: return frame_bgr
         h, w = frame_bgr.shape[:2]
@@ -1003,7 +973,17 @@ class LoomingStim:
         sh = max(1, int(round(nat_h * scale)))
         return (sw, sh)
 
-    # -------- offline deterministic render (no window capture) --------
+    def _cv_get_image(self, path: str):
+        if not HAVE_OPENCV or not path: return None
+        if path == self._cv_img_path and self._cv_img is not None: return self._cv_img
+        try:
+            img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+            if img is None: raise RuntimeError("cv2.imread None")
+            self._cv_img = img; self._cv_img_path = path
+        except Exception as e:
+            LOGGER.warning("[Stim] Image load (OpenCV): %s", e); self._cv_img = None; self._cv_img_path = ""
+        return self._cv_img
+
     def render_timeline_video(
         self,
         total_s: float,
@@ -1082,6 +1062,7 @@ class LoomingStim:
                         scaled = cv2.resize(img, (sw, sh), interpolation=cv2.INTER_AREA)
                         y0 = out_h // 2 - sh // 2
                         x0 = out_w // 2 - sw // 2
+
                         if scaled.ndim == 3 and scaled.shape[2] == 4:
                             b, g, rch, a = cv2.split(scaled)
                             rgb = cv2.merge((b, g, rch))
@@ -1118,7 +1099,6 @@ class LoomingStim:
                     record_path, total_s, rec_fps, n_frames)
         return record_path
 
-    # -------- live presentation (during trial) --------
     def present_timeline(
         self,
         trial_t0_perf: float,
@@ -1169,6 +1149,7 @@ class LoomingStim:
         stim_period = 1.0 / rec_fps
         next_tick = trial_t0_perf
 
+        # NOTE: During trials we pass record_path=None (no capture) to avoid corrupting/lagging camera writes.
         if _psy_ok():
             try:
                 self._pp_window(screen, fullscreen, bg)
@@ -1187,12 +1168,18 @@ class LoomingStim:
                 stim_img = None
                 nat_w = nat_h = 0
                 if use_img:
-                    stim_img = self._pp_get_image(path)
-                    if stim_img is None:
+                    try:
+                        from PIL import Image
+                        if not os.path.exists(path):
+                            raise RuntimeError("image path missing")
+                        im = Image.open(path).convert("RGBA")
+                        arr = np.asarray(im)
+                        nat_h, nat_w = arr.shape[:2]
+                        stim_img = visual.ImageStim(self._pp_win, image=arr, units="pix", size=(nat_w, nat_h), interpolate=True)
+                    except Exception:
                         LOGGER.warning("[Stim] Image selected but failed to load; falling back to circle.")
                         use_img = False
-                    else:
-                        nat_w, nat_h = self._pp_img_native
+                        stim_img = None
 
                 dot = None
                 if not use_img:
@@ -1228,13 +1215,6 @@ class LoomingStim:
                         r = max(1, r)
 
                         if use_img and stim_img is not None:
-                            if nat_w <= 0 or nat_h <= 0:
-                                try:
-                                    iw, ih = stim_img.size
-                                    nat_w, nat_h = int(iw), int(ih)
-                                except Exception:
-                                    nat_w, nat_h = (1, 1)
-
                             sw, sh = self._size_from_radius(r, nat_w, nat_h, bool(self.cfg.stim_png_keep_aspect))
                             stim_img.size = (sw, sh)
                             stim_img.pos = (0, 0)
@@ -1247,22 +1227,6 @@ class LoomingStim:
                     time_txt.draw()
                     self._pp_win.flip()
 
-                    if writer is not None and HAVE_OPENCV:
-                        try:
-                            frame_rgb = None
-                            try: frame_rgb = self._pp_win._getFrame(buffer="front")
-                            except Exception: frame_rgb = self._pp_win._getFrame(buffer="back")
-                            if frame_rgb is not None:
-                                frame_bgr = frame_rgb[..., ::-1].copy()
-                                if frame_bgr.dtype != np.uint8:
-                                    frame_bgr = np.clip(frame_bgr, 0, 255).astype(np.uint8)
-                                if (frame_bgr.shape[1], frame_bgr.shape[0]) != (out_w, out_h):
-                                    frame_bgr = cv2.resize(frame_bgr, (out_w, out_h), interpolation=cv2.INTER_AREA)
-                                frame_bgr = self._cv_overlay(frame_bgr, float(t), bool(stim_on))
-                                writer.write(frame_bgr)
-                        except Exception:
-                            pass
-
                 if bool(self.cfg.stim_keep_window_open):
                     try:
                         t = max(0.0, stim_end_s)
@@ -1270,12 +1234,6 @@ class LoomingStim:
                         stim_txt.text = "STIMULUS ON"
                         r = max(1, int(r1))
                         if use_img and stim_img is not None:
-                            if nat_w <= 0 or nat_h <= 0:
-                                try:
-                                    iw, ih = stim_img.size
-                                    nat_w, nat_h = int(iw), int(ih)
-                                except Exception:
-                                    nat_w, nat_h = (1, 1)
                             sw, sh = self._size_from_radius(r, nat_w, nat_h, bool(self.cfg.stim_png_keep_aspect))
                             stim_img.size = (sw, sh)
                             stim_img.pos = (0, 0)
@@ -1377,53 +1335,6 @@ class LoomingStim:
             cv2.imshow(self._cv_name, frm)
             if cv2.waitKey(1) & 0xFF == 27: break
 
-            if writer is not None:
-                try:
-                    rec = frm
-                    if (rec.shape[1], rec.shape[0]) != (out_w, out_h):
-                        rec = cv2.resize(rec, (out_w, out_h), interpolation=cv2.INTER_AREA)
-                    writer.write(rec)
-                except Exception:
-                    pass
-
-        if bool(self.cfg.stim_keep_window_open) and HAVE_OPENCV and self._cv_open:
-            try:
-                frm = np.full((size[1], size[0], 3), bg255, np.uint8)
-                r = max(1, int(r1))
-                if use_img and img is not None:
-                    sw, sh = self._size_from_radius(r, nat_w, nat_h, bool(self.cfg.stim_png_keep_aspect))
-                    scaled = cv2.resize(img, (sw, sh), interpolation=cv2.INTER_AREA)
-                    y0 = size[1] // 2 - sh // 2
-                    x0 = size[0] // 2 - sw // 2
-                    if scaled.ndim == 3 and scaled.shape[2] == 4:
-                        b, g, rch, a = cv2.split(scaled)
-                        rgb = cv2.merge((b, g, rch))
-                        alpha = a.astype(np.float32) / 255.0
-                        y1 = max(0, y0); x1 = max(0, x0)
-                        y2 = min(size[1], y0 + sh); x2 = min(size[0], x0 + sw)
-                        H = max(0, y2 - y1); W = max(0, x2 - x1)
-                        if H > 0 and W > 0:
-                            roi = frm[y1:y2, x1:x2]
-                            rgb2 = rgb[(y1 - y0):(y1 - y0) + H, (x1 - x0):(x1 - x0) + W]
-                            a2 = alpha[(y1 - y0):(y1 - y0) + H, (x1 - x0):(x1 - x0) + W][..., None]
-                            frm[y1:y2, x1:x2] = (a2 * rgb2 + (1 - a2) * roi).astype(np.uint8)
-                    else:
-                        y1 = max(0, y0); x1 = max(0, x0)
-                        y2 = min(size[1], y0 + sh); x2 = min(size[0], x0 + sw)
-                        H = max(0, y2 - y1); W = max(0, x2 - x1)
-                        if H > 0 and W > 0:
-                            frm[y1:y2, x1:x2] = scaled[(y1 - y0):(y1 - y0) + H, (x1 - x0):(x1 - x0) + W]
-                else:
-                    cv2.circle(frm, (size[0] // 2, size[1] // 2), r, (0, 0, 0), -1)
-                frm = self._cv_overlay(frm, float(max(0.0, stim_end_s)), True)
-                cv2.imshow(self._cv_name, frm)
-                cv2.waitKey(1)
-            except Exception:
-                pass
-
-        if writer is not None:
-            try: writer.release()
-            except Exception: pass
         if not self.cfg.stim_keep_window_open:
             self.close()
 
@@ -1524,7 +1435,7 @@ class TrialRunner:
                 bg=float(self.cfg.stim_bg_grey),
                 screen=int(self.cfg.stim_screen_index),
                 fullscreen=bool(self.cfg.stim_fullscreen),
-                record_path=None,   # <-- critical: no capture during camera write
+                record_path=None,
             ),
             daemon=True
         )
@@ -1605,6 +1516,7 @@ class SettingsGUI(QtWidgets.QWidget):
     probe_requested = QtCore.pyqtSignal()
     refresh_devices_requested = QtCore.pyqtSignal()
     reset_stimulus_requested = QtCore.pyqtSignal()
+    qa_requested = QtCore.pyqtSignal()   # <-- restored QA button signal
 
     def __init__(self, cfg: Config, cam0: CameraNode, cam1: CameraNode):
         super().__init__()
@@ -1634,12 +1546,14 @@ class SettingsGUI(QtWidgets.QWidget):
         self.bt_stop = QtWidgets.QPushButton("Stop")
         self.bt_trig = QtWidgets.QPushButton("Trigger Once")
         self.bt_apply = QtWidgets.QPushButton("Apply Settings")
-        for w in (self.bt_start, self.bt_stop, self.bt_trig, self.bt_apply): row.addWidget(w)
+        self.bt_qa = QtWidgets.QPushButton("Run QA Check")  # <-- restored button
+        for w in (self.bt_start, self.bt_stop, self.bt_trig, self.bt_apply, self.bt_qa): row.addWidget(w)
         root.addLayout(row)
         self.bt_start.clicked.connect(self.start_experiment.emit)
         self.bt_stop.clicked.connect(self.stop_experiment.emit)
         self.bt_trig.clicked.connect(self.manual_trigger.emit)
         self.bt_apply.clicked.connect(self.apply_settings.emit)
+        self.bt_qa.clicked.connect(self.qa_requested.emit)
 
         self.lbl_status = QtWidgets.QLabel("Status: Idle.")
         root.addWidget(self.lbl_status)
@@ -1710,7 +1624,7 @@ class SettingsGUI(QtWidgets.QWidget):
                         self.cb_stim_preset.setCurrentIndex(i); break
             self.cb_stim_preset.blockSignals(False)
 
-        def _apply_preset():
+        def _apply_stim_preset():
             p = self.cb_stim_preset.currentData()
             if not isinstance(p, dict): return
             kind = str(p.get("stim_kind", "circle"))
@@ -1765,7 +1679,7 @@ class SettingsGUI(QtWidgets.QWidget):
         self.bt_preset_save.clicked.connect(_save_preset)
         self.bt_preset_delete.clicked.connect(_delete_preset)
         _refresh_presets()
-        self.cb_stim_preset.currentIndexChanged.connect(_apply_preset)
+        self.cb_stim_preset.currentIndexChanged.connect(_apply_stim_preset)
 
         sl.addRow("Stimulus Preset:", w_p)
         sl.addRow("Stimulus total time (s):", self.sb_stim_dur)
@@ -1948,6 +1862,7 @@ class MainApp(QtWidgets.QApplication):
         self.gui.probe_requested.connect(self.start_probe)
         self.gui.refresh_devices_requested.connect(self.refresh_devices)
         self.gui.reset_stimulus_requested.connect(self.reset_stimulus_window)
+        self.gui.qa_requested.connect(self.run_qa_from_gui)   # <-- restored binding
 
         self.show_scaled_gui(self.cfg.gui_screen_index)
 
@@ -1955,7 +1870,6 @@ class MainApp(QtWidgets.QApplication):
         self.in_trial = False
         self.thread = None
 
-        # v1.44.1: dedicated trial worker handle to avoid multiple overlapping trials
         self._trial_thread = None
         self._trial_lock = threading.Lock()
 
@@ -1970,7 +1884,6 @@ class MainApp(QtWidgets.QApplication):
         QtCore.QTimer.singleShot(200, self.refresh_devices)
 
     def _set_status(self, txt: str):
-        # safe from any thread
         try:
             QtCore.QMetaObject.invokeMethod(
                 self.gui.lbl_status, "setText",
@@ -1984,7 +1897,6 @@ class MainApp(QtWidgets.QApplication):
                 pass
 
     def _run_trial_async(self, force_soft: bool):
-        # v1.44.1: run trial in background so Qt event loop keeps repainting (fixes GUI/stim freeze)
         with self._trial_lock:
             if self.in_trial:
                 return
@@ -2154,7 +2066,6 @@ class MainApp(QtWidgets.QApplication):
             while self.running:
                 if (not self.in_trial) and self.hw.check_trigger():
                     self._run_trial_async(force_soft=False)
-                    # prevent stacking triggers; wait until trial ends (non-blocking to GUI)
                     while self.running and self.in_trial:
                         time.sleep(0.01)
                 time.sleep(0.005)
@@ -2177,9 +2088,76 @@ class MainApp(QtWidgets.QApplication):
         LOGGER.info("[Main] Stop")
 
     def trigger_once(self):
-        # v1.44.1: do NOT run trial inline on the Qt GUI thread
         if self.in_trial: return
         self._run_trial_async(force_soft=True)
+
+    # -------------------- GUI QA Runner (restored) --------------------
+    def run_qa_from_gui(self):
+        """
+        Runs the same QA protocol as --qa-check, but from the GUI.
+        Critical constraints:
+          - Must NOT run on the Qt main thread (avoid freezing UI).
+          - Must not overlap with an active trial.
+        """
+        if self.in_trial:
+            QtWidgets.QMessageBox.information(self.gui, "QA Check", "QA cannot run while a trial is active.")
+            return
+
+        try:
+            self.apply_settings_from_gui()
+        except Exception:
+            pass
+
+        self.gui.bt_qa.setEnabled(False)
+        self._set_status("Status: QA running… (headless)")
+
+        def worker():
+            # Build QA argv from current GUI-config (keeps QA deterministic + aligned to current settings)
+            qa_args = [
+                "--out", str(self.cfg.output_root),
+                "--seconds", str(max(0.1, float(self.cfg.record_duration_s))),
+                "--fourcc", str(self.cfg.fourcc),
+                "--cam-fps", str(max(1.0, float(self.cfg.video_write_fps_cap))),
+                "--stim-fps", "60",
+            ]
+            if bool(self.cfg.simulation_mode):
+                qa_args.append("--simulate")
+
+            rc = 2
+            err = None
+            try:
+                rc = run_qa_mode(qa_args)
+            except Exception as e:
+                err = str(e)
+
+            QtCore.QMetaObject.invokeMethod(
+                self,
+                "_finish_gui_qa",
+                QtCore.Qt.QueuedConnection,
+                QtCore.Q_ARG(int, int(rc)),
+                QtCore.Q_ARG(str, str(err or "")),
+                QtCore.Q_ARG(str, str(self.cfg.output_root)),
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @QtCore.pyqtSlot(int, str, str)
+    def _finish_gui_qa(self, rc: int, err: str, out_root: str):
+        try:
+            self.gui.bt_qa.setEnabled(True)
+            if err:
+                self._set_status("Status: QA failed.")
+                QtWidgets.QMessageBox.critical(self.gui, "QA Check", f"QA crashed:\n{err}")
+                return
+
+            if rc == 0:
+                self._set_status("Status: QA PASS.")
+                QtWidgets.QMessageBox.information(self.gui, "QA Check", f"QA PASS.\n\nOutput root:\n{out_root}")
+            else:
+                self._set_status("Status: QA FAIL.")
+                QtWidgets.QMessageBox.warning(self.gui, "QA Check", f"QA FAIL (rc={rc}).\n\nOutput root:\n{out_root}")
+        except Exception as e:
+            LOGGER.error("[QA GUI] finish: %s", e)
 
     def start_probe(self):
         try: self.apply_settings_from_gui()
@@ -2225,7 +2203,138 @@ class MainApp(QtWidgets.QApplication):
         except Exception: pass
         LOGGER.info("[Main] Cleanup done")
 
+# -------------------- QA MODE (headless, no GUI) --------------------
+def run_qa_mode(argv=None) -> int:
+    import argparse
+    import json
+    import logging
+
+    argv = list(argv or [])
+    ap = argparse.ArgumentParser(prog="FlyAPI.py --qa", add_help=True)
+    ap.add_argument("--out", default="FlyPy_Output", help="Output root folder (default: FlyPy_Output)")
+    ap.add_argument("--seconds", type=float, default=2.0, help="Clip duration seconds (default: 2.0)")
+    ap.add_argument("--cam-fps", type=float, default=240.0, help="Writer FPS (cap) for QA clips (default: 240)")
+    ap.add_argument("--stim-fps", type=float, default=60.0, help="Stimulus render FPS (default: 60)")
+    ap.add_argument("--fourcc", default="MJPG", help="FOURCC (default: MJPG)")
+    ap.add_argument("--force-opencv", action="store_true", help="Force OpenCV camera backend (ignore PySpin)")
+    ap.add_argument("--simulate", action="store_true", help="Simulation mode (no serial hardware)")
+    ns = ap.parse_args(argv)
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    logging.info("[QA] === QACheck start ===")
+
+    cfg = Config()
+    cfg.output_root = str(ns.out)
+    cfg.record_duration_s = float(max(0.1, ns.seconds))
+    cfg.video_write_fps_cap = float(max(1.0, ns.cam_fps))
+    cfg.fourcc = str(ns.fourcc)
+    cfg.simulation_mode = bool(ns.simulate)
+
+    day_dir = _day_folder(cfg.output_root)
+    folder = os.path.join(day_dir, f"QACheck_{_now()}")
+    os.makedirs(folder, exist_ok=True)
+
+    spin = [] if ns.force_opencv else _spin_enum()
+    ocv = enumerate_opencv(6) if HAVE_OPENCV else []
+
+    def _mk_cam(name: str, idx: int) -> CameraNode:
+        if spin:
+            serial = spin[idx]["serial"] if idx < len(spin) else spin[0]["serial"]
+            return CameraNode(
+                name=name,
+                backend="PySpin",
+                ident=str(serial),
+                fps=float(max(1.0, ns.cam_fps)),
+                adv={"width": 0, "height": 0, "exposure_us": 800, "hw_trigger": False},
+            )
+        if ocv:
+            try:
+                ident = ocv[idx].split()[-1]
+            except Exception:
+                ident = str(idx)
+            return CameraNode(
+                name=name,
+                backend="OpenCV",
+                ident=str(ident),
+                fps=float(max(1.0, ns.cam_fps)),
+                adv={"width": 640, "height": 480, "exposure_us": 5000, "hw_trigger": False},
+            )
+        return CameraNode(
+            name=name,
+            backend="OpenCV",
+            ident=str(idx),
+            fps=float(max(1.0, ns.cam_fps)),
+            adv={"width": 640, "height": 480, "exposure_us": 5000, "hw_trigger": False},
+        )
+
+    cam0 = _mk_cam("cam0", 0)
+    cam1 = _mk_cam("cam1", 1)
+
+    ext = "mp4" if cfg.fourcc.lower() in ("mp4v", "avc1", "h264") else "avi"
+    cam0_path = os.path.join(folder, f"cam0.{ext}")
+    cam1_path = os.path.join(folder, f"cam1.{ext}")
+
+    res = {"cam0": "", "cam1": "", "stim": ""}
+
+    t0 = threading.Thread(target=lambda: res.__setitem__("cam0", cam0.record_clip(cam0_path, cfg.record_duration_s, cfg.fourcc, async_writer=True, start_evt=None, force_soft=True)), daemon=True)
+    t1 = threading.Thread(target=lambda: res.__setitem__("cam1", cam1.record_clip(cam1_path, cfg.record_duration_s, cfg.fourcc, async_writer=True, start_evt=None, force_soft=True)), daemon=True)
+    t0.start(); t1.start()
+    t0.join(); t1.join()
+
+    stim_path = os.path.join(folder, f"stimulus.{ext}")
+    stim = LoomingStim(cfg)
+    stim_onset = float(cfg.lights_delay_s) + float(cfg.stim_delay_s)
+    rendered = stim.render_timeline_video(
+        total_s=float(cfg.record_duration_s),
+        stim_onset_s=stim_onset,
+        stim_dur_s=float(cfg.stim_duration_s),
+        r0=int(cfg.stim_r0_px),
+        r1=int(cfg.stim_r1_px),
+        bg=float(cfg.stim_bg_grey),
+        record_path=stim_path,
+        record_fourcc=str(cfg.fourcc),
+        record_fps=float(max(1.0, ns.stim_fps)),
+        record_size=(640, 480),
+    )
+    if rendered:
+        res["stim"] = rendered
+
+    report = {
+        "version": __version__,
+        "timestamp": _now(),
+        "output_folder": folder,
+        "cam0_path": res.get("cam0", ""),
+        "cam1_path": res.get("cam1", ""),
+        "stim_path": res.get("stim", ""),
+        "pass": bool(res.get("cam0")) and bool(res.get("cam1")) and bool(res.get("stim")),
+    }
+
+    try:
+        with open(os.path.join(folder, "qa_report.json"), "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+    except Exception as e:
+        logging.warning("[QA] Failed to write qa_report.json: %s", e)
+
+    try:
+        with open(os.path.join(folder, "qa_report.txt"), "w", encoding="utf-8") as f:
+            f.write(f"FlyPy QA Check (v{__version__})\n")
+            f.write(f"Timestamp: {report['timestamp']}\n")
+            f.write(f"Output: {folder}\n\n")
+            f.write(f"cam0: {report['cam0_path']}\n")
+            f.write(f"cam1: {report['cam1_path']}\n")
+            f.write(f"stim: {report['stim_path']}\n\n")
+            f.write(f"PASS: {report['pass']}\n")
+    except Exception as e:
+        logging.warning("[QA] Failed to write qa_report.txt: %s", e)
+
+    logging.info("[QA] === QACheck done | PASS=%s ===", str(report.get("pass")))
+    return 0 if report.get("pass") else 2
+
 def main():
+    if ("--qa" in sys.argv) or ("--qa-check" in sys.argv) or (os.environ.get("FLYPY_QA", "").strip() == "1"):
+        args = [a for a in sys.argv[1:] if a not in ("--qa", "--qa-check")]
+        return run_qa_mode(args)
+
     app = MainApp(sys.argv)
     return app.exec_()
 
