@@ -1,12 +1,6 @@
 # FlyAPI.py
 # FlyPy — Unified Trigger → Cameras + Lights + Looming Stimulus
-# v1.44.2
-#
-# FIX (v1.44.2):
-# - Patch headless QA mode so it matches the current class layout (CameraNode signature, LoomingStim API).
-# - Ensure --qa/--qa-check invocation strips the flag before passing args to QA argparse.
-# - Fix an indentation issue in the GUI QA worker block that could cause syntax/parse failure.
-# - RESTORE: GUI button for the all-in-one QA check ("Run QA Check") and run it in a background thread.
+# v1.44.1
 #
 # FIX (v1.44.1):
 # - Fix stimulus “instant max size” + stimulus/GUI freeze when Trigger Once or beam-break trigger fires.
@@ -27,13 +21,8 @@
 #   producing a time-accurate stimulus .AVI/.MP4 without AVI corruption from concurrent load.
 #
 # Keeps all prior v1.43.2 fixes and image scaling behavior.
-#
-# PRESET DEFAULT CHANGE (v1.44.1):
-# - Default camera ROI set to 640x512 (was 0=max).
-# - Default camera exposure set to 800 µs (was 1500 µs).
-#
 
-import os, sys, time, csv, json, atexit, threading, queue, logging, shutil, importlib
+import os, sys, time, csv, json, atexit, threading, queue, logging, shutil, importlib, re
 from collections import deque
 from datetime import datetime
 from typing import Optional, Tuple, List, Dict
@@ -41,12 +30,38 @@ from typing import Optional, Tuple, List, Dict
 import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
 
-__version__ = "1.44.2"
+__version__ = "1.44.1"
 
 # -------------------- Logging --------------------
 def _ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 def _now() -> str: return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 def _day() -> str: return datetime.now().strftime("%Y%m%d")
+def _session_date() -> str: return datetime.now().strftime("%Y-%m-%d")
+
+def sanitize_label_for_filename(label: str) -> str:
+    raw = str(label or "").strip().lower()
+    if not raw:
+        return "unlabeled"
+    raw = raw.replace("->", "_")
+    raw = raw.replace("+", "")
+    raw = raw.replace(";", "_")
+    raw = raw.replace("|", "_")
+    raw = raw.replace("/", "-")
+    raw = re.sub(r"[^a-z0-9_-]+", "_", raw)
+    raw = re.sub(r"_+", "_", raw).strip("_-")
+    return raw or "unlabeled"
+
+def _path_exists_nonempty(path: str) -> bool:
+    try:
+        return bool(path) and os.path.exists(path) and os.path.getsize(path) > 0
+    except Exception:
+        return False
+
+def _csv_bool(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1", "true", "yes", "y")
+
 LOG_DIR_DEFAULT = r"C:\\Users\\Murpheylab\\Desktop\\LevitatingInsect-main\\logs"
 
 def _init_log():
@@ -185,6 +200,7 @@ class Config:
         self.simulation_mode = False
         self.sim_trigger_interval = 5.0
         self.output_root = "FlyPy_Output"
+        self.geno_group_label = ""
         self.prewarm_stim = False
 
         self.video_preset_id = "avi_mjpg"
@@ -215,12 +231,12 @@ class Config:
         self.cam1_id = ""
         self.cam0_target_fps = 522
         self.cam1_target_fps = 522
-        self.cam0_width = 640
-        self.cam1_width = 640
-        self.cam0_height = 512
-        self.cam1_height = 512
-        self.cam0_exposure_us = 800
-        self.cam1_exposure_us = 800
+        self.cam0_width = 0
+        self.cam1_width = 0
+        self.cam0_height = 0
+        self.cam1_height = 0
+        self.cam0_exposure_us = 1500
+        self.cam1_exposure_us = 1500
         self.cam0_hw_trigger = True
         self.cam1_hw_trigger = True
 
@@ -436,7 +452,7 @@ def _b(nm, val: bool):
         return False
 
 class SpinnakerCamera(BaseCamera):
-    def __init__(self, serial: str, fps: float, width: int = 0, height: int = 0, exp_us: int = 800, hw_trigger: bool = False):
+    def __init__(self, serial: str, fps: float, width: int = 0, height: int = 0, exp_us: int = 1500, hw_trigger: bool = False):
         self.serial = serial.strip(); self.fps = float(fps)
         self.req_w = int(width); self.req_h = int(height); self.exp = int(exp_us)
         self.hw_trigger = bool(hw_trigger)
@@ -595,7 +611,7 @@ class CameraNode:
                     self.ident, self.fps,
                     width=int(self.adv.get("width", 0) or 0),
                     height=int(self.adv.get("height", 0) or 0),
-                    exp_us=int(self.adv.get("exposure_us", 800) or 800),
+                    exp_us=int(self.adv.get("exposure_us", 1500) or 1500),
                     hw_trigger=bool(self.adv.get("hw_trigger", False)),
                 )
                 d.open(); self.dev = d
@@ -642,6 +658,7 @@ class CameraNode:
         dt = self.tbuf[-1] - self.tbuf[0]; n = len(self.tbuf) - 1
         return (n / dt) if dt > 0 else 0.0
 
+    # -------------------- REAL-TIME RECORDING FIX --------------------
     def record_clip(
         self,
         out_path: str,
@@ -742,6 +759,7 @@ class CameraNode:
                     latest["ts"] = time.perf_counter()
                     latest["got_any"] = True
 
+                # v1.44.1: cooperative yield to reduce starving other timing loops (stimulus)
                 time.sleep(0)
 
         tgrab = threading.Thread(target=grabber, daemon=True)
@@ -804,6 +822,7 @@ class CameraNode:
             except Exception:
                 pass
 
+            # v1.44.1: cooperative yield every few frames (keeps stimulus smooth under load)
             if (frames_written & 0x3) == 0:
                 time.sleep(0)
 
@@ -943,6 +962,39 @@ class LoomingStim:
             self._cv_open = False
         self._cv_img = None; self._cv_img_path = ""
 
+    def _pp_get_image(self, path: str):
+        if not path: return None
+        p = os.path.abspath(path)
+        if p == self._pp_img_path and self._pp_img is not None:
+            return self._pp_img
+        if not os.path.exists(p):
+            LOGGER.warning("[Stim] Image path does not exist: %s", p)
+            self._pp_img = None; self._pp_img_path = ""; self._pp_img_native = (0, 0)
+            return None
+        try:
+            from PIL import Image
+            im = Image.open(p).convert("RGBA")
+            arr = np.asarray(im)  # HxWx4 uint8
+            h, w = arr.shape[:2]
+            self._pp_img = visual.ImageStim(self._pp_win, image=arr, units="pix", size=(w, h), interpolate=True)
+            self._pp_img_path = p
+            self._pp_img_native = (w, h)
+        except Exception as e:
+            LOGGER.warning("[Stim] Image load (PsychoPy/PIL): %s", e)
+            self._pp_img = None; self._pp_img_path = ""; self._pp_img_native = (0, 0)
+        return self._pp_img
+
+    def _cv_get_image(self, path: str):
+        if not HAVE_OPENCV or not path: return None
+        if path == self._cv_img_path and self._cv_img is not None: return self._cv_img
+        try:
+            img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+            if img is None: raise RuntimeError("cv2.imread None")
+            self._cv_img = img; self._cv_img_path = path
+        except Exception as e:
+            LOGGER.warning("[Stim] Image load (OpenCV): %s", e); self._cv_img = None; self._cv_img_path = ""
+        return self._cv_img
+
     def _cv_overlay(self, frame_bgr: np.ndarray, t_sec: float, stim_on: bool):
         if not HAVE_OPENCV or frame_bgr is None: return frame_bgr
         h, w = frame_bgr.shape[:2]
@@ -973,17 +1025,7 @@ class LoomingStim:
         sh = max(1, int(round(nat_h * scale)))
         return (sw, sh)
 
-    def _cv_get_image(self, path: str):
-        if not HAVE_OPENCV or not path: return None
-        if path == self._cv_img_path and self._cv_img is not None: return self._cv_img
-        try:
-            img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-            if img is None: raise RuntimeError("cv2.imread None")
-            self._cv_img = img; self._cv_img_path = path
-        except Exception as e:
-            LOGGER.warning("[Stim] Image load (OpenCV): %s", e); self._cv_img = None; self._cv_img_path = ""
-        return self._cv_img
-
+    # -------- offline deterministic render (no window capture) --------
     def render_timeline_video(
         self,
         total_s: float,
@@ -1062,7 +1104,6 @@ class LoomingStim:
                         scaled = cv2.resize(img, (sw, sh), interpolation=cv2.INTER_AREA)
                         y0 = out_h // 2 - sh // 2
                         x0 = out_w // 2 - sw // 2
-
                         if scaled.ndim == 3 and scaled.shape[2] == 4:
                             b, g, rch, a = cv2.split(scaled)
                             rgb = cv2.merge((b, g, rch))
@@ -1099,6 +1140,7 @@ class LoomingStim:
                     record_path, total_s, rec_fps, n_frames)
         return record_path
 
+    # -------- live presentation (during trial) --------
     def present_timeline(
         self,
         trial_t0_perf: float,
@@ -1149,7 +1191,6 @@ class LoomingStim:
         stim_period = 1.0 / rec_fps
         next_tick = trial_t0_perf
 
-        # NOTE: During trials we pass record_path=None (no capture) to avoid corrupting/lagging camera writes.
         if _psy_ok():
             try:
                 self._pp_window(screen, fullscreen, bg)
@@ -1168,18 +1209,12 @@ class LoomingStim:
                 stim_img = None
                 nat_w = nat_h = 0
                 if use_img:
-                    try:
-                        from PIL import Image
-                        if not os.path.exists(path):
-                            raise RuntimeError("image path missing")
-                        im = Image.open(path).convert("RGBA")
-                        arr = np.asarray(im)
-                        nat_h, nat_w = arr.shape[:2]
-                        stim_img = visual.ImageStim(self._pp_win, image=arr, units="pix", size=(nat_w, nat_h), interpolate=True)
-                    except Exception:
+                    stim_img = self._pp_get_image(path)
+                    if stim_img is None:
                         LOGGER.warning("[Stim] Image selected but failed to load; falling back to circle.")
                         use_img = False
-                        stim_img = None
+                    else:
+                        nat_w, nat_h = self._pp_img_native
 
                 dot = None
                 if not use_img:
@@ -1215,6 +1250,13 @@ class LoomingStim:
                         r = max(1, r)
 
                         if use_img and stim_img is not None:
+                            if nat_w <= 0 or nat_h <= 0:
+                                try:
+                                    iw, ih = stim_img.size
+                                    nat_w, nat_h = int(iw), int(ih)
+                                except Exception:
+                                    nat_w, nat_h = (1, 1)
+
                             sw, sh = self._size_from_radius(r, nat_w, nat_h, bool(self.cfg.stim_png_keep_aspect))
                             stim_img.size = (sw, sh)
                             stim_img.pos = (0, 0)
@@ -1227,6 +1269,22 @@ class LoomingStim:
                     time_txt.draw()
                     self._pp_win.flip()
 
+                    if writer is not None and HAVE_OPENCV:
+                        try:
+                            frame_rgb = None
+                            try: frame_rgb = self._pp_win._getFrame(buffer="front")
+                            except Exception: frame_rgb = self._pp_win._getFrame(buffer="back")
+                            if frame_rgb is not None:
+                                frame_bgr = frame_rgb[..., ::-1].copy()
+                                if frame_bgr.dtype != np.uint8:
+                                    frame_bgr = np.clip(frame_bgr, 0, 255).astype(np.uint8)
+                                if (frame_bgr.shape[1], frame_bgr.shape[0]) != (out_w, out_h):
+                                    frame_bgr = cv2.resize(frame_bgr, (out_w, out_h), interpolation=cv2.INTER_AREA)
+                                frame_bgr = self._cv_overlay(frame_bgr, float(t), bool(stim_on))
+                                writer.write(frame_bgr)
+                        except Exception:
+                            pass
+
                 if bool(self.cfg.stim_keep_window_open):
                     try:
                         t = max(0.0, stim_end_s)
@@ -1234,6 +1292,12 @@ class LoomingStim:
                         stim_txt.text = "STIMULUS ON"
                         r = max(1, int(r1))
                         if use_img and stim_img is not None:
+                            if nat_w <= 0 or nat_h <= 0:
+                                try:
+                                    iw, ih = stim_img.size
+                                    nat_w, nat_h = int(iw), int(ih)
+                                except Exception:
+                                    nat_w, nat_h = (1, 1)
                             sw, sh = self._size_from_radius(r, nat_w, nat_h, bool(self.cfg.stim_png_keep_aspect))
                             stim_img.size = (sw, sh)
                             stim_img.pos = (0, 0)
@@ -1335,6 +1399,53 @@ class LoomingStim:
             cv2.imshow(self._cv_name, frm)
             if cv2.waitKey(1) & 0xFF == 27: break
 
+            if writer is not None:
+                try:
+                    rec = frm
+                    if (rec.shape[1], rec.shape[0]) != (out_w, out_h):
+                        rec = cv2.resize(rec, (out_w, out_h), interpolation=cv2.INTER_AREA)
+                    writer.write(rec)
+                except Exception:
+                    pass
+
+        if bool(self.cfg.stim_keep_window_open) and HAVE_OPENCV and self._cv_open:
+            try:
+                frm = np.full((size[1], size[0], 3), bg255, np.uint8)
+                r = max(1, int(r1))
+                if use_img and img is not None:
+                    sw, sh = self._size_from_radius(r, nat_w, nat_h, bool(self.cfg.stim_png_keep_aspect))
+                    scaled = cv2.resize(img, (sw, sh), interpolation=cv2.INTER_AREA)
+                    y0 = size[1] // 2 - sh // 2
+                    x0 = size[0] // 2 - sw // 2
+                    if scaled.ndim == 3 and scaled.shape[2] == 4:
+                        b, g, rch, a = cv2.split(scaled)
+                        rgb = cv2.merge((b, g, rch))
+                        alpha = a.astype(np.float32) / 255.0
+                        y1 = max(0, y0); x1 = max(0, x0)
+                        y2 = min(size[1], y0 + sh); x2 = min(size[0], x0 + sw)
+                        H = max(0, y2 - y1); W = max(0, x2 - x1)
+                        if H > 0 and W > 0:
+                            roi = frm[y1:y2, x1:x2]
+                            rgb2 = rgb[(y1 - y0):(y1 - y0) + H, (x1 - x0):(x1 - x0) + W]
+                            a2 = alpha[(y1 - y0):(y1 - y0) + H, (x1 - x0):(x1 - x0) + W][..., None]
+                            frm[y1:y2, x1:x2] = (a2 * rgb2 + (1 - a2) * roi).astype(np.uint8)
+                    else:
+                        y1 = max(0, y0); x1 = max(0, x0)
+                        y2 = min(size[1], y0 + sh); x2 = min(size[0], x0 + sw)
+                        H = max(0, y2 - y1); W = max(0, x2 - x1)
+                        if H > 0 and W > 0:
+                            frm[y1:y2, x1:x2] = scaled[(y1 - y0):(y1 - y0) + H, (x1 - x0):(x1 - x0) + W]
+                else:
+                    cv2.circle(frm, (size[0] // 2, size[1] // 2), r, (0, 0, 0), -1)
+                frm = self._cv_overlay(frm, float(max(0.0, stim_end_s)), True)
+                cv2.imshow(self._cv_name, frm)
+                cv2.waitKey(1)
+            except Exception:
+                pass
+
+        if writer is not None:
+            try: writer.release()
+            except Exception: pass
         if not self.cfg.stim_keep_window_open:
             self.close()
 
@@ -1355,26 +1466,56 @@ def _day_folder(root: str) -> str:
     p = os.path.join(root, _day()); os.makedirs(p, exist_ok=True); return p
 
 class TrialRunner:
+    CSV_HEADER = [
+        "session_date", "session_folder", "geno_group_label", "geno_group_trial_n",
+        "timestamp", "trial_idx", "cam0_path", "cam1_path", "stim_path", "record_duration_s",
+        "lights_delay_s", "stim_delay_s", "stim_duration_s", "stim_screen_index", "stim_fullscreen",
+        "stim_kind", "stim_img_path", "keep_aspect", "keep_window",
+        "cam0_backend", "cam0_ident", "cam0_target_fps", "cam0_w", "cam0_h", "cam0_exp_us", "cam0_hwtrig",
+        "cam1_backend", "cam1_ident", "cam1_target_fps", "cam1_w", "cam1_h", "cam1_exp_us", "cam1_hwtrig",
+        "video_preset_id", "fourcc"
+    ]
+
     def __init__(self, cfg: Config, hw: HardwareBridge, cam0: "CameraNode", cam1: "CameraNode", log_path: str):
         self.cfg = cfg; self.hw = hw; self.cam0 = cam0; self.cam1 = cam1
         self.stim = LoomingStim(cfg)
-        os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+        self.log_path = ""
+        self.log = None
+        self.csvw = None
+        self.session_root = ""
+        self.trial_idx = 0
+        self._open_log_for_root(log_path)
+
+    def _open_log_for_root(self, log_path: str):
+        root = os.path.abspath(os.path.dirname(log_path) or ".")
+        os.makedirs(root, exist_ok=True)
+        if self.log_path == log_path and self.log and self.csvw:
+            return
+        try:
+            if self.log:
+                self.log.flush()
+                self.log.close()
+        except Exception:
+            pass
+        self.log_path = log_path
+        self.session_root = root
         new = not os.path.exists(log_path)
         self.log = open(log_path, "a", newline="", encoding="utf-8")
         self.csvw = csv.writer(self.log)
         if new:
-            self.csvw.writerow([
-                "timestamp","trial_idx","cam0_path","cam1_path","stim_path","record_duration_s",
-                "lights_delay_s","stim_delay_s","stim_duration_s","stim_screen_index","stim_fullscreen",
-                "stim_kind","stim_img_path","keep_aspect","keep_window",
-                "cam0_backend","cam0_ident","cam0_target_fps","cam0_w","cam0_h","cam0_exp_us","cam0_hwtrig",
-                "cam1_backend","cam1_ident","cam1_target_fps","cam1_w","cam1_h","cam1_exp_us","cam1_hwtrig",
-                "video_preset_id","fourcc"
-            ])
-        self.trial_idx = 0
+            self.csvw.writerow(self.CSV_HEADER)
+            self.log.flush()
+        self.trial_idx = self._resolve_next_trial_idx() - 1
+
+    def update_session_root(self, output_root: str):
+        root = os.path.abspath(output_root or self.cfg.output_root or os.getcwd())
+        self.cfg.output_root = root
+        self._open_log_for_root(os.path.join(root, "trials_log.csv"))
 
     def close(self):
-        try: self.log.close()
+        try:
+            if self.log:
+                self.log.close()
         except Exception: pass
         try: self.stim.close()
         except Exception: pass
@@ -1382,13 +1523,104 @@ class TrialRunner:
     def _ext(self, fcc: str) -> str:
         return "mp4" if fcc.lower() in ("mp4v", "avc1", "h264") else "avi"
 
-    def _folder(self) -> str:
-        p = os.path.join(_day_folder(self.cfg.output_root), f"trial_{_now()}"); os.makedirs(p, exist_ok=True); return p
+    def _read_existing_rows(self) -> List[Dict[str, str]]:
+        rows: List[Dict[str, str]] = []
+        if not self.log_path or not os.path.exists(self.log_path):
+            return rows
+        try:
+            with open(self.log_path, "r", newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    if isinstance(row, dict):
+                        rows.append(row)
+        except Exception as e:
+            LOGGER.warning("[CSV] Read existing rows failed: %s", e)
+        return rows
 
-    def _start_recorders(self, folder: str, force_soft: bool):
+    def _resolve_next_trial_idx(self) -> int:
+        max_idx = 0
+        for row in self._read_existing_rows():
+            try:
+                max_idx = max(max_idx, int(row.get("trial_idx", 0) or 0))
+            except Exception:
+                continue
+        return max_idx + 1
+
+    def resolve_next_geno_group_trial_n(self, session_folder: str, geno_group_label: str) -> int:
+        norm_folder = os.path.abspath(session_folder or self.cfg.output_root or os.getcwd())
+        target_label = str(geno_group_label or "")
+        max_n = 0
+        for row in self._read_existing_rows():
+            try:
+                row_folder = os.path.abspath(row.get("session_folder", "") or "")
+                row_label = str(row.get("geno_group_label", "") or "")
+                if row_folder != norm_folder or row_label != target_label:
+                    continue
+                max_n = max(max_n, int(row.get("geno_group_trial_n", 0) or 0))
+            except Exception as e:
+                LOGGER.warning("[CSV] Skipping malformed row for geno_group_trial_n resolution: %s", e)
+                continue
+        return max_n + 1
+
+    def preview_next_geno_group_trial_n(self, session_folder: str, geno_group_label: str) -> int:
+        try:
+            return self.resolve_next_geno_group_trial_n(session_folder, geno_group_label)
+        except Exception:
+            return 1
+
+    def _folder(self, folder_slug: str, trial_n: int) -> str:
+        trial_stamp = _now()
+        p = os.path.join(self.cfg.output_root, f"trial_{trial_stamp}_{folder_slug}_{trial_n:03d}")
+        os.makedirs(p, exist_ok=True)
+        return p
+
+    def _csv_row_exists(self, session_date: str, session_folder: str, geno_group_label: str, geno_group_trial_n: int, trial_idx: int) -> bool:
+        if not self.log_path or not os.path.exists(self.log_path):
+            return False
+        try:
+            with open(self.log_path, "r", newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    try:
+                        if (str(row.get("session_date", "")) == str(session_date) and
+                            os.path.abspath(row.get("session_folder", "") or "") == os.path.abspath(session_folder or "") and
+                            str(row.get("geno_group_label", "")) == str(geno_group_label or "") and
+                            int(row.get("geno_group_trial_n", 0) or 0) == int(geno_group_trial_n) and
+                            int(row.get("trial_idx", 0) or 0) == int(trial_idx)):
+                            return True
+                    except Exception:
+                        continue
+        except Exception as e:
+            LOGGER.warning("[CSV] Verify row failed: %s", e)
+        return False
+
+    def emit_postrender_trial_confirmation(self, *, session_date: str, session_folder: str, geno_group_label: str,
+                                           geno_group_trial_n: int, trial_idx: int, cam0_path: str, cam1_path: str,
+                                           stim_path: str, csv_ok: bool):
+        cam0_ok = int(_path_exists_nonempty(cam0_path))
+        cam1_ok = int(_path_exists_nonempty(cam1_path))
+        stim_ok = int(_path_exists_nonempty(stim_path))
+        ok = bool(cam0_ok and cam1_ok and stim_ok and csv_ok)
+        if ok:
+            LOGGER.info(
+                '[TRIAL COMPLETE] session_date=%s session_folder=%s geno_group_label=%r geno_group_trial_n=%d trial_idx=%d cam0_ok=%d cam1_ok=%d stim_ok=%d csv_ok=%d status=COMPLETE',
+                session_date, session_folder, geno_group_label, int(geno_group_trial_n), int(trial_idx),
+                cam0_ok, cam1_ok, stim_ok, int(bool(csv_ok))
+            )
+        else:
+            reasons = []
+            if not cam0_ok: reasons.append("cam0 missing")
+            if not cam1_ok: reasons.append("cam1 missing")
+            if not stim_ok: reasons.append("stim missing")
+            if not csv_ok: reasons.append("csv append failed")
+            LOGGER.warning(
+                '[TRIAL INCOMPLETE] session_date=%s session_folder=%s geno_group_label=%r geno_group_trial_n=%d trial_idx=%d cam0_ok=%d cam1_ok=%d stim_ok=%d csv_ok=%d status=FAIL_TECHNICAL reason=%r',
+                session_date, session_folder, geno_group_label, int(geno_group_trial_n), int(trial_idx),
+                cam0_ok, cam1_ok, stim_ok, int(bool(csv_ok)), "; ".join(reasons) or "unknown"
+            )
+
+    def _start_recorders(self, folder: str, force_soft: bool, file_stem: str):
         fcc = self.cfg.fourcc; ext = self._ext(fcc)
-        out0 = os.path.join(folder, f"cam0.{ext}")
-        out1 = os.path.join(folder, f"cam1.{ext}")
+        out0 = os.path.join(folder, f"{file_stem}_cam0.{ext}")
+        out1 = os.path.join(folder, f"{file_stem}_cam1.{ext}")
         res = {"c0": None, "c1": None}
         s0 = threading.Event(); s1 = threading.Event()
 
@@ -1408,18 +1640,25 @@ class TrialRunner:
         return res, (t0, t1), (s0, s1)
 
     def run_one(self, force_soft: bool = False):
-        folder = self._folder()
+        self.update_session_root(self.cfg.output_root)
+        session_date = _session_date()
+        session_folder = os.path.abspath(self.cfg.output_root)
+        geno_group_label = str(self.cfg.geno_group_label or "")
+        geno_group_trial_n = self.resolve_next_geno_group_trial_n(session_folder, geno_group_label)
+        slug = sanitize_label_for_filename(geno_group_label)
+        file_stem = f"{slug}_{geno_group_trial_n:03d}"
+        folder = self._folder(slug, geno_group_trial_n)
         if self.cfg.stim_keep_window_open:
             self.stim.open_persistent(self.cfg.stim_screen_index, self.cfg.stim_fullscreen, self.cfg.stim_bg_grey)
 
         self.hw.mark_start()
         trial_t0_perf = time.perf_counter()
 
-        res, threads, starts = self._start_recorders(folder, force_soft)
+        res, threads, starts = self._start_recorders(folder, force_soft, file_stem)
 
         fcc = self.cfg.fourcc
         ext = self._ext(fcc)
-        stim_path = os.path.join(folder, f"stimulus.{ext}")
+        stim_path = os.path.join(folder, f"{file_stem}_stim.{ext}")
         res["stim"] = stim_path
 
         stim_onset = float(self.cfg.lights_delay_s) + float(self.cfg.stim_delay_s)
@@ -1476,8 +1715,9 @@ class TrialRunner:
         except Exception as e:
             LOGGER.warning("[StimRender] failed: %s", e)
 
-        self.trial_idx += 1
-        self.csvw.writerow([
+        self.trial_idx = self._resolve_next_trial_idx()
+        row = [
+            session_date, session_folder, geno_group_label, int(geno_group_trial_n),
             _now(), self.trial_idx,
             res["c0"] or "", res["c1"] or "", res.get("stim") or "", float(self.cfg.record_duration_s),
             float(self.cfg.lights_delay_s), float(self.cfg.stim_delay_s), float(self.cfg.stim_duration_s),
@@ -1486,8 +1726,27 @@ class TrialRunner:
             self.cam0.backend, self.cam0.ident, int(self.cam0.fps), self.cam0.adv.get("width", 0), self.cam0.adv.get("height", 0), self.cam0.adv.get("exposure_us", 0), self.cam0.adv.get("hw_trigger", False),
             self.cam1.backend, self.cam1.ident, int(self.cam1.fps), self.cam1.adv.get("width", 0), self.cam1.adv.get("height", 0), self.cam1.adv.get("exposure_us", 0), self.cam1.adv.get("hw_trigger", False),
             self.cfg.video_preset_id, self.cfg.fourcc
-        ])
-        self.log.flush()
+        ]
+        csv_ok = False
+        try:
+            self.csvw.writerow(row)
+            self.log.flush()
+            csv_ok = self._csv_row_exists(session_date, session_folder, geno_group_label, int(geno_group_trial_n), int(self.trial_idx))
+        except Exception as e:
+            LOGGER.error("[CSV] Write failed: %s", e)
+            csv_ok = False
+
+        self.emit_postrender_trial_confirmation(
+            session_date=session_date,
+            session_folder=session_folder,
+            geno_group_label=geno_group_label,
+            geno_group_trial_n=int(geno_group_trial_n),
+            trial_idx=int(self.trial_idx),
+            cam0_path=res.get("c0") or "",
+            cam1_path=res.get("c1") or "",
+            stim_path=res.get("stim") or "",
+            csv_ok=csv_ok,
+        )
 
 # -------------------- Device enumeration --------------------
 def enumerate_opencv(max_index: int = 6) -> List[str]:
@@ -1516,7 +1775,6 @@ class SettingsGUI(QtWidgets.QWidget):
     probe_requested = QtCore.pyqtSignal()
     refresh_devices_requested = QtCore.pyqtSignal()
     reset_stimulus_requested = QtCore.pyqtSignal()
-    qa_requested = QtCore.pyqtSignal()   # <-- restored QA button signal
 
     def __init__(self, cfg: Config, cam0: CameraNode, cam1: CameraNode):
         super().__init__()
@@ -1546,14 +1804,12 @@ class SettingsGUI(QtWidgets.QWidget):
         self.bt_stop = QtWidgets.QPushButton("Stop")
         self.bt_trig = QtWidgets.QPushButton("Trigger Once")
         self.bt_apply = QtWidgets.QPushButton("Apply Settings")
-        self.bt_qa = QtWidgets.QPushButton("Run QA Check")  # <-- restored button
-        for w in (self.bt_start, self.bt_stop, self.bt_trig, self.bt_apply, self.bt_qa): row.addWidget(w)
+        for w in (self.bt_start, self.bt_stop, self.bt_trig, self.bt_apply): row.addWidget(w)
         root.addLayout(row)
         self.bt_start.clicked.connect(self.start_experiment.emit)
         self.bt_stop.clicked.connect(self.stop_experiment.emit)
         self.bt_trig.clicked.connect(self.manual_trigger.emit)
         self.bt_apply.clicked.connect(self.apply_settings.emit)
-        self.bt_qa.clicked.connect(self.qa_requested.emit)
 
         self.lbl_status = QtWidgets.QLabel("Status: Idle.")
         root.addWidget(self.lbl_status)
@@ -1566,6 +1822,11 @@ class SettingsGUI(QtWidgets.QWidget):
         self.sb_sim = QtWidgets.QDoubleSpinBox(); self.sb_sim.setRange(0.1, 3600.0); self.sb_sim.setDecimals(2); self.sb_sim.setValue(self.cfg.sim_trigger_interval); gl.addRow("Simulated trigger interval (s):", self.sb_sim)
         self.le_root = QtWidgets.QLineEdit(self.cfg.output_root); btn_browse = QtWidgets.QPushButton("Browse…")
         rowr = QtWidgets.QHBoxLayout(); rowr.addWidget(self.le_root); rowr.addWidget(btn_browse); gl.addRow("Output folder:", rowr)
+        self.le_geno_group = QtWidgets.QLineEdit(self.cfg.geno_group_label)
+        self.le_geno_group.setPlaceholderText("Male +;Tmb/CyO;+ | GroupA->Single")
+        gl.addRow("Genotype / group label:", self.le_geno_group)
+        self.lbl_next_geno_trial = QtWidgets.QLabel("Next genotype/group trial #: 1")
+        gl.addRow(self.lbl_next_geno_trial)
 
         self.cb_fmt = QtWidgets.QComboBox(); self._id_by_idx = {}; cur = 0
         for i, p in enumerate(VIDEO_PRESETS):
@@ -1577,6 +1838,8 @@ class SettingsGUI(QtWidgets.QWidget):
         grid.addWidget(gen, 0, 0, 1, 2)
 
         btn_browse.clicked.connect(lambda: self._browse())
+        self.le_root.textChanged.connect(lambda _=None: self._update_next_geno_trial_preview())
+        self.le_geno_group.textChanged.connect(lambda _=None: self._update_next_geno_trial_preview())
 
         stim = QtWidgets.QGroupBox("Stimulus & Timing"); sl = QtWidgets.QFormLayout(stim)
         self.sb_stim_dur = QtWidgets.QDoubleSpinBox(); self.sb_stim_dur.setRange(0.05, 60.0); self.sb_stim_dur.setDecimals(3); self.sb_stim_dur.setValue(self.cfg.stim_duration_s)
@@ -1624,7 +1887,7 @@ class SettingsGUI(QtWidgets.QWidget):
                         self.cb_stim_preset.setCurrentIndex(i); break
             self.cb_stim_preset.blockSignals(False)
 
-        def _apply_stim_preset():
+        def _apply_preset():
             p = self.cb_stim_preset.currentData()
             if not isinstance(p, dict): return
             kind = str(p.get("stim_kind", "circle"))
@@ -1679,7 +1942,7 @@ class SettingsGUI(QtWidgets.QWidget):
         self.bt_preset_save.clicked.connect(_save_preset)
         self.bt_preset_delete.clicked.connect(_delete_preset)
         _refresh_presets()
-        self.cb_stim_preset.currentIndexChanged.connect(_apply_stim_preset)
+        self.cb_stim_preset.currentIndexChanged.connect(_apply_preset)
 
         sl.addRow("Stimulus Preset:", w_p)
         sl.addRow("Stimulus total time (s):", self.sb_stim_dur)
@@ -1759,7 +2022,7 @@ class SettingsGUI(QtWidgets.QWidget):
             adv_frame = QtWidgets.QFrame(); adv_layout = QtWidgets.QFormLayout(adv_frame)
             sb_w = QtWidgets.QSpinBox(); sb_w.setRange(0, 20000); sb_w.setSingleStep(2); sb_w.setValue(int(node.adv.get("width", 0) or 0))
             sb_h = QtWidgets.QSpinBox(); sb_h.setRange(0, 20000); sb_h.setSingleStep(2); sb_h.setValue(int(node.adv.get("height", 0) or 0))
-            sb_exp = QtWidgets.QSpinBox(); sb_exp.setRange(20, 1000000); sb_exp.setSingleStep(50); sb_exp.setValue(int(node.adv.get("exposure_us", 800) or 800))
+            sb_exp = QtWidgets.QSpinBox(); sb_exp.setRange(20, 1000000); sb_exp.setSingleStep(50); sb_exp.setValue(int(node.adv.get("exposure_us", 1500) or 1500))
             cb_hwtrig = QtWidgets.QCheckBox("Hardware trigger (Line0)"); cb_hwtrig.setChecked(bool(node.adv.get("hw_trigger", True)))
             adv_layout.addRow("ROI Width (0=max):", sb_w); adv_layout.addRow("ROI Height (0=max):", sb_h)
             adv_layout.addRow("Exposure (µs):", sb_exp); adv_layout.addRow(cb_hwtrig)
@@ -1777,6 +2040,7 @@ class SettingsGUI(QtWidgets.QWidget):
             grid.addWidget(gb, 3 + idx, 0, 1, 2)
 
         scroll.setWidget(pane); outer.addWidget(scroll)
+        self._update_next_geno_trial_preview()
         self._update_footer = QtWidgets.QLabel("Note: Cameras are time-accurate (real seconds). Stimulus video is post-rendered to avoid corruption under load.")
         outer.addWidget(self._update_footer)
 
@@ -1790,7 +2054,7 @@ class SettingsGUI(QtWidgets.QWidget):
         if idx in (0, 1):
             fps = 522 if idx == 0 else 300
             w, h = (640, 512) if idx == 0 else (720, 540)
-            exp = 800 if idx == 0 else 2500
+            exp = 1500 if idx == 0 else 2500
             for box in self.cam_boxes:
                 box["cb_backend"].setCurrentIndex(1)
                 box["sb_fps"].setValue(fps)
@@ -1828,6 +2092,27 @@ class SettingsGUI(QtWidgets.QWidget):
         self.cam_boxes[0]["lbl_rep"].setText(f"Driver-reported FPS: ~{f0:.1f}")
         self.cam_boxes[1]["lbl_rep"].setText(f"Driver-reported FPS: ~{f1:.1f}")
 
+    def _update_next_geno_trial_preview(self):
+        root = (self.le_root.text().strip() or self.cfg.output_root or os.getcwd())
+        label = self.le_geno_group.text()
+        try:
+            log_path = os.path.join(root, "trials_log.csv")
+            next_n = 1
+            if os.path.exists(log_path):
+                with open(log_path, "r", newline="", encoding="utf-8") as f:
+                    for row in csv.DictReader(f):
+                        try:
+                            row_folder = os.path.abspath(row.get("session_folder", "") or root)
+                            row_label = str(row.get("geno_group_label", "") or "")
+                            if row_folder == os.path.abspath(root) and row_label == str(label or ""):
+                                next_n = max(next_n, int(row.get("geno_group_trial_n", 0) or 0) + 1)
+                        except Exception:
+                            continue
+            self.lbl_next_geno_trial.setText(f"Next genotype/group trial #: {next_n}")
+        except Exception:
+            self.lbl_next_geno_trial.setText("Next genotype/group trial #: 1")
+
+
 # -------------------- Main App --------------------
 class MainApp(QtWidgets.QApplication):
     def __init__(self, argv):
@@ -1850,6 +2135,7 @@ class MainApp(QtWidgets.QApplication):
         self.cam1 = CameraNode("cam1", self.cfg.cam1_backend, self.cfg.cam1_id, self.cfg.cam1_target_fps,
                                adv={"width": self.cfg.cam1_width, "height": self.cfg.cam1_height, "exposure_us": self.cfg.cam1_exposure_us, "hw_trigger": self.cfg.cam1_hw_trigger})
 
+        self.cfg.output_root = os.path.abspath(self.cfg.output_root)
         os.makedirs(self.cfg.output_root, exist_ok=True)
         log_path = os.path.join(self.cfg.output_root, "trials_log.csv")
         self.runner = TrialRunner(self.cfg, self.hw, self.cam0, self.cam1, log_path)
@@ -1862,7 +2148,6 @@ class MainApp(QtWidgets.QApplication):
         self.gui.probe_requested.connect(self.start_probe)
         self.gui.refresh_devices_requested.connect(self.refresh_devices)
         self.gui.reset_stimulus_requested.connect(self.reset_stimulus_window)
-        self.gui.qa_requested.connect(self.run_qa_from_gui)   # <-- restored binding
 
         self.show_scaled_gui(self.cfg.gui_screen_index)
 
@@ -1870,6 +2155,7 @@ class MainApp(QtWidgets.QApplication):
         self.in_trial = False
         self.thread = None
 
+        # v1.44.1: dedicated trial worker handle to avoid multiple overlapping trials
         self._trial_thread = None
         self._trial_lock = threading.Lock()
 
@@ -1884,6 +2170,7 @@ class MainApp(QtWidgets.QApplication):
         QtCore.QTimer.singleShot(200, self.refresh_devices)
 
     def _set_status(self, txt: str):
+        # safe from any thread
         try:
             QtCore.QMetaObject.invokeMethod(
                 self.gui.lbl_status, "setText",
@@ -1897,6 +2184,7 @@ class MainApp(QtWidgets.QApplication):
                 pass
 
     def _run_trial_async(self, force_soft: bool):
+        # v1.44.1: run trial in background so Qt event loop keeps repainting (fixes GUI/stim freeze)
         with self._trial_lock:
             if self.in_trial:
                 return
@@ -1972,7 +2260,9 @@ class MainApp(QtWidgets.QApplication):
         try:
             self.cfg.simulation_mode = bool(self.gui.cb_sim.isChecked())
             self.cfg.sim_trigger_interval = float(self.gui.sb_sim.value())
-            self.cfg.output_root = self.gui.le_root.text().strip() or self.cfg.output_root
+            self.cfg.output_root = os.path.abspath(self.gui.le_root.text().strip() or self.cfg.output_root)
+            self.cfg.geno_group_label = str(self.gui.le_geno_group.text() or "")
+            self.runner.update_session_root(self.cfg.output_root)
 
             idx = self.gui.cb_fmt.currentIndex()
             self.cfg.video_preset_id = self.gui.cb_fmt.itemData(idx) or "avi_mjpg"
@@ -2023,6 +2313,7 @@ class MainApp(QtWidgets.QApplication):
 
             self.hw.simulated = bool(self.cfg.simulation_mode)
             os.makedirs(self.cfg.output_root, exist_ok=True)
+            self.gui._update_next_geno_trial_preview()
             self.gui.lbl_status.setText("Status: Settings applied.")
 
             if self.cfg.prewarm_stim or self.cfg.stim_keep_window_open:
@@ -2066,6 +2357,7 @@ class MainApp(QtWidgets.QApplication):
             while self.running:
                 if (not self.in_trial) and self.hw.check_trigger():
                     self._run_trial_async(force_soft=False)
+                    # prevent stacking triggers; wait until trial ends (non-blocking to GUI)
                     while self.running and self.in_trial:
                         time.sleep(0.01)
                 time.sleep(0.005)
@@ -2088,76 +2380,9 @@ class MainApp(QtWidgets.QApplication):
         LOGGER.info("[Main] Stop")
 
     def trigger_once(self):
+        # v1.44.1: do NOT run trial inline on the Qt GUI thread
         if self.in_trial: return
         self._run_trial_async(force_soft=True)
-
-    # -------------------- GUI QA Runner (restored) --------------------
-    def run_qa_from_gui(self):
-        """
-        Runs the same QA protocol as --qa-check, but from the GUI.
-        Critical constraints:
-          - Must NOT run on the Qt main thread (avoid freezing UI).
-          - Must not overlap with an active trial.
-        """
-        if self.in_trial:
-            QtWidgets.QMessageBox.information(self.gui, "QA Check", "QA cannot run while a trial is active.")
-            return
-
-        try:
-            self.apply_settings_from_gui()
-        except Exception:
-            pass
-
-        self.gui.bt_qa.setEnabled(False)
-        self._set_status("Status: QA running… (headless)")
-
-        def worker():
-            # Build QA argv from current GUI-config (keeps QA deterministic + aligned to current settings)
-            qa_args = [
-                "--out", str(self.cfg.output_root),
-                "--seconds", str(max(0.1, float(self.cfg.record_duration_s))),
-                "--fourcc", str(self.cfg.fourcc),
-                "--cam-fps", str(max(1.0, float(self.cfg.video_write_fps_cap))),
-                "--stim-fps", "60",
-            ]
-            if bool(self.cfg.simulation_mode):
-                qa_args.append("--simulate")
-
-            rc = 2
-            err = None
-            try:
-                rc = run_qa_mode(qa_args)
-            except Exception as e:
-                err = str(e)
-
-            QtCore.QMetaObject.invokeMethod(
-                self,
-                "_finish_gui_qa",
-                QtCore.Qt.QueuedConnection,
-                QtCore.Q_ARG(int, int(rc)),
-                QtCore.Q_ARG(str, str(err or "")),
-                QtCore.Q_ARG(str, str(self.cfg.output_root)),
-            )
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @QtCore.pyqtSlot(int, str, str)
-    def _finish_gui_qa(self, rc: int, err: str, out_root: str):
-        try:
-            self.gui.bt_qa.setEnabled(True)
-            if err:
-                self._set_status("Status: QA failed.")
-                QtWidgets.QMessageBox.critical(self.gui, "QA Check", f"QA crashed:\n{err}")
-                return
-
-            if rc == 0:
-                self._set_status("Status: QA PASS.")
-                QtWidgets.QMessageBox.information(self.gui, "QA Check", f"QA PASS.\n\nOutput root:\n{out_root}")
-            else:
-                self._set_status("Status: QA FAIL.")
-                QtWidgets.QMessageBox.warning(self.gui, "QA Check", f"QA FAIL (rc={rc}).\n\nOutput root:\n{out_root}")
-        except Exception as e:
-            LOGGER.error("[QA GUI] finish: %s", e)
 
     def start_probe(self):
         try: self.apply_settings_from_gui()
@@ -2203,138 +2428,7 @@ class MainApp(QtWidgets.QApplication):
         except Exception: pass
         LOGGER.info("[Main] Cleanup done")
 
-# -------------------- QA MODE (headless, no GUI) --------------------
-def run_qa_mode(argv=None) -> int:
-    import argparse
-    import json
-    import logging
-
-    argv = list(argv or [])
-    ap = argparse.ArgumentParser(prog="FlyAPI.py --qa", add_help=True)
-    ap.add_argument("--out", default="FlyPy_Output", help="Output root folder (default: FlyPy_Output)")
-    ap.add_argument("--seconds", type=float, default=2.0, help="Clip duration seconds (default: 2.0)")
-    ap.add_argument("--cam-fps", type=float, default=240.0, help="Writer FPS (cap) for QA clips (default: 240)")
-    ap.add_argument("--stim-fps", type=float, default=60.0, help="Stimulus render FPS (default: 60)")
-    ap.add_argument("--fourcc", default="MJPG", help="FOURCC (default: MJPG)")
-    ap.add_argument("--force-opencv", action="store_true", help="Force OpenCV camera backend (ignore PySpin)")
-    ap.add_argument("--simulate", action="store_true", help="Simulation mode (no serial hardware)")
-    ns = ap.parse_args(argv)
-
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    logging.info("[QA] === QACheck start ===")
-
-    cfg = Config()
-    cfg.output_root = str(ns.out)
-    cfg.record_duration_s = float(max(0.1, ns.seconds))
-    cfg.video_write_fps_cap = float(max(1.0, ns.cam_fps))
-    cfg.fourcc = str(ns.fourcc)
-    cfg.simulation_mode = bool(ns.simulate)
-
-    day_dir = _day_folder(cfg.output_root)
-    folder = os.path.join(day_dir, f"QACheck_{_now()}")
-    os.makedirs(folder, exist_ok=True)
-
-    spin = [] if ns.force_opencv else _spin_enum()
-    ocv = enumerate_opencv(6) if HAVE_OPENCV else []
-
-    def _mk_cam(name: str, idx: int) -> CameraNode:
-        if spin:
-            serial = spin[idx]["serial"] if idx < len(spin) else spin[0]["serial"]
-            return CameraNode(
-                name=name,
-                backend="PySpin",
-                ident=str(serial),
-                fps=float(max(1.0, ns.cam_fps)),
-                adv={"width": 0, "height": 0, "exposure_us": 800, "hw_trigger": False},
-            )
-        if ocv:
-            try:
-                ident = ocv[idx].split()[-1]
-            except Exception:
-                ident = str(idx)
-            return CameraNode(
-                name=name,
-                backend="OpenCV",
-                ident=str(ident),
-                fps=float(max(1.0, ns.cam_fps)),
-                adv={"width": 640, "height": 480, "exposure_us": 5000, "hw_trigger": False},
-            )
-        return CameraNode(
-            name=name,
-            backend="OpenCV",
-            ident=str(idx),
-            fps=float(max(1.0, ns.cam_fps)),
-            adv={"width": 640, "height": 480, "exposure_us": 5000, "hw_trigger": False},
-        )
-
-    cam0 = _mk_cam("cam0", 0)
-    cam1 = _mk_cam("cam1", 1)
-
-    ext = "mp4" if cfg.fourcc.lower() in ("mp4v", "avc1", "h264") else "avi"
-    cam0_path = os.path.join(folder, f"cam0.{ext}")
-    cam1_path = os.path.join(folder, f"cam1.{ext}")
-
-    res = {"cam0": "", "cam1": "", "stim": ""}
-
-    t0 = threading.Thread(target=lambda: res.__setitem__("cam0", cam0.record_clip(cam0_path, cfg.record_duration_s, cfg.fourcc, async_writer=True, start_evt=None, force_soft=True)), daemon=True)
-    t1 = threading.Thread(target=lambda: res.__setitem__("cam1", cam1.record_clip(cam1_path, cfg.record_duration_s, cfg.fourcc, async_writer=True, start_evt=None, force_soft=True)), daemon=True)
-    t0.start(); t1.start()
-    t0.join(); t1.join()
-
-    stim_path = os.path.join(folder, f"stimulus.{ext}")
-    stim = LoomingStim(cfg)
-    stim_onset = float(cfg.lights_delay_s) + float(cfg.stim_delay_s)
-    rendered = stim.render_timeline_video(
-        total_s=float(cfg.record_duration_s),
-        stim_onset_s=stim_onset,
-        stim_dur_s=float(cfg.stim_duration_s),
-        r0=int(cfg.stim_r0_px),
-        r1=int(cfg.stim_r1_px),
-        bg=float(cfg.stim_bg_grey),
-        record_path=stim_path,
-        record_fourcc=str(cfg.fourcc),
-        record_fps=float(max(1.0, ns.stim_fps)),
-        record_size=(640, 480),
-    )
-    if rendered:
-        res["stim"] = rendered
-
-    report = {
-        "version": __version__,
-        "timestamp": _now(),
-        "output_folder": folder,
-        "cam0_path": res.get("cam0", ""),
-        "cam1_path": res.get("cam1", ""),
-        "stim_path": res.get("stim", ""),
-        "pass": bool(res.get("cam0")) and bool(res.get("cam1")) and bool(res.get("stim")),
-    }
-
-    try:
-        with open(os.path.join(folder, "qa_report.json"), "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2)
-    except Exception as e:
-        logging.warning("[QA] Failed to write qa_report.json: %s", e)
-
-    try:
-        with open(os.path.join(folder, "qa_report.txt"), "w", encoding="utf-8") as f:
-            f.write(f"FlyPy QA Check (v{__version__})\n")
-            f.write(f"Timestamp: {report['timestamp']}\n")
-            f.write(f"Output: {folder}\n\n")
-            f.write(f"cam0: {report['cam0_path']}\n")
-            f.write(f"cam1: {report['cam1_path']}\n")
-            f.write(f"stim: {report['stim_path']}\n\n")
-            f.write(f"PASS: {report['pass']}\n")
-    except Exception as e:
-        logging.warning("[QA] Failed to write qa_report.txt: %s", e)
-
-    logging.info("[QA] === QACheck done | PASS=%s ===", str(report.get("pass")))
-    return 0 if report.get("pass") else 2
-
 def main():
-    if ("--qa" in sys.argv) or ("--qa-check" in sys.argv) or (os.environ.get("FLYPY_QA", "").strip() == "1"):
-        args = [a for a in sys.argv[1:] if a not in ("--qa", "--qa-check")]
-        return run_qa_mode(args)
-
     app = MainApp(sys.argv)
     return app.exec_()
 
